@@ -158,9 +158,6 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   off), so Settings briefly turns intercept on and off again when it is off.
 - `auth add` replaces the whole profile, so editing one with a stored password needs it
   typed again; `--login-request` only takes a file.
-- A literal auth password and the login body still go in argv: `auth add` can read neither
-  from stdin or the environment (`--password-env` names a variable read at each login, so
-  a variable set only for `auth add` would be gone by then).
-- The dev bridge (`npm run dev`) passes stdin as text and ignores `env`, so binary bodies
-  are not exact there.
+- A literal auth password goes to `auth add` in `BRAINPROXY_SECRET_PASSWORD`, not argv. The
+  login body is a template (`{{password}}` is filled at login), so it stays an argument.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).

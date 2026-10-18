@@ -2,7 +2,7 @@
 // rule data, and project info. Each sub-tab loads its data when first shown.
 
 import { Fragment, useEffect, useState, type ReactNode } from "react";
-import { run } from "../api";
+import { run, type CliInput } from "../api";
 import { AUTO_PROXY, autoProxy, useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
@@ -72,9 +72,9 @@ function ConfirmButton(p: { label: string; question: string; onConfirm: () => vo
 /** Runs a command, toasting its error; returns its data or undefined on failure. */
 function useRunner() {
   const app = useApp();
-  return async <T,>(args: string[]): Promise<T | undefined> => {
+  return async <T,>(args: string[], input?: CliInput): Promise<T | undefined> => {
     try {
-      return await run<T>(args);
+      return await run<T>(args, input);
     } catch (e: any) {
       app.toast(e.message, "error");
       return undefined;
@@ -215,13 +215,12 @@ function addArgs(f: Form): string[] {
       .forEach((l) => args.push(`${flag}=${l}`));
   opt("--login-url", f.loginUrl);
   opt("--login-method", f.loginMethod);
-  // ponytail: the CLI has no stdin/env option for the login body, so it stays in argv.
+  // The login body is a template ({{password}} is filled at login), so it isn't a secret.
   if (f.loginBody) args.push(`--login-body=${f.loginBody}`);
   opt("--login-request", f.loginRequestFile);
   lines("--login-header", f.loginHeaders);
   opt("--username", f.username);
   if (f.passwordMode === "env") opt("--password-env", f.passwordEnv);
-  if (f.passwordMode === "literal" && f.password) args.push(`--password=${f.password}`);
   opt("--csrf-url", f.csrfUrl);
   opt("--csrf-regex", f.csrfRegex);
   opt("--token-regex", f.tokenRegex);
@@ -284,7 +283,9 @@ function Auth() {
   const save = async () => {
     if (!form) return;
     if (!form.name.trim()) return app.toast("A profile needs a name", "error");
-    const d = await exec(addArgs(form));
+    // A literal password goes in the environment, never on the command line (`ps` shows that).
+    const env = form.passwordMode === "literal" && form.password ? { BRAINPROXY_SECRET_PASSWORD: form.password } : undefined;
+    const d = await exec(addArgs(form), { env });
     if (!d) return;
     app.toast(`Saved profile ${form.name.trim()}`);
     setForm(null);

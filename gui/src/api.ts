@@ -23,7 +23,7 @@ export const getProject = () => project;
 /**
  * Input for one CLI call. `stdin` text is sent as UTF-8; pass bytes (see `textBytes`) when it
  * holds a binary body. `env` sets BRAINPROXY_SECRET_* variables on the child, so secrets stay
- * off the command line (point the CLI at them with e.g. --password-env).
+ * off the command line (e.g. BRAINPROXY_SECRET_PASSWORD for `auth add`).
  */
 export interface CliInput {
   stdin?: string | Uint8Array;
@@ -32,17 +32,16 @@ export interface CliInput {
 
 export async function cli<T = any>(args: string[], input: string | Uint8Array | CliInput = {}): Promise<Envelope<T>> {
   const { stdin, env } = typeof input === "string" || input instanceof Uint8Array ? { stdin: input, env: undefined } : input;
+  // Bytes go as a number array (Vec<u8> in Tauri, a Buffer in the dev bridge), so nothing is re-encoded.
+  const bytes = stdin == null ? null : Array.from(typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin);
   if (inTauri) {
     const { invoke } = await import("@tauri-apps/api/core");
-    // Bytes go over IPC as a number array (Vec<u8> on the Rust side), so nothing is re-encoded.
-    const bytes = stdin == null ? null : Array.from(typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin);
     return invoke<Envelope<T>>("cli", { project, args, stdin: bytes, env: env ?? null });
   }
-  // ponytail: the dev bridge (vite.config.ts) takes stdin as text and no env, so binary stdin is lossy there.
   const res = await fetch("/api/cli", {
     method: "POST",
     headers: { "content-type": "application/json", "x-brainproxy": "1" },
-    body: JSON.stringify({ project, args, stdin: stdin instanceof Uint8Array ? new TextDecoder().decode(stdin) : stdin, env }),
+    body: JSON.stringify({ project, args, stdin: bytes, env }),
   });
   return res.json();
 }

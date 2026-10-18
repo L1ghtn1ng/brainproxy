@@ -23,11 +23,19 @@ function cliBridge(): Plugin {
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
-          const { project, args, stdin } = JSON.parse(body) as { project: string; args: string[]; stdin?: string };
+          const { project, args, stdin, env } = JSON.parse(body) as {
+            project: string;
+            args: string[];
+            stdin?: number[] | null;
+            env?: Record<string, string> | null;
+          };
+          // Same rule as the Tauri command: only BRAINPROXY_SECRET_* variables may be set.
+          const extra = Object.fromEntries(Object.entries(env ?? {}).filter(([k]) => k.startsWith("BRAINPROXY_SECRET_")));
           const child = spawn(bin, ["--format", "json", "--project", project, ...args], {
             stdio: [stdin == null ? "ignore" : "pipe", "pipe", "pipe"],
+            env: { ...process.env, ...extra },
           });
-          if (stdin != null) child.stdin!.end(stdin);
+          if (stdin != null) child.stdin!.end(Buffer.from(stdin));
           let out = "";
           let err = "";
           child.stdout!.on("data", (c) => (out += c));

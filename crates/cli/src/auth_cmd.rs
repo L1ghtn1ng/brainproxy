@@ -82,8 +82,9 @@ pub struct AddArgs {
     login_header: Vec<String>,
     #[arg(long)]
     username: Option<String>,
-    /// Password stored in the project file. Prefer --password-env.
-    #[arg(long, conflicts_with = "password_env")]
+    /// Password stored in the project file. Prefer --password-env. Also read from
+    /// BRAINPROXY_SECRET_PASSWORD, which keeps it off the command line (the desktop app uses it).
+    #[arg(long, conflicts_with = "password_env", env = "BRAINPROXY_SECRET_PASSWORD", hide_env_values = true)]
     password: Option<String>,
     /// Environment variable holding the password, read at each login; never stored.
     #[arg(long)]

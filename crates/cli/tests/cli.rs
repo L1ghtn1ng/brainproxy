@@ -683,3 +683,19 @@ fn auth_secrets_stay_out_of_history_and_replay_fills_them_in() {
     assert_ne!(code, 0, "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("«auth:p:header:X-Api-Key»"), "{v}");
 }
+
+#[test]
+fn auth_add_reads_a_literal_password_from_the_environment() {
+    let project = tmp_project("pwenv");
+    let out = bin()
+        .args(["--format", "json", "--project"])
+        .arg(&project)
+        .args(["auth", "add", "--login-url", "http://127.0.0.1:1/login", "--username", "u", "p"])
+        .env("BRAINPROXY_SECRET_PASSWORD", "-Pa55")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let (_, v) = run(&["auth", "show", "p"], &project, None);
+    assert!(v["data"]["profile"]["password"]["literal"].is_string(), "{v}");
+    assert!(!v.to_string().contains("-Pa55"), "{v}");
+}
