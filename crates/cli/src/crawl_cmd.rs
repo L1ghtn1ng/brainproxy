@@ -12,7 +12,8 @@ use crate::output::Out;
 
 #[derive(clap::Args)]
 pub struct CrawlArgs {
-    /// Seed URLs. The crawl stays on their hosts.
+    /// Seed URLs. The crawl stays on their origins (scheme, host and port; an http
+    /// seed also covers https on port 443 of the same host).
     #[arg(required = true)]
     urls: Vec<String>,
     /// Link depth from the seeds.
@@ -38,6 +39,9 @@ pub struct CrawlArgs {
     /// Also crawl subdomains of the seed hosts.
     #[arg(long)]
     subdomains: bool,
+    /// Follow links to any port and scheme on the seed hosts, not only the seeds' origins.
+    #[arg(long)]
+    any_port: bool,
     /// Only crawl paths starting with this prefix.
     #[arg(long)]
     path_prefix: Option<String>,
@@ -103,6 +107,7 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
         send,
         headers,
         subdomains: args.subdomains,
+        any_port: args.any_port,
         path_prefix: args.path_prefix.clone(),
         exclude,
         submit_forms: !args.no_forms,

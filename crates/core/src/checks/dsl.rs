@@ -684,7 +684,9 @@ fn call(f: Func, args: Vec<Value>, re: &LazyRegex) -> Option<Value> {
             if max < min {
                 return None;
             }
-            Some(Value::Num((min + (rand_u64() % (max - min + 1) as u64) as i64) as f64))
+            // In i128: the span of saturated bounds (i64::MIN..=i64::MAX) is 2^64.
+            let span = (max as i128 - min as i128 + 1) as u128;
+            Some(Value::Num((min as i128 + (rand_u64() as u128 % span) as i128) as f64))
         }
         CompareVersions => {
             let v = version(&s(0))?;
@@ -874,6 +876,8 @@ mod tests {
         assert!(yes("regex('^[a-z]{6}$', rand_base(6, 'abcdefghijklmnopqrstuvwxyz'))"));
         assert!(yes("!contains(rand_text_alpha(200, 'aeiou'), 'a')"));
         assert!(yes("rand_int(5, 7) >= 5 && rand_int(5, 7) <= 7"));
+        // Saturated bounds used to divide by zero.
+        assert!(yes("rand_int(-99999999999999999999999, 99999999999999999999999) >= -99999999999999999999999"));
         assert!(yes("unix_time() > 1700000000"));
         assert!(yes("compare_versions('2.4.4', '<= 2.4.4')"));
         assert!(yes("compare_versions('v3.1', '>= 3.0', '< 4.8')"));

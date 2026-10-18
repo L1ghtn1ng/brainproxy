@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use regex::Regex;
 use serde::Serialize;
@@ -39,6 +39,9 @@ pub struct CrawlConfig {
     pub headers: Vec<(String, String)>,
     /// Also crawl subdomains of the seed hosts.
     pub subdomains: bool,
+    /// Any port and scheme on the seed hosts. Otherwise only the seeds' origins
+    /// (scheme, host, port), plus https on port 443 for an http seed.
+    pub any_port: bool,
     /// Only crawl paths starting with this prefix.
     pub path_prefix: Option<String>,
     /// URLs matching any of these are never requested.
@@ -81,6 +84,8 @@ pub struct CrawlSummary {
     pub endpoint_count: usize,
     pub out_of_scope_hosts: Vec<String>,
     pub errors: usize,
+    /// Exchanges that could not be saved to the project (e.g. too large).
+    pub record_errors: usize,
     pub stopped: bool,
     pub limit_reached: bool,
     pub new_findings: usize,
@@ -89,6 +94,9 @@ pub struct CrawlSummary {
 
 struct Scope {
     hosts: Vec<String>,
+    /// Seed origins: (scheme, host, port).
+    origins: Vec<(String, String, u16)>,
+    any_port: bool,
     subdomains: bool,
     path_prefix: Option<String>,
     exclude: Vec<Regex>,
@@ -97,11 +105,27 @@ struct Scope {
 impl Scope {
     fn host_allowed(&self, u: &Url) -> bool {
         let Some(host) = u.host_str().map(|h| h.to_ascii_lowercase()) else { return false };
-        self.hosts.iter().any(|h| host == *h || (self.subdomains && host.ends_with(&format!(".{h}"))))
+        self.hosts.iter().any(|h| self.same_host(&host, h))
+    }
+
+    fn same_host(&self, host: &str, seed: &str) -> bool {
+        host == seed || (self.subdomains && host.ends_with(&format!(".{seed}")))
+    }
+
+    /// On a seed's origin; an http seed also covers https on 443 (sites redirect there).
+    fn origin_allowed(&self, u: &Url) -> bool {
+        let (Some(host), Some(port)) = (u.host_str().map(|h| h.to_ascii_lowercase()), u.port_or_known_default()) else {
+            return false;
+        };
+        self.origins.iter().any(|(scheme, h, p)| {
+            self.same_host(&host, h)
+                && ((u.scheme() == scheme && port == *p) || (scheme == "http" && u.scheme() == "https" && port == 443))
+        })
     }
 
     fn allows(&self, u: &Url) -> bool {
         self.host_allowed(u)
+            && (self.any_port || self.origin_allowed(u))
             && matches!(u.scheme(), "http" | "https")
             && self.path_prefix.as_deref().is_none_or(|p| u.path().starts_with(p))
             && !self.exclude.iter().any(|r| r.is_match(u.as_str()))
@@ -120,6 +144,13 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     }
     let scope = Scope {
         hosts: seeds.iter().filter_map(|u| u.host_str().map(|h| h.to_ascii_lowercase())).collect(),
+        origins: seeds
+            .iter()
+            .filter_map(|u| {
+                Some((u.scheme().to_string(), u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()?))
+            })
+            .collect(),
+        any_port: cfg.any_port,
         subdomains: cfg.subdomains,
         path_prefix: cfg.path_prefix.clone(),
         exclude: cfg.exclude.clone(),
@@ -127,7 +158,8 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
 
     let mut store = Store::open(project)?;
     let client = Arc::new(Client::new(cfg.send.clone()));
-    let limiter = cfg.rate.filter(|r| *r > 0.0).map(|r| Duration::from_secs_f64(1.0 / r));
+    // One limiter for the whole crawl: --rate holds across tasks and depths.
+    let limiter = crate::scan::active::Limiter::new(cfg.rate).map(Arc::new);
     let mut summary = CrawlSummary::default();
     let mut seen: HashSet<Req> = HashSet::new();
     let mut per_path: HashMap<(String, String), usize> = HashMap::new();
@@ -178,17 +210,24 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
 
         let sem = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
         let mut tasks = Vec::new();
-        for (i, req) in batch.iter().cloned().enumerate() {
-            let (sem, client, headers, ctl, auth, jar) =
-                (sem.clone(), client.clone(), cfg.headers.clone(), ctl.clone(), cfg.auth.clone(), jar.clone());
-            let delay = limiter.map(|d| d * (i as u32 / cfg.concurrency.max(1) as u32));
+        for req in &batch {
+            let (req, sem, client, headers, ctl, auth, jar, limiter) = (
+                req.clone(),
+                sem.clone(),
+                client.clone(),
+                cfg.headers.clone(),
+                ctl.clone(),
+                cfg.auth.clone(),
+                jar.clone(),
+                limiter.clone(),
+            );
             tasks.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.ok()?;
+                if let Some(l) = &limiter {
+                    l.wait().await;
+                }
                 if ctl.stopped() {
                     return None;
-                }
-                if let Some(d) = delay {
-                    tokio::time::sleep(d).await;
                 }
                 Some(fetch(&client, auth.as_deref(), &jar, &req, &headers).await)
             }));
@@ -240,7 +279,17 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
                 }
             }
         }
-        store.record_batch(&captures)?;
+        // One unsavable exchange (e.g. a huge body) must not abort the crawl:
+        // fall back to saving one by one and count what fails.
+        if let Err(e) = store.record_batch(&captures) {
+            eprintln!("brainproxy: crawl: saving {} exchanges failed ({e}); saving one by one", captures.len());
+            for c in &captures {
+                if let Err(e) = store.record(c) {
+                    eprintln!("brainproxy: crawl: exchange not saved: {e}");
+                    summary.record_errors += 1;
+                }
+            }
+        }
         summary.new_findings += crate::scan::passive::scan_pending(&mut store)?.new_findings;
         ctl.set_progress(serde_json::json!({
             "depth": depth,
@@ -604,18 +653,29 @@ fn refresh_url(v: &str) -> Option<String> {
     Some(v[i + 4..].trim().trim_matches(['\'', '"']).to_string())
 }
 
-/// One request per form, filled with existing or generated values.
+/// Forms submitted per page; the rest are ignored.
+const MAX_FORMS: usize = 200;
+
+/// One request per form (at most `MAX_FORMS`), filled with existing or generated values.
+/// Linear in the page: one forward pass over the tags and the `</form` closers.
 fn form_requests(html: &str, all: &[Tag], base: &Url) -> Vec<Found> {
+    use crate::scan::passive::util::find_ci;
     let mut out = Vec::new();
-    let forms: Vec<&Tag> = all.iter().filter(|t| t.name == "form").collect();
-    for (i, form) in forms.iter().enumerate() {
+    let forms: Vec<usize> = all.iter().enumerate().filter(|(_, t)| t.name == "form").map(|(i, _)| i).collect();
+    let mut close = None; // the next `</form` at or after the current form
+    for (n, &fi) in forms.iter().enumerate().take(MAX_FORMS) {
+        let form = &all[fi];
         // Fields between this form's start and the next </form> (or next form).
-        let end = crate::scan::passive::util::find_ci(html, "</form", form.end)
-            .unwrap_or(html.len())
-            .min(forms.get(i + 1).map(|f| f.start).unwrap_or(html.len()));
+        if close.is_none_or(|c| c < form.end) {
+            close = Some(find_ci(html, "</form", form.end).unwrap_or(html.len()));
+        }
+        let next_form = forms.get(n + 1).map(|&j| all[j].start).unwrap_or(html.len());
+        let end = close.unwrap_or(html.len()).min(next_form);
+        let inside = &all[fi + 1..forms.get(n + 1).copied().unwrap_or(all.len())];
+        let inside = &inside[..inside.partition_point(|t| t.start < end)];
         let mut fields: Vec<(String, String)> = Vec::new();
         let mut radios: HashSet<String> = HashSet::new();
-        for t in all.iter().filter(|t| t.start > form.start && t.start < end) {
+        for (k, t) in inside.iter().enumerate() {
             let Some(name) = t.attr("name").filter(|n| !n.is_empty()) else { continue };
             match t.name.as_str() {
                 "input" => {
@@ -636,8 +696,8 @@ fn form_requests(html: &str, all: &[Tag], base: &Url) -> Vec<Found> {
                     }
                 }
                 "select" => {
-                    let close = crate::scan::passive::util::find_ci(html, "</select", t.end).unwrap_or(end);
-                    let first = all.iter().find(|o| o.name == "option" && o.start > t.start && o.start < close);
+                    // The first option before the next select (closing tags aren't in `all`).
+                    let first = inside[k + 1..].iter().take_while(|o| o.name != "select").find(|o| o.name == "option");
                     let v = first.and_then(|o| o.attr("value").map(str::to_string)).unwrap_or_default();
                     fields.push((name.into(), v));
                 }
@@ -696,6 +756,7 @@ fn form_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn extracts_links_forms_and_robots() {
@@ -801,6 +862,8 @@ mod tests {
     fn scope_rules() {
         let scope = Scope {
             hosts: vec!["a.test".into()],
+            origins: vec![("https".into(), "a.test".into(), 443)],
+            any_port: false,
             subdomains: false,
             path_prefix: Some("/app".into()),
             exclude: vec![Regex::new(DEFAULT_EXCLUDE).unwrap()],
@@ -810,5 +873,48 @@ mod tests {
         assert!(!scope.allows(&Url::parse("https://b.a.test/app").unwrap()));
         assert!(!scope.allows(&Url::parse("https://a.test/app/logout").unwrap()));
         assert!(!scope.allows(&Url::parse("ftp://a.test/app").unwrap()));
+    }
+
+    #[test]
+    fn scope_keeps_the_seed_origin_unless_any_port() {
+        let mut scope = Scope {
+            hosts: vec!["a.test".into()],
+            origins: vec![("http".into(), "a.test".into(), 8080)],
+            any_port: false,
+            subdomains: false,
+            path_prefix: None,
+            exclude: vec![],
+        };
+        let ok = |s: &Scope, u: &str| s.allows(&Url::parse(u).unwrap());
+        assert!(ok(&scope, "http://a.test:8080/x"));
+        // http -> https on the same host is the same site.
+        assert!(ok(&scope, "https://a.test/x"));
+        assert!(!ok(&scope, "http://a.test:8081/internal-admin"));
+        assert!(!ok(&scope, "http://a.test/x"));
+        assert!(!ok(&scope, "https://a.test:8443/x"));
+        scope.any_port = true;
+        assert!(ok(&scope, "http://a.test:8081/internal-admin"));
+        assert!(!ok(&scope, "http://b.test:8080/x"));
+    }
+
+    #[test]
+    fn form_extraction_is_linear_and_capped() {
+        let page = Url::parse("http://a.test/").unwrap();
+        let headers = vec![("Content-Type".to_string(), "text/html".to_string())];
+        // 40,000 unclosed forms took ~9 s when each form scanned to the end of the page.
+        let html = "<form><input name=a>".repeat(40_000);
+        let started = Instant::now();
+        let found = extract(&page, &headers, html.as_bytes(), true);
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        let forms: Vec<&Found> = found.iter().filter(|f| f.form).collect();
+        assert_eq!(forms.len(), MAX_FORMS);
+        assert!(forms.iter().all(|f| f.url == "http://a.test/?a=brainproxy"), "{forms:?}");
+        // Fields stop at </form>; a select takes its first option.
+        let html = "<form method=post><select name=s><option value=x><option value=y></select></form>\
+                    <input name=outside><form><select name=t></select><input name=b></form>";
+        let found = extract(&page, &headers, html.as_bytes(), true);
+        let bodies: Vec<String> =
+            found.iter().filter(|f| f.form).map(|f| f.body.clone().unwrap_or_else(|| f.url.clone())).collect();
+        assert_eq!(bodies, ["s=x", "http://a.test/?t=&b=brainproxy"]);
     }
 }

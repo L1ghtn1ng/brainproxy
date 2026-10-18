@@ -462,3 +462,63 @@ fn output_files_are_not_overwritten_without_force() {
         assert_ne!(std::fs::read_to_string(&file).unwrap(), "keep me");
     }
 }
+
+/// `/` links to five pages; every other path is a plain page. Serves until the test process ends.
+fn serve_links() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 16384];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf[len..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
+                let body = if line.starts_with("GET / ") {
+                    "<a href=/a>a</a><a href=/b>b</a><a href=/c>c</a><a href=/d>d</a><a href=/e>e</a>"
+                } else {
+                    "page"
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn crawl_rate_holds_across_concurrency() {
+    let port = serve_links();
+    let project = tmp_project("crawlrate");
+    let site = format!("http://127.0.0.1:{port}/");
+    // 6 requests at 4/s take at least 1.25 s; the old per-batch delay sent the 5 links at once.
+    let (code, v) = run(&["crawl", &site, "--rate", "4", "-c", "10", "--no-robots", "--no-sitemap"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["requests"], 6, "{v}");
+    assert!(v["data"]["elapsed_ms"].as_u64().unwrap() >= 1200, "{v}");
+}
+
+#[test]
+fn scan_active_skips_state_changing_methods_by_default() {
+    let port = serve_site();
+    let project = tmp_project("methods");
+    let req = format!("DELETE /item?id=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+    let (code, v) = run(&["send", "--scheme", "http"], &project, Some(req.as_bytes()));
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = run(&["scan", "active", "--rules", "40018", "--no-oob"], &project, None);
+    assert_eq!(code, 2, "{v}");
+    let (code, v) =
+        run(&["scan", "active", "--rules", "40018", "--no-oob", "--include-methods", "delete"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["targets"], 1, "{v}");
+}

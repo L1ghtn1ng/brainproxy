@@ -482,13 +482,22 @@ fn rand_u64() -> u64 {
     h.finish()
 }
 
-struct Limiter {
+/// Spaces requests evenly across all tasks sharing it (also used by the crawler).
+pub(crate) struct Limiter {
     interval: Duration,
     next: tokio::sync::Mutex<Instant>,
 }
 
 impl Limiter {
-    async fn wait(&self) {
+    /// None when there is no limit (no rate, or not positive).
+    pub(crate) fn new(rate: Option<f64>) -> Option<Limiter> {
+        rate.filter(|r| *r > 0.0).map(|r| Limiter {
+            interval: Duration::from_secs_f64(1.0 / r),
+            next: tokio::sync::Mutex::new(Instant::now()),
+        })
+    }
+
+    pub(crate) async fn wait(&self) {
         let at = {
             let mut next = self.next.lock().await;
             let at = (*next).max(Instant::now());
@@ -565,6 +574,8 @@ pub struct ActiveSummary {
     /// Findings raised in this run, per alert ref.
     pub raised: BTreeMap<String, usize>,
     pub new_findings: usize,
+    /// Rule units that crashed (panicked) instead of finishing.
+    pub errors: usize,
     /// None when no OOB listener was running (out-of-band checks skipped).
     pub oob: Option<OobSummary>,
     pub stopped: bool,
@@ -651,10 +662,7 @@ pub async fn run(
         strength: cfg.strength,
         ctl: ctl.clone(),
         deadline: cfg.max_duration.map(|d| started + d),
-        limiter: cfg.rate.filter(|r| *r > 0.0).map(|r| Limiter {
-            interval: Duration::from_secs_f64(1.0 / r),
-            next: tokio::sync::Mutex::new(Instant::now()),
-        }),
+        limiter: Limiter::new(cfg.rate),
         requests: AtomicU64::new(0),
         reports: Mutex::new(tx),
         raised: Mutex::new(BTreeMap::new()),
@@ -698,6 +706,7 @@ pub async fn run(
     let total = units.len();
     let done = Arc::new(AtomicU64::new(0));
     let sem = Arc::new(tokio::sync::Semaphore::new(cfg.concurrency.max(1)));
+    let mut errors = 0;
     units.sort_by_key(|u| u.1.phase());
     let mut phases: Vec<Vec<Unit>> = Vec::new();
     for u in units {
@@ -728,7 +737,10 @@ pub async fn run(
             }));
         }
         for t in tasks {
-            let _ = t.await;
+            // A panicking rule is an error, not a silently skipped unit.
+            if t.await.is_err() {
+                errors += 1;
+            }
         }
     }
 
@@ -780,6 +792,7 @@ pub async fn run(
         requests,
         raised: summary_raised,
         new_findings,
+        errors,
         oob,
         stopped: ctl.stopped(),
         timed_out,
@@ -797,5 +810,69 @@ fn keep_alive(request: &[u8]) -> Vec<u8> {
         raw.set_header("Connection", "keep-alive").into_bytes()
     } else {
         request.to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Boom;
+
+    impl ActiveRule for Boom {
+        fn id(&self) -> u32 {
+            999_999
+        }
+        fn name(&self) -> &'static str {
+            "boom"
+        }
+        fn alerts(&self) -> &'static [&'static AlertDef] {
+            &[]
+        }
+        fn scope(&self) -> RuleScope {
+            RuleScope::Page
+        }
+        fn scan<'a>(&'a self, _cx: &'a Cx) -> BoxFuture<'a> {
+            Box::pin(async { std::panic::panic_any("boom-rule-test") })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_rule_counts_as_an_error() {
+        // Keep the expected panic out of the test log (scripts/check.sh greps for "panicked").
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.payload().downcast_ref::<&str>() != Some(&"boom-rule-test") {
+                prev(info);
+            }
+        }));
+        static BOOM: Boom = Boom;
+        let project = std::env::temp_dir().join(format!("bp-active-boom-{}.bpdb", std::process::id()));
+        let _ = std::fs::remove_file(&project);
+        let target = ScanTarget {
+            history_id: None,
+            target: Target::from_url("http://127.0.0.1:9/").unwrap(),
+            request: b"GET / HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n".to_vec(),
+            response: b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+            duration_ms: None,
+        };
+        let cfg = ActiveConfig {
+            strength: Strength::Medium,
+            concurrency: 1,
+            rate: None,
+            send: SendOptions::default(),
+            points: PointOptions::default(),
+            rules: None,
+            exclude_rules: vec![],
+            no_rules: true,
+            checks: vec![&BOOM],
+            max_duration: None,
+            auth: None,
+            oob: None,
+            oob_wait: Duration::ZERO,
+        };
+        let s = run(&project, vec![target], cfg, JobControl::default()).await.unwrap();
+        let _ = std::fs::remove_file(&project);
+        assert_eq!((s.units, s.units_done, s.errors), (1, 0, 1), "{s:?}");
     }
 }

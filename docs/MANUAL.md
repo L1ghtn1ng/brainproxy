@@ -167,6 +167,8 @@ attack type, and pick payloads:
     cookies the site sets and sends them back, so tick *Inject into cookies* to attack them
     (the guided Standard and Thorough scans do). It doesn't run JavaScript: for single-page
     apps, browse the app through the proxy first.
+    The crawl stays on the site URLs' origins (scheme, host and port); an `http://` site
+    also covers `https://` on port 443 of the same host, since sites redirect there.
   - **Audit everything recorded:** attacks all traffic already in the project.
   - **Audit specific URLs:** only the requests you list.
   - **Options:** strength, rules, login profile, speed limits, and *Include Nuclei
@@ -178,6 +180,9 @@ attack type, and pick payloads:
 
 Passive rules run automatically on everything recorded. Active scans send real attack
 requests that can change data: prefer a test environment.
+By default an active scan only replays GET, HEAD, OPTIONS and POST requests from history;
+DELETE, PUT, PATCH and other methods are skipped (and counted as `skipped_methods`) unless
+you include them.
 
 ### Findings
 - **Layout:** issues grouped by type, filterable by risk, with false positives hidden by
@@ -256,6 +261,18 @@ brainproxy findings show 12
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
 brainproxy report html -o acme-report.html
 ```
+
+Crawl and active-scan scope and safety flags:
+
+- `crawl --any-port` and `scan active --crawl --crawl-any-port`: follow links to any port
+  and scheme on the seed hosts. Without it the crawl stays on the seeds' origins (plus
+  https on 443 for an http seed), so a page can't steer it, with your cookies and auth, to
+  other services on the same host.
+- `crawl --rate N` and `scan active --rate N`: at most N requests per second in total,
+  whatever `-c` is.
+- The crawler submits at most 200 forms per page.
+- `scan active --include-methods DELETE,PUT,PATCH` (or `all`): also attack requests with
+  these methods. Requests picked with `--history-id` are attacked whatever their method.
 
 More detail: [README](../README.md), [MCP](MCP.md), [checks](CHECKS.md),
 [rule updates](RULE_UPDATES.md), [out-of-band](OOB.md), [desktop app](GUI.md).

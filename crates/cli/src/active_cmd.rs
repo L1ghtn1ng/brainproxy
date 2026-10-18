@@ -31,6 +31,14 @@ pub struct ActiveArgs {
     /// Maximum crawl requests for --crawl.
     #[arg(long, default_value_t = 500, requires = "crawl")]
     crawl_max_pages: usize,
+    /// Let --crawl follow links to any port and scheme on the URLs' hosts (and attack
+    /// what it finds there), not only the URLs' origins.
+    #[arg(long, requires = "crawl")]
+    crawl_any_port: bool,
+    /// Also attack requests from history with these methods (comma-separated, or `all`).
+    /// By default only GET, HEAD, OPTIONS and POST are replayed; --history-id is always attacked.
+    #[arg(long, value_delimiter = ',', value_name = "METHODS")]
+    include_methods: Vec<String>,
     /// History entry to attack. Repeatable.
     #[arg(long = "history-id")]
     history_ids: Vec<i64>,
@@ -189,7 +197,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     let result = crate::jobs_cmd::run_job(project, args.job_id, |ctl| {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         let mut crawled = serde_json::Value::Null;
-        let (targets, skipped) = match selected {
+        let (targets, skipped, skipped_methods) = match selected {
             Some(s) => s,
             None => {
                 let crawl_cfg = brainproxy_core::crawl::CrawlConfig {
@@ -202,6 +210,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                     send: cfg.send.clone(),
                     headers: vec![],
                     subdomains: false,
+                    any_port: args.crawl_any_port,
                     path_prefix: None,
                     exclude: vec![regex::Regex::new(brainproxy_core::crawl::DEFAULT_EXCLUDE).expect("valid default")],
                     submit_forms: true,
@@ -236,6 +245,10 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         })?;
         let mut v = json!(summary);
         v["skipped_out_of_scope"] = json!(skipped);
+        if skipped_methods > 0 {
+            v["skipped_methods"] = json!(skipped_methods);
+            v["methods_hint"] = json!("Requests other than GET, HEAD, OPTIONS and POST were not attacked; add --include-methods to attack them.");
+        }
         if !crawled.is_null() {
             v["crawl"] = crawled;
         }
@@ -309,7 +322,12 @@ struct Selection {
     history_ids: Vec<i64>,
     where_sql: Option<String>,
     max_targets: usize,
+    /// Methods attacked besides the default ones (upper case; `ALL` for every method).
+    include_methods: Vec<String>,
 }
+
+/// Methods attacked by default: replaying others (DELETE, PUT, PATCH, ...) can change data.
+const SAFE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST"];
 
 impl Selection {
     fn from_args(args: &ActiveArgs) -> Self {
@@ -318,6 +336,7 @@ impl Selection {
             history_ids: args.history_ids.clone(),
             where_sql: args.where_sql.clone(),
             max_targets: args.max_targets,
+            include_methods: args.include_methods.iter().map(|m| m.trim().to_ascii_uppercase()).collect(),
         }
     }
 
@@ -329,7 +348,18 @@ impl Selection {
             .filter_map(|u| Target::from_url(u).ok())
             .map(|t| {
                 let q = |s: &str| s.replace('\'', "''");
-                format!("(scheme = '{}' AND host = '{}' AND port = {})", q(&t.scheme), q(&t.host), t.port)
+                let host = format!("host = '{}'", q(&t.host));
+                if args.crawl_any_port {
+                    host
+                } else if t.scheme == "http" {
+                    // The crawl follows an http site to https on 443.
+                    format!(
+                        "({host} AND ((scheme = 'http' AND port = {}) OR (scheme = 'https' AND port = 443)))",
+                        t.port
+                    )
+                } else {
+                    format!("({host} AND scheme = '{}' AND port = {})", q(&t.scheme), t.port)
+                }
             })
             .collect();
         let site = sites.join(" OR ");
@@ -337,18 +367,19 @@ impl Selection {
         if let Some(w) = &args.where_sql {
             where_sql = format!("{where_sql} AND ({w})");
         }
-        Selection { urls: vec![], history_ids: vec![], where_sql: Some(where_sql), max_targets: args.max_targets }
+        Selection { urls: vec![], history_ids: vec![], where_sql: Some(where_sql), ..Self::from_args(args) }
     }
 }
 
-/// Picks and de-duplicates targets; returns them with the number skipped as out of scope.
+/// Picks and de-duplicates targets; returns them with the numbers skipped as out of
+/// scope and for their method.
 fn select_targets(
     project: &Path,
     args: &Selection,
     send: &SendOptions,
     opts: &PointOptions,
     auth: Option<&AuthSession>,
-) -> Result<(Vec<ScanTarget>, usize), Error> {
+) -> Result<(Vec<ScanTarget>, usize, usize), Error> {
     let store = Store::open(project)?;
     let mut ids: Vec<i64> = args.history_ids.clone();
     if let Some(w) = &args.where_sql {
@@ -412,14 +443,25 @@ fn select_targets(
     }
     // One target per method + origin + path + parameter names.
     let mut seen = HashSet::new();
+    let mut skipped_methods = 0;
+    let all_methods = args.include_methods.iter().any(|m| m == "ALL");
     targets.retain(|t| {
         let head = RawRequest::from_bytes(t.request.clone()).head().ok();
-        let method = head.as_ref().map(|h| h.method.clone()).unwrap_or_default();
+        let method = head.as_ref().map(|h| h.method.to_ascii_uppercase()).unwrap_or_default();
+        let explicit = t.history_id.is_some_and(|id| args.history_ids.contains(&id));
+        if !(all_methods
+            || explicit
+            || SAFE_METHODS.contains(&method.as_str())
+            || args.include_methods.contains(&method))
+        {
+            skipped_methods += 1;
+            return false;
+        }
         let path = head.map(|h| h.target.split('?').next().unwrap_or("").to_string()).unwrap_or_default();
         let mut names: Vec<String> = points::points(&t.request, opts).into_iter().map(|p| p.name).collect();
         names.sort();
         seen.insert((method, t.target.origin(), path, names))
     });
     targets.truncate(args.max_targets);
-    Ok((targets, skipped))
+    Ok((targets, skipped, skipped_methods))
 }
