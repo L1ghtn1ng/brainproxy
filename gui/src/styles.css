@@ -1909,10 +1909,31 @@ button.chip {
     transform: translateX(300%);
   }
 }
+/* Results use the card's full width: four across, two by two, or one column, never 3 + 1. */
+.wiz-done {
+  max-width: none;
+  container-type: inline-size;
+}
 .wiz-results {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
+}
+@container (max-width: 880px) {
+  .wiz-results {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@container (max-width: 440px) {
+  .wiz-results {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.wiz-next {
+  flex-wrap: wrap;
+}
+.wiz-next .btn {
+  flex-shrink: 0;
 }
 .wiz-result {
   display: flex;

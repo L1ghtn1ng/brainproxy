@@ -299,7 +299,7 @@ function WizardProgress({ jobId, onClose }: { jobId: number; onClose: () => void
           <div className="error">{job.error}</div>
         </div>
       ) : (
-        <div className="wiz-body">
+        <div className="wiz-body wiz-done">
           <div className="wiz-results">
             {(["high", "medium", "low", "info"] as Risk[]).map((r) => (
               <div key={r} className="wiz-result">
@@ -313,7 +313,7 @@ function WizardProgress({ jobId, onClose }: { jobId: number; onClose: () => void
               </div>
             ))}
           </div>
-          <div className="row gap">
+          <div className="row gap wiz-next">
             <button className="btn primary" onClick={() => app.setTab("findings")}>
               Review the findings
             </button>
