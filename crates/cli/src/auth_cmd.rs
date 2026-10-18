@@ -54,7 +54,7 @@ pub enum AuthCmd {
     },
     /// All profiles with their session state.
     List,
-    /// One profile (password redacted).
+    /// One profile (password and header values redacted).
     Show { name: String },
     /// Delete a profile and its session.
     Remove { name: String },
@@ -190,7 +190,7 @@ pub fn auth(project: &Path, cmd: AuthCmd, out: &Out) -> Result<(), Error> {
             if login_request.is_some() && a.login_url.is_none() {
                 return Err(Error::InvalidInput("--login-request needs --login-url (where to send it)".into()));
             }
-            let profile = AuthProfile {
+            let mut profile = AuthProfile {
                 name: a.name,
                 login_url: a.login_url,
                 login_method: a.login_method.to_ascii_uppercase(),
@@ -210,7 +210,19 @@ pub fn auth(project: &Path, cmd: AuthCmd, out: &Out) -> Result<(), Error> {
                 relogin_interval_secs: a.relogin_interval,
                 max_relogins: a.max_relogins,
             };
-            Store::open(project)?.auth_save_profile(&profile)?;
+            let store = Store::open(project)?;
+            // `auth show` redacts header values; re-saving one unchanged (the GUI's edit form does)
+            // keeps the stored value instead of storing the mask.
+            if let Ok((old, _)) = store.auth_profile(&profile.name) {
+                for (k, v) in &mut profile.headers {
+                    if let Some((_, stored)) =
+                        old.headers.iter().find(|(o, _)| v == "********" && o.eq_ignore_ascii_case(k))
+                    {
+                        *v = stored.clone();
+                    }
+                }
+            }
+            store.auth_save_profile(&profile)?;
             let shown = profile.redacted();
             out.ok(json!({"profile": shown, "next": format!("brainproxy auth login {}", shown.name)}), || {
                 format!("profile {:?} saved; run: brainproxy auth login {}", shown.name, shown.name)

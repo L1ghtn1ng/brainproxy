@@ -289,11 +289,13 @@ pub struct QueryResult {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        owner_only(path);
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         let store = Self::init(conn)?;
         store.migrate()?;
+        owner_only(path);
         Ok(store)
     }
 
@@ -312,6 +314,15 @@ impl Store {
         let conn =
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         conn.pragma_update(None, "query_only", true)?;
+        // Agent-written SQL must not read stored passwords, API-key headers or session tokens.
+        conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| match ctx.action {
+            rusqlite::hooks::AuthAction::Read { table_name, .. }
+                if table_name.eq_ignore_ascii_case("auth_profiles") =>
+            {
+                rusqlite::hooks::Authorization::Deny
+            }
+            _ => rusqlite::hooks::Authorization::Allow,
+        }));
         Self::init(conn)
     }
 
@@ -797,7 +808,16 @@ impl Store {
     /// longer than `max_cell` bytes are cut and marked. Blobs that aren't UTF-8
     /// come back as `{"base64": ...}`.
     pub fn query(&self, sql: &str, params: &[String], limit: usize, max_cell: usize) -> Result<QueryResult> {
-        let mut stmt = self.conn.prepare(sql).map_err(|e| Error::InvalidInput(format!("SQL: {e}")))?;
+        let mut stmt = self.conn.prepare(sql).map_err(|e| {
+            if e.to_string().contains("access to auth_profiles.") {
+                return Error::InvalidInput(
+                    "SQL: auth_profiles can't be read with query because it holds passwords, headers and session \
+                     tokens; use `auth list` or `auth show NAME` (redacted)"
+                        .into(),
+                );
+            }
+            Error::InvalidInput(format!("SQL: {e}"))
+        })?;
         let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let mut rows_iter = stmt
             .query(rusqlite::params_from_iter(params.iter().map(|p| bind_value(p))))
@@ -818,6 +838,31 @@ impl Store {
         Ok(QueryResult { row_count: rows.len(), columns, rows, truncated })
     }
 }
+
+/// Makes the project file, its -wal/-shm sidecars and `<project>.browsers/` (browser
+/// profiles with cookies) owner-only, and sets the process umask to 077 so whatever is
+/// created next (the database, sidecars, browser profiles, output files) starts that way.
+#[cfg(unix)]
+fn owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // ponytail: process-wide umask; it is a single-user CLI, nothing it writes needs to be shared.
+    unsafe { libc::umask(0o077) };
+    let with = |suffix: &str| {
+        let mut s = path.as_os_str().to_owned();
+        s.push(suffix);
+        std::path::PathBuf::from(s)
+    };
+    for (p, mode) in
+        [(path.to_path_buf(), 0o600), (with("-wal"), 0o600), (with("-shm"), 0o600), (with(".browsers"), 0o700)]
+    {
+        if p.exists() {
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn owner_only(_: &Path) {}
 
 pub(crate) fn insert_capture(conn: &Connection, c: &Capture) -> Result<i64> {
     conn.execute(
@@ -1066,5 +1111,32 @@ mod tests {
         let ro = Store::open_read_only(&path).unwrap();
         assert!(ro.query("DELETE FROM history", &[], 10, 10).is_err());
         assert_eq!(ro.count().unwrap(), 1);
+        // Secrets stay out of reach, directly or through a subquery.
+        for sql in ["SELECT state FROM AUTH_PROFILES", "SELECT (SELECT profile FROM auth_profiles)"] {
+            let e = ro.query(sql, &[], 10, 10).unwrap_err().to_string();
+            assert!(e.contains("auth show"), "{e}");
+        }
+        assert!(ro.query("SELECT name FROM sqlite_master", &[], 10, 10).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bp-store-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let browsers = dir.join("p.bpdb.browsers");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::create_dir_all(&browsers).unwrap();
+        std::fs::set_permissions(&browsers, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let s = Store::open(&path).unwrap();
+        sample(&s);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir.join("p.bpdb-wal")), 0o600);
+        assert_eq!(mode(&browsers), 0o700);
     }
 }

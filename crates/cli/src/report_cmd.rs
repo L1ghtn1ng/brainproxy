@@ -20,8 +20,12 @@ pub struct ReportArgs {
     #[arg(value_enum, default_value = "json")]
     kind: KindArg,
     /// Write the report to FILE; stdout then gets a short summary (envelope in JSON mode).
+    /// An existing file is kept unless --force.
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
+    /// Overwrite an existing --output file.
+    #[arg(long)]
+    force: bool,
     /// Report title.
     #[arg(long)]
     title: Option<String>,
@@ -127,7 +131,7 @@ pub fn report(project: &Path, a: ReportArgs, out: &Out) -> Result<(), Error> {
 
     if let Some(path) = a.output {
         let content = report::render(&r, kind);
-        std::fs::write(&path, &content)?;
+        crate::output::write_file(&path, content.as_bytes(), a.force)?;
         let mut data = summary;
         data["path"] = json!(path.display().to_string());
         data["bytes"] = json!(content.len());

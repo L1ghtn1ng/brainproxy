@@ -28,12 +28,15 @@ pub enum CaCmd {
         /// Write DER instead of PEM.
         #[arg(long)]
         der: bool,
-        /// Write to this file instead of stdout.
+        /// Write to this file instead of stdout. An existing file is kept unless --force.
         #[arg(long)]
         out: Option<PathBuf>,
         /// Print the certificate itself rather than the JSON envelope.
         #[arg(long)]
         raw: bool,
+        /// Overwrite an existing --out file.
+        #[arg(long)]
+        force: bool,
     },
     /// Add the CA to the system trust store (Debian/Kali: update-ca-certificates). Needs root.
     InstallSystem,
@@ -245,11 +248,11 @@ pub fn ca(home: &Path, cmd: CaCmd, out: &Out) -> Result<(), Error> {
             });
             out.ok(data, || format!("CA: {}", info.cert_path.display()));
         }
-        CaCmd::Export { der, out: path, raw } => {
+        CaCmd::Export { der, out: path, raw, force } => {
             let (ca, info) = load_ca(home)?;
             let bytes = if der { ca.cert_der().to_vec() } else { ca.cert_pem().as_bytes().to_vec() };
             if let Some(path) = path {
-                std::fs::write(&path, &bytes)?;
+                crate::output::write_file(&path, &bytes, force)?;
                 out.ok(json!({"path": path, "format": if der { "der" } else { "pem" }}), || {
                     format!("wrote {}", path.display())
                 });

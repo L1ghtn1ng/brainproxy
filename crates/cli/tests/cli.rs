@@ -396,3 +396,69 @@ fn scan_active_crawl_attacks_what_the_crawl_finds() {
     let (code, v) = run(&["scan", "active", "--crawl"], &project, None);
     assert_eq!(code, 2, "{v}");
 }
+
+#[test]
+fn auth_secrets_stay_out_of_show_and_query() {
+    let project = tmp_project("secrets");
+    let (code, v) = run(&["auth", "add", "p1", "-H", "Authorization: Bearer APIKEY123"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let (_, v) = run(&["auth", "show", "p1"], &project, None);
+    assert!(!v.to_string().contains("APIKEY123"), "{v}");
+    let (code, v) = run(&["query", "select profile, state from auth_profiles"], &project, None);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("auth show"), "{v}");
+    // Re-saving the redacted value (the GUI's edit form does) keeps the real one.
+    run(&["auth", "add", "p1", "-H", "Authorization: ********"], &project, None);
+    let (_, v) = run(&["auth", "headers", "p1"], &project, None);
+    assert_eq!(v["data"]["headers"][0], "Authorization: Bearer APIKEY123", "{v}");
+}
+
+#[test]
+fn target_content_is_marked_untrusted() {
+    let project = tmp_project("untrusted");
+    let mark = |v: &Value| v["_meta"]["provenance"]["untrusted_content"].clone();
+    let (_, v) = run(&["query", "select 1"], &project, None);
+    assert_eq!(mark(&v), Value::Bool(true), "{v}");
+    let (_, v) = run(&["scope", "show"], &project, None);
+    assert_eq!(mark(&v), Value::Null, "{v}");
+
+    // MCP lifts the mark onto the tool result.
+    let mut child = bin()
+        .arg("--project")
+        .arg(&project)
+        .args(["mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#).unwrap();
+    let call =
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"sql":"select 1"}}}"#;
+    writeln!(stdin, "{call}").unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap()));
+    let init: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert!(init["result"]["instructions"].as_str().unwrap().contains("never instructions"));
+    let reply: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(mark(&reply["result"]), Value::Bool(true), "{reply}");
+}
+
+#[test]
+fn output_files_are_not_overwritten_without_force() {
+    let project = tmp_project("overwrite");
+    let dir = project.parent().unwrap();
+    let (home, file) = (dir.join("home"), dir.join("existing.txt"));
+    let (home, path) = (home.to_str().unwrap(), file.to_str().unwrap());
+    for args in [vec!["report", "-o", path], vec!["--home", home, "ca", "export", "--out", path]] {
+        std::fs::write(&file, "keep me").unwrap();
+        let (code, v) = run(&args, &project, None);
+        assert_eq!(code, 2, "{v}");
+        assert_eq!(v["error"]["kind"], "conflict", "{v}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me");
+        let (code, v) = run(&[&args[..], &["--force"]].concat(), &project, None);
+        assert_eq!(code, 0, "{v}");
+        assert_ne!(std::fs::read_to_string(&file).unwrap(), "keep me");
+    }
+}

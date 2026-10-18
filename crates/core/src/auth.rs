@@ -142,11 +142,14 @@ impl AuthProfile {
         Ok(())
     }
 
-    /// The profile with the password hidden, for display.
+    /// The profile with the password and static header values hidden, for display.
     pub fn redacted(&self) -> AuthProfile {
         let mut p = self.clone();
         if let Some(Secret::Literal(_)) = p.password {
             p.password = Some(Secret::Literal("********".into()));
+        }
+        for (_, v) in &mut p.headers {
+            *v = "********".into();
         }
         p
     }
@@ -755,10 +758,12 @@ mod tests {
             name: "x".into(),
             login_url: Some("https://a.test/l".into()),
             password: Some(Secret::Literal("hunter2".into())),
+            headers: vec![("Authorization".into(), "Bearer APIKEY123".into())],
             ..Default::default()
         };
         assert!(p.validate().is_ok());
         assert_eq!(p.redacted().password, Some(Secret::Literal("********".into())));
+        assert_eq!(p.redacted().headers, vec![("Authorization".into(), "********".into())]);
         let bad = AuthProfile { csrf_url: Some("https://a.test/".into()), ..p.clone() };
         assert!(bad.validate().is_err());
     }
