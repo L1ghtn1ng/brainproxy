@@ -46,8 +46,8 @@ browsers trust the brainproxy CA in that profile only (by its key, via
 `--ignore-certificate-errors-spki-list`), Firefox gets the proxy prefs and a one-time CA import
 note. Traffic hides requests refused as out of scope by default (mostly browser background
 calls), and so does the Site map ("In scope only"); the proxy never holds an out-of-scope
-request for interception. Tools sit in a grouped, collapsible sidebar, with an Assertive
-Infosec card above Collapse (just the mark when collapsed; links open in the system browser
+request for interception. Tools sit in a grouped, collapsible sidebar, with a "By AssertiveInfosec"
+byline above Collapse and on the welcome screen (just the mark when collapsed; links open in the system browser
 via tauri-plugin-opener, limited to assertivesolutions.io); tools with several parts have sub-tabs.
 Views stay mounted when hidden, so state (selection, edits, Replay tabs) survives switching.
 
