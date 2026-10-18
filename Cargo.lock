@@ -221,6 +221,7 @@ dependencies = [
  "brotli-decompressor",
  "bytes",
  "flate2",
+ "getrandom",
  "h2",
  "hex",
  "http",

@@ -8,8 +8,6 @@
 
 pub mod server;
 
-use std::io::Read;
-
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -198,7 +196,7 @@ impl Endpoint {
 /// A fresh random token: `bp` + 18 base32 characters (90 bits).
 pub fn new_token() -> Result<String> {
     let mut bytes = [0u8; TOKEN_RANDOM];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::getrandom(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
     let mut t = String::from("bp");
     t.extend(bytes.iter().map(|b| BASE32[(b & 31) as usize] as char));
     Ok(t)
