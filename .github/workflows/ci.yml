@@ -107,6 +107,13 @@ jobs:
           $bin --version
           $bin --format json --project smoke.bpdb capabilities > /dev/null
           $bin --format json --project smoke.bpdb engagement start --target 127.0.0.1
+      - name: Checks count (temporary)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bin=target/release/brainproxy.exe
+          $bin --format json --project smoke.bpdb --home home checks update || true
+          $bin --format json --project smoke.bpdb --home home checks status
       - run: |
           cp target/release/brainproxy.exe $asset
           sha256sum $asset > $asset.sha256
