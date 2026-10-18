@@ -10,6 +10,9 @@ use crate::http::request::{find, RawRequest};
 use crate::http::response::parse_response_head;
 
 const MAX_HEAD: usize = 256 * 1024;
+/// Largest message body buffered (HTTP/1 framing included, HTTP/2 data).
+/// Anything bigger fails with a protocol error instead of eating memory.
+pub const MAX_BODY: usize = 64 * 1024 * 1024;
 const READ_CHUNK: usize = 16 * 1024;
 
 #[derive(Default)]
@@ -136,6 +139,14 @@ impl WireReader {
         Ok(n)
     }
 
+    /// [`Self::fill`] for body bytes: fails once the buffer passes `limit`.
+    async fn fill_body<S: AsyncRead + Unpin>(&mut self, s: &mut S, limit: usize) -> Result<usize> {
+        if self.buf.len() > limit {
+            return Err(too_large());
+        }
+        self.fill(s).await
+    }
+
     async fn head_end<S: AsyncRead + Unpin>(&mut self, s: &mut S, start: usize) -> Result<usize> {
         let mut searched = start;
         loop {
@@ -164,32 +175,36 @@ impl WireReader {
         body_start: usize,
         framing: Framing,
     ) -> Result<usize> {
+        let limit = body_start + MAX_BODY;
         match framing {
             Framing::None => Ok(body_start),
             Framing::Length(len) => {
+                if len > MAX_BODY {
+                    return Err(too_large());
+                }
                 let want = body_start + len;
                 while self.buf.len() < want {
-                    if self.fill(s).await? == 0 {
+                    if self.fill_body(s, limit).await? == 0 {
                         return Ok(self.buf.len());
                     }
                 }
                 Ok(want)
             }
             Framing::UntilClose => {
-                while self.fill(s).await? > 0 {}
+                while self.fill_body(s, limit).await? > 0 {}
                 Ok(self.buf.len())
             }
-            Framing::Chunked => self.chunked_end(s, body_start).await,
+            Framing::Chunked => self.chunked_end(s, body_start, limit).await,
         }
     }
 
-    async fn chunked_end<S: AsyncRead + Unpin>(&mut self, s: &mut S, mut pos: usize) -> Result<usize> {
+    async fn chunked_end<S: AsyncRead + Unpin>(&mut self, s: &mut S, mut pos: usize, limit: usize) -> Result<usize> {
         loop {
             let line_end = loop {
                 if let Some(i) = find(&self.buf[pos..], b"\r\n") {
                     break pos + i;
                 }
-                if self.fill(s).await? == 0 {
+                if self.fill_body(s, limit).await? == 0 {
                     return Ok(self.buf.len());
                 }
             };
@@ -207,14 +222,18 @@ impl WireReader {
                     if let Some(i) = find(&self.buf[pos..], b"\r\n\r\n") {
                         return Ok(pos + i + 4);
                     }
-                    if self.fill(s).await? == 0 {
+                    if self.fill_body(s, limit).await? == 0 {
                         return Ok(self.buf.len());
                     }
                 }
             }
+            // `pos` is within the buffer and `size` is capped, so this can't overflow.
+            if size > MAX_BODY || pos + size + 2 > limit {
+                return Err(too_large());
+            }
             let want = pos + size + 2;
             while self.buf.len() < want {
-                if self.fill(s).await? == 0 {
+                if self.fill_body(s, limit).await? == 0 {
                     return Ok(self.buf.len());
                 }
             }
@@ -223,9 +242,30 @@ impl WireReader {
     }
 }
 
+fn too_large() -> Error {
+    Error::Protocol(format!("message body over the {} MB limit", MAX_BODY / (1024 * 1024)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_oversized_bodies() {
+        // Chunk sizes that wrap `usize` arithmetic used to hang or panic.
+        for size in ["ffffffffffffffec", "fffffffffffffff3", "4000001"] {
+            let data = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{size}\r\nAAAA\r\n0\r\n\r\n");
+            let err = WireReader::new().read_response(&mut data.as_bytes(), "GET").await.unwrap_err();
+            assert!(err.to_string().contains("limit"), "{size}: {err}");
+        }
+        let data = b"POST / HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\nabc".to_vec();
+        assert!(WireReader::new().read_request(&mut data.as_slice()).await.is_err());
+        // A body with no framing that never ends stops at the cap.
+        let head = b"HTTP/1.1 200 OK\r\n\r\n".as_slice();
+        let mut endless = tokio::io::AsyncReadExt::chain(head, tokio::io::repeat(b'A'));
+        let err = WireReader::new().read_response(&mut endless, "GET").await.unwrap_err();
+        assert!(err.to_string().contains("limit"), "{err}");
+    }
 
     #[tokio::test]
     async fn reads_pipelined_requests() {

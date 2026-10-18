@@ -116,6 +116,9 @@ pub async fn read_response(fut: h2::client::ResponseFuture) -> Result<Vec<u8>> {
         let chunk = chunk.map_err(h2_error)?;
         let _ = body.flow_control().release_capacity(chunk.len());
         buf.extend_from_slice(&chunk);
+        if buf.len() > crate::http::wire::MAX_BODY {
+            return Err(Error::Protocol("HTTP/2 response body over the 64 MB limit".into()));
+        }
     }
     Ok(response_bytes(&parts, &buf))
 }

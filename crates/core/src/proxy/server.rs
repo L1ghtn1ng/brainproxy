@@ -508,10 +508,10 @@ async fn forward(ctx: &Arc<Ctx>, target: &Target, request: &[u8], method: &str, 
         }
     }
     let request = if h2 { h2p::to_http1(request) } else { request.to_vec() };
-    let (conn, response) =
-        tokio::time::timeout(Duration::from_secs(120), ctx.client.exchange(&request, target, method))
-            .await
-            .map_err(|_| Error::Timeout(Duration::from_secs(120)))??;
+    let timeout = ctx.client.options().timeout;
+    let (conn, response) = tokio::time::timeout(timeout, ctx.client.exchange(&request, target, method))
+        .await
+        .map_err(|_| Error::Timeout(timeout))??;
     Ok(Upstream { conn: Some(conn), sent: request, response })
 }
 

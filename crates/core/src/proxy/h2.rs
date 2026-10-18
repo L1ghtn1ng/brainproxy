@@ -11,7 +11,7 @@ use crate::http::response::{dechunk, parse_response_head};
 use crate::http::target::Target;
 
 /// Largest request body read from a browser stream.
-pub const MAX_BODY: usize = 64 * 1024 * 1024;
+pub use crate::http::wire::MAX_BODY;
 
 /// Response headers HTTP/2 forbids (RFC 9113 8.2.2).
 const DROPPED: &[&str] = &["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];

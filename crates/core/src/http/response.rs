@@ -74,11 +74,12 @@ pub fn dechunk(body: &[u8]) -> Vec<u8> {
         if size == 0 {
             return out;
         }
-        if pos + size > body.len() {
+        // `size` comes from the peer: compare without adding, so it can't wrap.
+        if size > body.len() - pos {
             return body.to_vec();
         }
         out.extend_from_slice(&body[pos..pos + size]);
-        pos += size + 2;
+        pos = (pos + size + 2).min(body.len());
     }
     if out.is_empty() {
         body.to_vec()
@@ -105,6 +106,15 @@ mod tests {
         assert!(out.ends_with(b"0\r\n\r\n"));
         let (_, body) = split_head_body(&out[find(&out, b"HTTP/1.1 200").unwrap()..]);
         assert_eq!(dechunk(body), b"abcde");
+    }
+
+    #[test]
+    fn dechunk_survives_overflowing_sizes() {
+        for size in ["ffffffffffffffec", "fffffffffffffff3"] {
+            let body = format!("{size}\r\nAAAAAAAAAAAAAAAAAAAA\r\n0\r\n\r\n").into_bytes();
+            assert_eq!(dechunk(&body), body);
+        }
+        assert_eq!(dechunk(b"3\r\nabc"), b"abc");
     }
 
     #[tokio::test]

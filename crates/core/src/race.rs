@@ -30,11 +30,14 @@ pub const SINGLE_PACKET_MAX: usize = 100;
 /// Sends `requests` concurrently. Results are in the same order as `requests`;
 /// `duration_ms` is measured from the moment the final bytes were released.
 pub async fn last_byte_sync(client: &Client, target: &Target, requests: Vec<Vec<u8>>) -> Vec<Result<Exchange>> {
+    let timeout = client.options().timeout;
     // 1. Connect everything up front.
     let mut connects = Vec::new();
     for _ in &requests {
         let (client, target) = (client.clone(), target.clone());
-        connects.push(tokio::spawn(async move { client.connect(&target).await }));
+        connects.push(tokio::spawn(async move {
+            tokio::time::timeout(timeout, client.connect(&target)).await.map_err(|_| Error::Timeout(timeout))?
+        }));
     }
     let mut streams = Vec::new();
     for c in connects {
@@ -45,13 +48,14 @@ pub async fn last_byte_sync(client: &Client, target: &Target, requests: Vec<Vec<
     for (stream, req) in streams.iter_mut().zip(&requests) {
         if let Ok(s) = stream {
             let body = &req[..req.len().saturating_sub(1)];
-            if let Err(e) = async {
+            let write = async {
                 s.write_all(body).await?;
                 s.flush().await
-            }
-            .await
-            {
-                *stream = Err(e.into());
+            };
+            match tokio::time::timeout(timeout, write).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => *stream = Err(e.into()),
+                Err(_) => *stream = Err(Error::Timeout(timeout)),
             }
         }
     }
@@ -78,7 +82,9 @@ pub async fn last_byte_sync(client: &Client, target: &Target, requests: Vec<Vec<
         reads.push(tokio::spawn(async move {
             let mut s = stream?;
             let method = crate::http::RawRequest::from_bytes(req.clone()).head().map(|h| h.method).unwrap_or_default();
-            let response = WireReader::new().read_response(&mut s, &method).await?;
+            let response = tokio::time::timeout(timeout, WireReader::new().read_response(&mut s, &method))
+                .await
+                .map_err(|_| Error::Timeout(timeout))??;
             Ok(Exchange { target, request: req, response, duration_ms: released.elapsed().as_millis() as u64 })
         }));
     }
@@ -299,6 +305,27 @@ mod tests {
         buf.extend([0, 0, 0, 0, 0, 0, 0, 0, 5]); // DATA without END_STREAM
         buf.extend([0, 0, 0, 1, 1, 0, 0, 0, 7]); // HEADERS with END_STREAM
         assert_eq!(end_streams(&buf), 2);
+    }
+
+    #[tokio::test]
+    async fn last_byte_sync_times_out() {
+        // A server that accepts and never replies.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        let opts = crate::http::SendOptions { timeout: Duration::from_millis(300), ..client(false).options().clone() };
+        let client = Client::new(opts);
+        let target = Target { scheme: "http".into(), host: "127.0.0.1".into(), port };
+        let req = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").into_bytes();
+        let results = tokio::time::timeout(Duration::from_secs(5), last_byte_sync(&client, &target, vec![req; 2]))
+            .await
+            .expect("race ignored the client timeout");
+        assert!(results.iter().all(|r| matches!(r, Err(Error::Timeout(_)))));
     }
 
     #[tokio::test]
