@@ -485,6 +485,31 @@ benchmark peak 976 -> 199 MB (3 m 28 s, 22,319 requests, same 12 findings). What
 is compiled regexes cached per template for the run (~150 MB); freeing them after a
 template's last unit is possible if it ever matters.
 
+## Adversarial review hardening (done, 0.2.4)
+
+GitHub issues #3–#24 (label `adversarial-review`), all closed. The rules worth knowing:
+
+- HTTP bodies are capped at `http::wire::MAX_BODY` (64 MB) for HTTP/1 and HTTP/2; chunk
+  sizes and Content-Length over it are protocol errors (no `usize` wrap). The proxy forward
+  uses `--timeout` (default 30 s, was a fixed 120 s).
+- Scope guard (`guard.rs`): hosts are canonical (lowercase, one trailing dot dropped).
+  Addresses reached by name: loopback, link-local, unspecified and metadata IPs are refused
+  unless the scope names the address/CIDR (`localhost` by name may reach loopback);
+  RFC 1918/ULA are allowed for exact host entries but not wildcard ones.
+- Crawl stays on the seeds' origins (http seed also allows https:443); `--any-port` /
+  `--crawl-any-port` widen it. `--rate` uses the shared `Limiter`. Forms: one pass, 200 per
+  page. `scan active` skips methods other than GET/HEAD/OPTIONS/POST unless
+  `--include-methods`.
+- Secrets: project files are 0600 (umask 077 in `Store::open`); `query` can't read
+  `auth_profiles` (SQLite authorizer); auth values are recorded as `«auth:PROFILE:KIND»`
+  placeholders and filled in on the wire by `Client::fill_auth` (vault on the `Guard`).
+- Every envelope carrying target data has `_meta.provenance.untrusted_content: true`.
+- `browser open` takes only http(s)/about:blank; stop commands verify the process start
+  time; OOB stores only token-matching interactions (100 per token, 10,000 per project).
+- GUI: CLI stdin is exact bytes (number array), secrets go in `BRAINPROXY_SECRET_*` env,
+  flags are `--flag=value`, the Fuzzer sends its request on stdin. The Render view is a
+  `sandbox=""` srcdoc iframe with a `default-src 'none'` CSP.
+
 ## Backlog (suggested order)
 
 1. Tag `v0.1.0` once CI is green (publishes arm64 + x86_64 binaries).
