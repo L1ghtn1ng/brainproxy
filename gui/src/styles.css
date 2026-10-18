@@ -816,6 +816,27 @@ select {
   position: absolute;
   inset: 0;
 }
+.render {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+.render-note {
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.render iframe {
+  flex: 1;
+  border: 0;
+  background: #fff;
+}
+.render img {
+  max-width: 100%;
+  margin: 10px;
+  align-self: flex-start;
+}
 .code.editor {
   border: 0;
   outline: none;

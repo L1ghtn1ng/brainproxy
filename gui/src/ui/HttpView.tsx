@@ -1,11 +1,13 @@
 // Viewer and editor for one raw HTTP message: Raw (highlighted, editable when onChange is
-// given), Pretty (JSON and form bodies formatted), and Hex, with a search bar.
+// given), Pretty (JSON and form bodies formatted), Hex, and for responses Render (HTML in a
+// sandboxed iframe with no network, images), with a search bar.
 // Line endings are shown and edited as \n; `send` normalizes them back to CRLF.
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { decode, encodeAll } from "./urlencode";
+import { RENDER_CAP, renderable } from "./render";
 
-type Mode = "raw" | "pretty" | "hex";
+type Mode = "raw" | "pretty" | "hex" | "render";
 
 export function normalize(raw: string): string {
   return raw.replace(/\r\n/g, "\n");
@@ -123,9 +125,16 @@ export function HttpView(p: {
     });
   };
   const text = useMemo(() => normalize(p.value), [p.value]);
-  const editable = !!p.onChange && mode === "raw";
-  const shown = mode === "pretty" ? pretty(text) : text;
-  const nodes = useMemo(() => (mode === "hex" ? [hexdump(text)] : highlight(shown, query)), [mode, shown, text, query]);
+  // Render is offered only for responses; a request shown after one falls back to Raw.
+  const isResponse = text.startsWith("HTTP/");
+  const view: Mode = mode === "render" && !isResponse ? "raw" : mode;
+  const [big, setBig] = useState(false);
+  useEffect(() => setBig(false), [text]);
+  const tooBig = text.length > RENDER_CAP && !big;
+  const rendered = useMemo(() => (view === "render" && !tooBig ? renderable(text) : null), [view, tooBig, text]);
+  const editable = !!p.onChange && view === "raw";
+  const shown = view === "pretty" ? pretty(text) : text;
+  const nodes = useMemo(() => (view === "hex" ? [hexdump(text)] : highlight(shown, query)), [view, shown, text, query]);
   const hits = useMemo(() => {
     if (!query) return 0;
     const l = shown.toLowerCase();
@@ -140,9 +149,9 @@ export function HttpView(p: {
       <div className="msg-bar">
         <span className="msg-title">{p.title}</span>
         <div className="seg">
-          {(["raw", "pretty", "hex"] as Mode[]).map((m) => (
-            <button key={m} className={mode === m ? "on" : ""} onClick={() => setMode(m)}>
-              {m === "raw" ? "Raw" : m === "pretty" ? "Pretty" : "Hex"}
+          {(isResponse ? ["raw", "pretty", "hex", "render"] : ["raw", "pretty", "hex"]).map((m) => (
+            <button key={m} className={view === m ? "on" : ""} onClick={() => setMode(m as Mode)}>
+              {m === "raw" ? "Raw" : m === "pretty" ? "Pretty" : m === "hex" ? "Hex" : "Render"}
             </button>
           ))}
         </div>
@@ -160,7 +169,28 @@ export function HttpView(p: {
         {p.extra}
       </div>
       <div className="code-wrap">
-        {editable ? (
+        {view === "render" ? (
+          <div className="render">
+            {tooBig ? (
+              <div className="blank">
+                {(text.length / 1048576).toFixed(1)} MB response
+                <button className="btn small" onClick={() => setBig(true)}>
+                  Render anyway
+                </button>
+              </div>
+            ) : rendered?.kind === "html" ? (
+              <>
+                <div className="render-note muted">Scripts, forms and remote resources are blocked.</div>
+                {/* sandbox="": no scripts, origin, forms, popups or navigation; the injected CSP blocks every request. */}
+                <iframe title="Rendered response" sandbox="" srcDoc={rendered.srcdoc} referrerPolicy="no-referrer" />
+              </>
+            ) : rendered?.kind === "image" ? (
+              <img alt="Response image" src={rendered.src} />
+            ) : (
+              <div className="blank">Can't render this content type ({rendered?.kind === "none" ? rendered.type : ""}).</div>
+            )}
+          </div>
+        ) : editable ? (
           <>
             <pre className="code backdrop" ref={back} aria-hidden>
               {nodes}

@@ -91,7 +91,10 @@ colours only for findings. Dark and light themes are CSS variables in `styles.cs
 table (`ui/DataTable.tsx`, virtualized, sortable, resizable columns, keyboard), split
 panes (`ui/Split.tsx`, sizes remembered), message view (`ui/HttpView.tsx`, Raw with
 highlighting and an overlay editor, Pretty for JSON/forms, Hex, search), and context menu
-(`ui/Menu.tsx`) are small local components.
+(`ui/Menu.tsx`) are small local components. Responses also get Render (`ui/render.ts`): HTML
+in a `sandbox=""` srcdoc iframe with an injected `default-src 'none'` CSP (no scripts, forms
+or network requests; `data:` images and inline styles only), images from the body bytes,
+anything above 5 MB only after a click.
 
 ## Develop
 
