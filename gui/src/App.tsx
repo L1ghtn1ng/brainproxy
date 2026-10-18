@@ -136,6 +136,9 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
   // The proxy starts with the project (unless turned off in Settings); one the app started
   // stops again when the project closes or the window does, so none are left behind.
   const startedHere = useRef(false);
+  // `app` changes with every toast or tab switch; only a project change may restart the proxy.
+  const toastRef = useRef(app.toast);
+  toastRef.current = app.toast;
   useEffect(() => {
     if (!autoProxy()) return;
     let cancelled = false;
@@ -149,10 +152,10 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
           refreshStatus();
           return;
         } catch (e: any) {
-          if (!/cannot listen/i.test(e.message)) return app.toast(`The proxy didn't start: ${e.message}`, "error");
+          if (!/cannot listen/i.test(e.message)) return toastRef.current(`The proxy didn't start: ${e.message}`, "error");
         }
       }
-      app.toast(`The proxy didn't start: ports ${PROXY_PORTS.join(", ")} are all in use. Start it from the Proxy pill.`, "error");
+      toastRef.current(`The proxy didn't start: ports ${PROXY_PORTS.join(", ")} are all in use. Start it from the Proxy pill.`, "error");
     })();
     return () => {
       cancelled = true;
@@ -161,7 +164,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
         run(["proxy", "stop"]).catch(() => {});
       }
     };
-  }, [app, refreshStatus]);
+  }, [app.project, refreshStatus]);
 
   useEffect(() => {
     if (!inTauri) return;
