@@ -11,10 +11,4 @@ if grep -qE "FAILED|panicked|^error" "$log"; then
     echo "tests failed (see $log)" >&2
     exit 1
 fi
-# The licenses page must list the dependencies actually locked.
-python3 scripts/gen-licenses.py >/dev/null
-git diff --exit-code --quiet gui/src/licenses.json || {
-    echo "gui/src/licenses.json is stale: commit the output of scripts/gen-licenses.py" >&2
-    exit 1
-}
 echo "checks passed"

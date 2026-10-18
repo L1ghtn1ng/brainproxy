@@ -2117,8 +2117,3 @@ button.chip {
   white-space: pre-wrap;
   font-size: 11px;
 }
-.lic-table {
-  display: flex;
-  height: 420px;
-  border: 1px solid var(--border);
-}

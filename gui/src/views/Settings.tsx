@@ -7,7 +7,7 @@ import { AUTO_PROXY, autoProxy, useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
 import { interceptEnableArgs, type InterceptSettings } from "./Proxy";
-import LICENSES from "../licenses.json";
+import NOTICE from "../../../NOTICE?raw";
 
 type Sub = "auth" | "rules" | "intercept" | "ca" | "data" | "project" | "licenses";
 
@@ -1001,21 +1001,7 @@ const CREDITS: { name: string; what: string; license: string; url: string }[] = 
   { name: "fuzz.txt", what: "The content-discovery wordlist, by Bo0oM.", license: "WTFPL", url: "https://github.com/Bo0oM/fuzz.txt" },
 ];
 
-type Package = (typeof LICENSES.packages)[number];
-
 function Licenses() {
-  const [filter, setFilter] = useState("");
-  const q = filter.trim().toLowerCase();
-  const rows = q
-    ? LICENSES.packages.filter((p) => `${p.name} ${p.license} ${p.kind}`.toLowerCase().includes(q))
-    : LICENSES.packages;
-  const columns: Column<Package>[] = [
-    { key: "name", label: "Package", width: 240, value: (p) => p.name },
-    { key: "version", label: "Version", width: 100, value: (p) => p.version },
-    { key: "kind", label: "Kind", width: 70, value: (p) => p.kind },
-    { key: "license", label: "License", width: 260, value: (p) => p.license },
-    { key: "url", label: "Source", width: 380, value: (p) => p.url, render: (p) => <span className="mono">{p.url}</span> },
-  ];
   return (
     <div className="detail">
       <h2>Open source licenses</h2>
@@ -1037,16 +1023,8 @@ function Licenses() {
       </dl>
       <details className="lic-notice">
         <summary>NOTICE (full attribution and license texts)</summary>
-        <pre>{LICENSES.notice}</pre>
+        <pre>{NOTICE}</pre>
       </details>
-      <h3>Third-party packages ({LICENSES.packages.length})</h3>
-      <p className="muted">Rust crates linked into brainproxy and the desktop app, and the npm packages in its interface.</p>
-      <div className="toolbar">
-        <input className="input" placeholder="Filter by name or license" value={filter} onChange={(e) => setFilter(e.target.value)} />
-      </div>
-      <div className="lic-table">
-        <DataTable rows={rows} columns={columns} rowKey={(p) => `${p.kind}:${p.name}@${p.version}`} initialSort={{ key: "name", desc: false }} empty="No package matches." />
-      </div>
     </div>
   );
 }

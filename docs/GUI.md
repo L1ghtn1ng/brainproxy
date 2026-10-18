@@ -75,7 +75,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles, match & replace, intercept options, TLS/CA, rule data, project, open source licenses (`gui/src/licenses.json`, from `scripts/gen-licenses.py`) | `auth *`, `rules *`, `intercept *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `engagement show` |
+| | Settings | Auth profiles, match & replace, intercept options, TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *`, `rules *`, `intercept *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `engagement show` |
 
 ### Guided scan
 
