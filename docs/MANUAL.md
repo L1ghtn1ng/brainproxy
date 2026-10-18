@@ -63,7 +63,7 @@ allows.
 
 **Data folder.** The interception certificate (CA), downloaded rule data, and Nuclei
 templates live once per user (`~/.local/share/brainproxy`, on Windows
-`%LOCALAPPDATA%\brainproxy`) and are shared by all projects. A project file gets the
+`%APPDATA%\brainproxy`) and are shared by all projects. A project file gets the
 permissions of the folder it is saved in: keep it in your own folders on a shared machine.
 
 ---

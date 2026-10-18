@@ -220,12 +220,11 @@ pub enum StateArg {
 }
 
 /// Where the CA and other per-user data live: `--home`, `$BRAINPROXY_HOME` (clap),
-/// `$XDG_DATA_HOME/brainproxy`, `%LOCALAPPDATA%\brainproxy` on Windows, `~/.local/share/brainproxy`.
+/// `$XDG_DATA_HOME/brainproxy`, `%APPDATA%\brainproxy` on Windows (the
+/// per-user installer puts the app itself in `%LOCALAPPDATA%\brainproxy`), `~/.local/share/brainproxy`.
 pub fn resolve_home(home: Option<PathBuf>) -> PathBuf {
     home.or_else(|| std::env::var_os("XDG_DATA_HOME").map(|d| PathBuf::from(d).join("brainproxy")))
-        .or_else(|| {
-            std::env::var_os("LOCALAPPDATA").filter(|_| cfg!(windows)).map(|d| PathBuf::from(d).join("brainproxy"))
-        })
+        .or_else(|| std::env::var_os("APPDATA").filter(|_| cfg!(windows)).map(|d| PathBuf::from(d).join("brainproxy")))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/brainproxy")))
         .unwrap_or_else(|| PathBuf::from(".brainproxy"))
 }
