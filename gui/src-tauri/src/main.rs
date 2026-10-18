@@ -53,6 +53,9 @@ async fn cli(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // CREATE_NO_WINDOW: the CLI is a console program; without it each call flashes a console window.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return failure(format!("can't run {}: {e}", binary().display())),

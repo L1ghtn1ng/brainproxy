@@ -15,7 +15,10 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::output::Out;
-use crate::proxy_cmd::{start_time, still_running, terminate};
+use crate::process::{self, start_time, still_running};
+
+/// `oob stop` asks the listener to exit through this key (see `process::shutdown`).
+const STOP_KEY: &str = "oob.stop";
 
 #[derive(Subcommand)]
 pub enum OobCmd {
@@ -136,8 +139,10 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
         OobCmd::Stop => {
             let store = Store::open(project)?;
             let state = running(&store)?.ok_or_else(not_running)?;
-            let forced = terminate(state.pid, state.start_time, "OOB listener")?;
+            process::request_stop(&store, STOP_KEY, state.pid)?;
+            let forced = process::terminate(state.pid, state.start_time, "OOB listener")?;
             store.meta_set(STATE_KEY, None)?;
+            store.meta_set(STOP_KEY, None)?;
             out.ok(json!({"stopped": state.pid, "forced": forced}), || {
                 format!("stopped OOB listener (pid {})", state.pid)
             });
@@ -287,11 +292,7 @@ fn start(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Error> {
         }
     }
     cmd.arg("--log").arg(&log);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    process::detach(&mut cmd);
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
     let deadline = Instant::now() + Duration::from_secs_f64(args.wait.max(0.1));
@@ -395,14 +396,7 @@ fn run_foreground(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Err
             None => format!("OOB listener on {addr}"),
         });
 
-        let shutdown = async {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-            }
-        };
+        let shutdown = process::shutdown(&store, STOP_KEY);
         let opts = ServeOptions { project: project.to_path_buf(), domain, public_ip };
         let result = serve(tcp, dns, opts, shutdown).await;
         if oob::read_state(&store)?.is_some_and(|s| s.pid == std::process::id()) {

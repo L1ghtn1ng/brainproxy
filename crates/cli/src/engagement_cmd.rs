@@ -16,7 +16,7 @@ pub enum EngagementCmd {
     /// removed afterwards. Every request brainproxy sends must match it.
     #[command(after_help = "Target forms: example.com (exact host), *.example.com (subdomains), 10.0.0.5, \
         10.0.0.0/24, [2001:db8::1], each optionally with :port. Link-local addresses such as cloud metadata \
-        (169.254.169.254) are refused unless listed by address.\nA system scope file at /etc/brainproxy/scope.json \
+        (169.254.169.254) are refused unless listed by address.\nA system scope file at /etc/brainproxy/scope.json (Windows: C:\\ProgramData\\brainproxy\\scope.json) \
         (same JSON shape as `engagement show`), when present, is enforced as well and cannot be overridden.")]
     Start {
         /// Target that may be contacted. Repeatable; at least one.

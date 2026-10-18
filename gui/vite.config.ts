@@ -8,7 +8,7 @@ import react from "@vitejs/plugin-react";
 // to a localhost Host with the X-Brainproxy header, which blocks DNS rebinding and simple
 // cross-site posts. Never part of a build.
 function cliBridge(): Plugin {
-  const bin = process.env.BRAINPROXY_BIN ?? resolve(__dirname, "../target/debug/brainproxy");
+  const bin = process.env.BRAINPROXY_BIN ?? resolve(__dirname, `../target/debug/brainproxy${process.platform === "win32" ? ".exe" : ""}`);
   return {
     name: "brainproxy-cli-bridge",
     apply: "serve",

@@ -15,6 +15,10 @@ use clap::{Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
 use crate::output::{body_value, Out};
+use crate::process;
+
+/// `proxy stop` asks the proxy to exit through this key (see `process::shutdown`).
+const STOP_KEY: &str = "proxy.stop";
 
 #[derive(Subcommand)]
 pub enum CaCmd {
@@ -38,7 +42,8 @@ pub enum CaCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Add the CA to the system trust store (Debian/Kali: update-ca-certificates). Needs root.
+    /// Add the CA to the system trust store. Debian/Kali: update-ca-certificates, needs root. Windows: the
+    /// current user's Trusted Root store (certutil -user), no admin needed.
     InstallSystem,
 }
 
@@ -214,9 +219,13 @@ pub enum StateArg {
     All,
 }
 
-/// Where the CA and other per-user data live.
+/// Where the CA and other per-user data live: `--home`, `$BRAINPROXY_HOME` (clap),
+/// `$XDG_DATA_HOME/brainproxy`, `%LOCALAPPDATA%\brainproxy` on Windows, `~/.local/share/brainproxy`.
 pub fn resolve_home(home: Option<PathBuf>) -> PathBuf {
     home.or_else(|| std::env::var_os("XDG_DATA_HOME").map(|d| PathBuf::from(d).join("brainproxy")))
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA").filter(|_| cfg!(windows)).map(|d| PathBuf::from(d).join("brainproxy"))
+        })
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/brainproxy")))
         .unwrap_or_else(|| PathBuf::from(".brainproxy"))
 }
@@ -265,6 +274,26 @@ pub fn ca(home: &Path, cmd: CaCmd, out: &Out) -> Result<(), Error> {
                 out.ok(data, || ca.cert_pem().to_string());
             }
         }
+        #[cfg(windows)]
+        CaCmd::InstallSystem => {
+            // The current user's Root store: no admin needed; Windows asks the user to confirm.
+            let (ca, info) = load_ca(home)?;
+            let result = std::process::Command::new("certutil")
+                .args(["-user", "-addstore", "Root"])
+                .arg(&info.cert_path)
+                .output()
+                .map_err(|e| Error::InvalidInput(format!("certutil: {e}")))?;
+            if !result.status.success() {
+                return Err(Error::InvalidInput(format!(
+                    "certutil failed: {}",
+                    String::from_utf8_lossy(&result.stdout).trim()
+                )));
+            }
+            out.ok(json!({"installed": "CurrentUser\\Root", "sha256": fingerprint(ca.cert_der())}), || {
+                "installed in the current user's Trusted Root store".into()
+            });
+        }
+        #[cfg(not(windows))]
         CaCmd::InstallSystem => {
             let (ca, _) = load_ca(home)?;
             let dest = PathBuf::from("/usr/local/share/ca-certificates/brainproxy.crt");
@@ -306,82 +335,10 @@ fn read_state(store: &Store) -> Result<Option<Saved>, Error> {
     Ok(store.meta_get(STATE_KEY)?.and_then(|s| serde_json::from_str(&s).ok()))
 }
 
-/// `pid` as a pid_t that is safe to signal: 0, 1 and anything that turns negative
-/// (`kill(0|-1|-n)` hits a process group or every process) are refused.
-fn pid_t(pid: u32) -> Option<libc::pid_t> {
-    libc::pid_t::try_from(pid).ok().filter(|&p| p > 1)
-}
-
-/// Whether `pid` is a live process we may signal. Signal 0 checks without delivering
-/// anything; EPERM means another user's process, which is not ours.
-pub(crate) fn alive(pid: u32) -> bool {
-    pid_t(pid).is_some_and(|p| unsafe { libc::kill(p, 0) } == 0)
-}
-
-/// When `pid` started, as an opaque number: tells a process from a later one reusing its pid.
-pub(crate) fn start_time(pid: u32) -> Option<u64> {
-    os_start_time(pid_t(pid)?)
-}
-
-#[cfg(target_os = "macos")]
-fn os_start_time(p: libc::pid_t) -> Option<u64> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let ptr = (&mut info as *mut libc::proc_bsdinfo).cast();
-    let n = unsafe { libc::proc_pidinfo(p, libc::PROC_PIDTBSDINFO, 0, ptr, size) };
-    (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
-}
-
-#[cfg(target_os = "linux")]
-fn os_start_time(p: libc::pid_t) -> Option<u64> {
-    // Field 22 (clock ticks since boot); the fields after `(comm)` start at 3.
-    let stat = std::fs::read_to_string(format!("/proc/{p}/stat")).ok()?;
-    stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn os_start_time(_: libc::pid_t) -> Option<u64> {
-    None
-}
-
-/// Whether the process recorded as `pid`, started at `start`, still runs: `Some(false)`
-/// when it is gone or the pid now belongs to another process, `None` when the pid is
-/// alive but there is no start time to compare (state from an older version).
-pub(crate) fn still_running(pid: u32, start: Option<u64>) -> Option<bool> {
-    if !alive(pid) {
-        return Some(false);
-    }
-    start.map(|s| start_time(pid) == Some(s))
-}
-
-/// Stops the process recorded as (`pid`, `start`): SIGTERM, then SIGKILL after 5 s.
-/// Returns whether SIGKILL was needed. A process that can't be verified gets SIGTERM only.
-pub(crate) fn terminate(pid: u32, start: Option<u64>, what: &str) -> Result<bool, Error> {
-    let gone = || still_running(pid, start) == Some(false);
-    let Some(p) = pid_t(pid).filter(|_| !gone()) else { return Ok(false) };
-    unsafe { libc::kill(p, libc::SIGTERM) };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !gone() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    if gone() {
-        return Ok(false);
-    }
-    if start.is_none() {
-        return Err(Error::Conflict(format!(
-            "pid {pid} is still running after SIGTERM. Its {what} state comes from an older brainproxy without a \
-             process start time, so it can't be verified as the {what}; not sending SIGKILL. Check it with \
-             `ps -p {pid}` and stop it yourself"
-        )));
-    }
-    unsafe { libc::kill(p, libc::SIGKILL) };
-    Ok(true)
-}
-
 /// The running proxy's saved state, clearing stale state left by a crash.
 fn current(store: &Store) -> Result<Option<Saved>, Error> {
     match read_state(store)? {
-        Some(s) if still_running(s.state.pid, s.start_time) != Some(false) => Ok(Some(s)),
+        Some(s) if process::still_running(s.state.pid, s.start_time) != Some(false) => Ok(Some(s)),
         Some(_) => {
             store.meta_set(STATE_KEY, None)?;
             Ok(None)
@@ -422,8 +379,10 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             let store = Store::open(project)?;
             let Saved { state, start_time } =
                 current(&store)?.ok_or_else(|| Error::NotFound("no proxy running for this project".into()))?;
-            let forced = terminate(state.pid, start_time, "proxy")?;
+            process::request_stop(&store, STOP_KEY, state.pid)?;
+            let forced = process::terminate(state.pid, start_time, "proxy")?;
             store.meta_set(STATE_KEY, None)?;
+            store.meta_set(STOP_KEY, None)?;
             out.ok(json!({"stopped": state.pid, "forced": forced}), || format!("stopped proxy (pid {})", state.pid));
             Ok(())
         }
@@ -483,11 +442,7 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
         store.auth_profile(name)?; // Fail fast on an unknown profile.
         cmd.args(["--auth", name]);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    process::detach(&mut cmd);
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
 
@@ -540,24 +495,12 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
             ca_cert: info.cert_path.clone(),
             log: args.log.clone(),
         };
-        let saved = Saved { state, start_time: start_time(std::process::id()) };
+        let saved = Saved { state, start_time: process::start_time(std::process::id()) };
         store.meta_set(STATE_KEY, Some(&serde_json::to_string(&saved).unwrap_or_default()))?;
         let state = saved.state;
         out.ok(state_json(&state), || format!("proxy listening on http://{addr}"));
 
-        let shutdown = async {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = tokio::signal::ctrl_c().await;
-        };
+        let shutdown = process::shutdown(&store, STOP_KEY);
         let opts = ProxyOptions { project: project.to_path_buf(), upstream, auth: auth.clone(), http2: !args.no_http2 };
         let result = brainproxy_core::proxy::run(listener, std::sync::Arc::new(ca), opts, shutdown).await;
         if read_state(&store)?.is_some_and(|s| s.state.pid == std::process::id()) {
@@ -730,22 +673,4 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_identity() {
-        for bad in [0, 1, u32::MAX, i32::MAX as u32 + 1] {
-            assert!(!alive(bad) && start_time(bad).is_none(), "{bad}");
-        }
-        let me = std::process::id();
-        let start = start_time(me);
-        assert!(start.is_some() && start == start_time(me));
-        assert_eq!(still_running(me, start), Some(true));
-        assert_eq!(still_running(me, start.map(|s| s + 1)), Some(false));
-        assert_eq!(still_running(me, None), None);
-    }
 }

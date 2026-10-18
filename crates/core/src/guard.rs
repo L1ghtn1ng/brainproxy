@@ -23,7 +23,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+#[cfg(not(windows))]
 pub const SYSTEM_SCOPE_PATH: &str = "/etc/brainproxy/scope.json";
+/// Under %ProgramData%, which is C:\ProgramData unless Windows was installed elsewhere.
+#[cfg(windows)]
+pub const SYSTEM_SCOPE_PATH: &str = r"C:\ProgramData\brainproxy\scope.json";
 /// Only honoured when the system scope file does not exist (tests, non-root setups).
 pub const SYSTEM_SCOPE_ENV: &str = "BRAINPROXY_SYSTEM_SCOPE";
 pub const ENGAGEMENT_KEY: &str = "engagement";

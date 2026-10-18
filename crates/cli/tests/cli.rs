@@ -552,18 +552,21 @@ fn stop_never_signals_a_process_it_cannot_verify() {
     }
     // State from an older version (no start time) for a live process that ignores
     // SIGTERM: it gets SIGTERM, never SIGKILL, and the user is told.
-    let mut child = Command::new("sh").args(["-c", "trap '' TERM; sleep 30"]).spawn().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    set("oob.state", &oob(child.id() as u64));
-    let (_, v) = run(&["oob", "status"], &project, None);
-    assert_eq!(v["data"]["running"], true, "old state is still read: {v}");
-    set("proxy.state", &proxy(child.id() as u64, None));
-    let (_, v) = run(&["proxy", "stop"], &project, None);
-    assert_eq!(v["error"]["kind"], "conflict", "{v}");
-    assert!(v["error"]["message"].as_str().unwrap().contains("not sending SIGKILL"), "{v}");
-    assert!(child.try_wait().unwrap().is_none(), "the unverified process was killed");
-    child.kill().unwrap();
-    child.wait().unwrap();
+    #[cfg(unix)]
+    {
+        let mut child = Command::new("sh").args(["-c", "trap '' TERM; sleep 30"]).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        set("oob.state", &oob(child.id() as u64));
+        let (_, v) = run(&["oob", "status"], &project, None);
+        assert_eq!(v["data"]["running"], true, "old state is still read: {v}");
+        set("proxy.state", &proxy(child.id() as u64, None));
+        let (_, v) = run(&["proxy", "stop"], &project, None);
+        assert_eq!(v["error"]["kind"], "conflict", "{v}");
+        assert!(v["error"]["message"].as_str().unwrap().contains("not sending SIGKILL"), "{v}");
+        assert!(child.try_wait().unwrap().is_none(), "the unverified process was killed");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
 }
 
 /// Answers every request with 200 and a session cookie, keeping the raw requests it got.

@@ -224,7 +224,7 @@ fn reap_if_dead(store: &Store, run: i64) -> Result<(), Error> {
     let state = info["state"].as_str().unwrap_or("");
     if matches!(state, "running" | "stopping") {
         if let Some(pid) = info["pid"].as_u64() {
-            if !crate::proxy_cmd::alive(pid as u32) {
+            if !crate::process::alive(pid as u32) {
                 store.fuzz_set_state(run, "failed", None, Some("fuzz process exited unexpectedly"), true)?;
             }
         }
@@ -423,11 +423,7 @@ fn spawn_background(
         std::fs::write(&path, bytes)?;
         cmd.arg(format!("--attach-request={}", path.display()));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    crate::process::detach(&mut cmd);
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
     let deadline = Instant::now() + Duration::from_secs(10);

@@ -16,8 +16,13 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 clap.workspace = true
-libc = "0.2.190"
 regex.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.190"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 brainproxy-core = { path = "../core" }

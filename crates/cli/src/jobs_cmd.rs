@@ -100,7 +100,7 @@ fn reap(store: &Store, id: i64) -> Result<(), Error> {
     let j = store.job_get(id)?;
     if matches!(j["state"].as_str(), Some("running" | "stopping")) {
         if let Some(pid) = j["pid"].as_u64() {
-            if !crate::proxy_cmd::alive(pid as u32) {
+            if !crate::process::alive(pid as u32) {
                 store.job_set_state(id, "failed", None, Some("job process exited unexpectedly"), true)?;
             }
         }
@@ -144,11 +144,7 @@ pub fn spawn_background(kind: &str, project: &Path, home: &Path, out: &Out) -> R
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&argv);
     cmd.arg("--job-id").arg(id.to_string());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    crate::process::detach(&mut cmd);
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
     let deadline = Instant::now() + Duration::from_secs(10);

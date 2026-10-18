@@ -43,25 +43,50 @@ struct Found {
     path: PathBuf,
 }
 
-/// (id, name, kind, macOS app executable, Linux executables on PATH)
-const KNOWN: &[(&str, &str, Kind, &str, &[&str])] = &[
+/// (id, name, kind, macOS app executable, Linux executables on PATH, Windows executable
+/// under Program Files or %LOCALAPPDATA%)
+type Known = (&'static str, &'static str, Kind, &'static str, &'static [&'static str], &'static str);
+const KNOWN: &[Known] = &[
     (
         "chrome",
         "Google Chrome",
         Kind::Chromium,
         "Google Chrome.app/Contents/MacOS/Google Chrome",
         &["google-chrome", "google-chrome-stable"],
+        r"Google\Chrome\Application\chrome.exe",
     ),
-    ("chromium", "Chromium", Kind::Chromium, "Chromium.app/Contents/MacOS/Chromium", &["chromium", "chromium-browser"]),
+    (
+        "chromium",
+        "Chromium",
+        Kind::Chromium,
+        "Chromium.app/Contents/MacOS/Chromium",
+        &["chromium", "chromium-browser"],
+        r"Chromium\Application\chrome.exe",
+    ),
     (
         "edge",
         "Microsoft Edge",
         Kind::Chromium,
         "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
         &["microsoft-edge", "microsoft-edge-stable"],
+        r"Microsoft\Edge\Application\msedge.exe",
     ),
-    ("brave", "Brave", Kind::Chromium, "Brave Browser.app/Contents/MacOS/Brave Browser", &["brave-browser", "brave"]),
-    ("firefox", "Firefox", Kind::Firefox, "Firefox.app/Contents/MacOS/firefox", &["firefox", "firefox-esr"]),
+    (
+        "brave",
+        "Brave",
+        Kind::Chromium,
+        "Brave Browser.app/Contents/MacOS/Brave Browser",
+        &["brave-browser", "brave"],
+        r"BraveSoftware\Brave-Browser\Application\brave.exe",
+    ),
+    (
+        "firefox",
+        "Firefox",
+        Kind::Firefox,
+        "Firefox.app/Contents/MacOS/firefox",
+        &["firefox", "firefox-esr"],
+        r"Mozilla Firefox\firefox.exe",
+    ),
 ];
 
 fn find() -> Vec<Found> {
@@ -71,12 +96,19 @@ fn find() -> Vec<Found> {
     }
     let path_dirs: Vec<PathBuf> =
         std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let win_dirs: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+        .iter()
+        .filter(|_| cfg!(windows))
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect();
     KNOWN
         .iter()
-        .filter_map(|&(id, name, kind, mac, linux)| {
+        .filter_map(|&(id, name, kind, mac, linux, win)| {
             let mac = app_dirs.iter().map(|d| d.join(mac));
             let linux = linux.iter().flat_map(|exe| path_dirs.iter().map(move |d| d.join(exe)));
-            let path = mac.chain(linux).find(|p| p.is_file())?;
+            let win = win_dirs.iter().map(|d| d.join(win));
+            let path = mac.chain(linux).chain(win).find(|p| p.is_file())?;
             Some(Found { id, name, kind, path })
         })
         .collect()
@@ -159,12 +191,8 @@ pub fn browser(project: &Path, home: &Path, cmd: BrowserCmd, out: &Out) -> Resul
                 }
             }
             cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                // Its own process group: it outlives this command and isn't hit by our signals.
-                cmd.process_group(0);
-            }
+            // It outlives this command and isn't hit by our signals.
+            crate::process::detach(&mut cmd);
             let child = cmd.spawn().map_err(|e| Error::InvalidInput(format!("can't start {}: {e}", b.name)))?;
             let data = json!({
                 "browser": describe(b),
