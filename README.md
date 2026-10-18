@@ -254,42 +254,6 @@ brainproxy decode jwt eyJhbGciOi...
   `capabilities` output as resources; see [docs/MCP.md](docs/MCP.md).
 - If `NO_PROXY` covers your target (often `localhost`), pass `--noproxy ''` to curl.
 
-## Status
-
-- **Phase 0 (done):** raw HTTP/1.x client, `send`, the SQLite capture DB with `query` and
-  `schema`, `history`, codecs, `capabilities`, and a static Linux build.
-- **Phase 1 (done):** intercepting proxy (HTTP/1.x, CONNECT, TLS interception with a
-  per-install CA, WebSocket pass-through), scope, match-and-replace rules, and an
-  agent-driven intercept queue.
-- **Phase 2 (done):** fuzzer with sniper, battering-ram, pitchfork, and cluster-bomb modes,
-  payload sources and processing, grep/extract, outlier summary, background runs;
-  race-condition sending (last-byte sync); diff.
-- **Phase 3 (done):** passive scanner with 52 rules ported from ZAP (see
-  [docs/PASSIVE_RULES.md](docs/PASSIVE_RULES.md)), de-duplicated findings, triage.
-- **Phase 4 (done):** crawler, background jobs, immutable engagement scope enforced on
-  every connection, active scanner with 48 rules ported from ZAP (see
-  [docs/ACTIVE_RULES.md](docs/ACTIVE_RULES.md)), ZAP drift detection
-  ([docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
-- **Phase 5 (in progress):** authenticated testing is done: login profiles (form, JSON,
-  raw request template, CSRF prefetch, bearer tokens, static headers) and `--auth` on send,
-  race, fuzz, crawl, active scan, and the proxy, with automatic re-login. Reports in JSON,
-  Markdown, self-contained HTML, and SARIF 2.1.0. API import from OpenAPI/Swagger,
-  Postman, and GraphQL introspection. Out-of-band callback listener (HTTP, LDAP, TLS, DNS)
-  with Log4Shell, XXE, and blind SSTI callback checks (see [docs/OOB.md](docs/OOB.md)).
-  Rule updates without a release: `scan data update` for ZAP's pattern lists and
-  declarative checks in the Nuclei HTTP template format, including a DSL subset, `flow`,
-  multi-request conditions, payload files, template inputs (`--check-var`), and
-  `{{interactsh-url}}` over the OOB listener (`checks update`, `scan active --checks`; see
-  [docs/CHECKS.md](docs/CHECKS.md) and [docs/RULE_UPDATES.md](docs/RULE_UPDATES.md)).
-  All ZAP active rules are ported. Upstream connections are kept alive and reused (inside
-  the scope guard) by fuzz, crawl, active scan, import, and the proxy. HTTP/2 client
-  (`--http2`), the HTTP/2 single-packet race attack, and HTTP/2 in the proxy. MCP server (`mcp serve`, see
-  [docs/MCP.md](docs/MCP.md)).
-- Desktop GUI (`gui/`, Tauri): Dashboard, Target, Proxy (intercept, history), Repeater,
-  Fuzzer, Scanner, Findings, OOB, Decoder, Comparer, Settings, and a "New engagement"
-  welcome flow. It drives the CLI underneath, so it shares projects with agents. See
-  [docs/GUI.md](docs/GUI.md).
-
 ## License
 
 Apache 2.0.
