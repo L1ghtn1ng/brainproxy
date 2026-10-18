@@ -1,5 +1,5 @@
 // Project and tool settings: auth profiles, match & replace, intercept options, the CA,
-// rule data, and project info. Each sub-tab loads its data when first shown.
+// rule data, project info, and open-source licenses. Each sub-tab loads its data when first shown.
 
 import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { run, type CliInput } from "../api";
@@ -7,8 +7,9 @@ import { AUTO_PROXY, autoProxy, useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
 import { interceptEnableArgs, type InterceptSettings } from "./Proxy";
+import LICENSES from "../licenses.json";
 
-type Sub = "auth" | "rules" | "intercept" | "ca" | "data" | "project";
+type Sub = "auth" | "rules" | "intercept" | "ca" | "data" | "project" | "licenses";
 
 const SUBS: { id: Sub; label: string }[] = [
   { id: "auth", label: "Auth profiles" },
@@ -17,6 +18,7 @@ const SUBS: { id: Sub; label: string }[] = [
   { id: "ca", label: "TLS / CA" },
   { id: "data", label: "Rules & data" },
   { id: "project", label: "Project" },
+  { id: "licenses", label: "Open source licenses" },
 ];
 
 export function SettingsView() {
@@ -37,6 +39,7 @@ export function SettingsView() {
       {sub === "ca" && <Ca />}
       {sub === "data" && <RuleData />}
       {sub === "project" && <Project />}
+      {sub === "licenses" && <Licenses />}
     </div>
   );
 }
@@ -980,6 +983,70 @@ function Project() {
         </dl>
       )}
       {eng && <p className="muted small">{eng.rule} Start or inspect it with brainproxy engagement start / show.</p>}
+    </div>
+  );
+}
+
+// ---------------- Open source licenses ----------------
+
+/** The projects brainproxy's rules, checks and payloads come from (full terms in NOTICE). */
+const CREDITS: { name: string; what: string; license: string; url: string }[] = [
+  { name: "OWASP ZAP", what: "Passive and active scan rules, their alert texts, payloads and data files are ported from ZAP and its add-ons. Copyright the ZAP development team.", license: "Apache-2.0", url: "https://github.com/zaproxy/zaproxy" },
+  { name: "Nuclei and nuclei-templates", what: "Declarative checks run Nuclei HTTP templates (downloaded on request, not bundled); the template format, DSL and interactsh matchers follow Nuclei and interactsh. Copyright ProjectDiscovery, Inc.", license: "MIT", url: "https://github.com/projectdiscovery/nuclei-templates" },
+  { name: "SecLists", what: "Fuzzer wordlists (sqli, xss, ssti, usernames, passwords, ...). Copyright Daniel Miessler.", license: "MIT", url: "https://github.com/danielmiessler/SecLists" },
+  { name: "PayloadsAllTheThings", what: "Fuzzer wordlists (sqli, xss, path traversal, command injection, nosqli). Copyright Swissky.", license: "MIT", url: "https://github.com/swisskyrepo/PayloadsAllTheThings" },
+  { name: "FuzzDB", what: "Command-injection and time-based SQLi wordlists. Copyright Adam Muntner.", license: "BSD-3-Clause", url: "https://github.com/fuzzdb-project/fuzzdb" },
+  { name: "Param Miner", what: "Parameter and header name wordlists. Copyright PortSwigger Web Security and James Kettle.", license: "Apache-2.0", url: "https://github.com/PortSwigger/param-miner" },
+  { name: "Big List of Naughty Strings", what: "The naughty-strings wordlist. Copyright Max Woolf.", license: "MIT", url: "https://github.com/minimaxir/big-list-of-naughty-strings" },
+  { name: "fuzz.txt", what: "The content-discovery wordlist, by Bo0oM.", license: "WTFPL", url: "https://github.com/Bo0oM/fuzz.txt" },
+];
+
+type Package = (typeof LICENSES.packages)[number];
+
+function Licenses() {
+  const [filter, setFilter] = useState("");
+  const q = filter.trim().toLowerCase();
+  const rows = q
+    ? LICENSES.packages.filter((p) => `${p.name} ${p.license} ${p.kind}`.toLowerCase().includes(q))
+    : LICENSES.packages;
+  const columns: Column<Package>[] = [
+    { key: "name", label: "Package", width: 240, value: (p) => p.name },
+    { key: "version", label: "Version", width: 100, value: (p) => p.version },
+    { key: "kind", label: "Kind", width: 70, value: (p) => p.kind },
+    { key: "license", label: "License", width: 260, value: (p) => p.license },
+    { key: "url", label: "Source", width: 380, value: (p) => p.url, render: (p) => <span className="mono">{p.url}</span> },
+  ];
+  return (
+    <div className="detail">
+      <h2>Open source licenses</h2>
+      <p className="muted">
+        brainproxy is licensed under the Apache License 2.0 and builds on the work of these projects. Thank you to
+        their authors and contributors.
+      </p>
+      <h3>Rules, checks and payloads</h3>
+      <dl className="facts lic-credits">
+        {CREDITS.map((c) => (
+          <Fragment key={c.name}>
+            <dt>{c.name}</dt>
+            <dd>
+              {c.what}{" "}
+              <span className="lic-tag">{c.license}</span> <span className="mono muted">{c.url}</span>
+            </dd>
+          </Fragment>
+        ))}
+      </dl>
+      <details className="lic-notice">
+        <summary>NOTICE (full attribution and license texts)</summary>
+        <pre>{LICENSES.notice}</pre>
+      </details>
+      <h3>Third-party packages ({LICENSES.packages.length})</h3>
+      <p className="muted">Rust crates linked into brainproxy and the desktop app, and the npm packages in its interface.</p>
+      <div className="toolbar">
+        <input className="input" placeholder="Filter by name or license" value={filter} onChange={(e) => setFilter(e.target.value)} />
+      </div>
+      <div className="lic-table">
+        <DataTable rows={rows} columns={columns} rowKey={(p) => `${p.kind}:${p.name}@${p.version}`} initialSort={{ key: "name", desc: false }} empty="No package matches." />
+      </div>
     </div>
   );
 }

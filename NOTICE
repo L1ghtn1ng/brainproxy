@@ -14,6 +14,13 @@ Copyright the ZAP development team, licensed under the Apache License, Version 2
   TimingUtils), including their alert texts and payload lists.
 - crates/core/src/scan/active/rules/probes/data/hidden_files.json: copied from ascanrules.
 
+Declarative checks run Nuclei templates (https://github.com/projectdiscovery/nuclei-templates),
+Copyright (c) 2020 ProjectDiscovery, Inc., MIT License. They are downloaded on request
+(`checks update`), not bundled. The template format, DSL functions, and interactsh-style
+matchers follow Nuclei and interactsh (https://github.com/projectdiscovery/nuclei,
+https://github.com/projectdiscovery/interactsh), Copyright (c) 2020 ProjectDiscovery, Inc.,
+MIT License.
+
 Built-in fuzzer wordlists (crates/core/src/wordlists/data/, built by
 scripts/update-wordlists.py from the commits recorded in MANIFEST.json; files were cleaned:
 blank, duplicate, and comment lines and destructive statements removed):
@@ -31,7 +38,8 @@ blank, duplicate, and comment lines and destructive statements removed):
   Copyright (c) 2015-2020 Max Woolf, MIT License: naughty-strings.
 - fuzz.txt (https://github.com/Bo0oM/fuzz.txt) by Bo0oM, WTFPL: content-discovery.
 
-MIT License text (SecLists, PayloadsAllTheThings, Big List of Naughty Strings):
+MIT License text (SecLists, PayloadsAllTheThings, Big List of Naughty Strings, Nuclei,
+nuclei-templates, interactsh):
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -2085,3 +2085,40 @@ button.chip {
 .tree-subname {
   color: var(--text);
 }
+
+/* ---------- open source licenses ---------- */
+
+.lic-credits {
+  grid-template-columns: 190px minmax(0, 820px);
+  row-gap: 8px;
+}
+.lic-credits dd {
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+.lic-tag {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.lic-notice {
+  margin: 12px 0;
+}
+.lic-notice pre {
+  max-height: 360px;
+  overflow: auto;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  font-size: 11px;
+}
+.lic-table {
+  display: flex;
+  height: 420px;
+  border: 1px solid var(--border);
+}

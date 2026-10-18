@@ -235,6 +235,9 @@ byte, side by side or unified.
 - **Rules & data:** update the ZAP rule data and Nuclei templates.
 - **Project:** project information, the engagement, and *Start the proxy when a project
   opens*.
+- **Open source licenses:** credits for the projects the rules, checks and wordlists come
+  from (OWASP ZAP, Nuclei, SecLists, ...), the full NOTICE, and every third-party package
+  with its license.
 
 ---
 
