@@ -10,8 +10,9 @@
 //! A connection is allowed only if every present source allows it. With no source
 //! at all, nothing is sent. Hostnames are resolved and checked before connecting,
 //! and the connection goes to the checked address, so DNS changes between check
-//! and connect don't matter. Internal addresses (see [`is_internal`]) reached
-//! through a name are refused unless the scope includes them by address.
+//! and connect don't matter. Internal addresses reached through a name are
+//! refused unless the scope includes them by address (see [`Internal`] for the
+//! exceptions).
 //! Hostnames are compared in one canonical form (see [`norm_host`]).
 
 use std::net::{IpAddr, SocketAddr};
@@ -170,32 +171,47 @@ fn unwrap_v4(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// Addresses a name must not lead to on its own: loopback, unspecified / "this
-/// network" (0.0.0.0/8, ::), private (RFC 1918), link-local, IPv6 ULA (fc00::/7,
-/// which holds AWS IMDS fd00:ec2::254) and known metadata IPs outside those ranges
-/// (Alibaba 100.100.100.200), also when wrapped as IPv4-mapped or NAT64
-/// (64:ff9b::/96).
+/// Internal addresses a name may resolve to, checked per resolved address in
+/// [`Scope::allowed_addrs`]. All forms are also matched behind IPv4-mapped
+/// (`::ffff:`) and NAT64 (`64:ff9b::/96`) wrapping.
 ///
-/// The rule, applied per resolved address in [`Scope::allowed_addrs`]: an internal
-/// address is allowed only if an include entry names it by IP or CIDR (so an IP
-/// literal or an address-scoped lab target always passes), or if it is loopback
-/// and the host is `localhost` matched by name (a scope entry `localhost` means
-/// this machine, nothing else).
-fn is_internal(ip: IpAddr) -> bool {
-    match unwrap_v4(ip) {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.octets()[0] == 0
-                || v4.octets() == [100, 100, 100, 200]
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-        }
+/// The rule:
+/// - An include entry that names the address by IP or CIDR always allows it (so
+///   IP literals and address-scoped lab targets pass).
+/// - [`Internal::Sensitive`] (loopback, unspecified / 0.0.0.0/8, link-local, and
+///   metadata IPs: 169.254.169.254 via link-local, AWS IPv6 fd00:ec2::254, Alibaba
+///   100.100.100.200) is otherwise refused for every name, except loopback for
+///   the host `localhost` matched by name (an entry `localhost` means this machine).
+/// - [`Internal::Private`] (RFC 1918, IPv6 ULA fc00::/7) is allowed when an exact
+///   host entry matches (an internal pentest scoped to `app.corp`), and refused
+///   when only a wildcard matches: whoever controls DNS under `*.target.com` could
+///   otherwise point a name at the tester's own network.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Internal {
+    Sensitive,
+    Private,
+}
+
+fn internal(ip: IpAddr) -> Option<Internal> {
+    if ip == IpAddr::from([0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254]) {
+        return Some(Internal::Sensitive);
+    }
+    let (sensitive, private) = match unwrap_v4(ip) {
+        IpAddr::V4(v4) => (
+            v4.is_loopback() || v4.is_link_local() || v4.octets()[0] == 0 || v4.octets() == [100, 100, 100, 200],
+            v4.is_private(),
+        ),
+        IpAddr::V6(v6) => (
+            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+            (v6.segments()[0] & 0xfe00) == 0xfc00,
+        ),
+    };
+    if sensitive {
+        Some(Internal::Sensitive)
+    } else if private {
+        Some(Internal::Private)
+    } else {
+        None
     }
 }
 
@@ -227,8 +243,11 @@ impl Scope {
             return Err(format!("{host} is excluded by the {}", self.origin));
         }
         let name_ok = literal.is_none() && self.include.iter().any(|e| e.matches_name(&host, port));
-        let localhost = name_ok && host == "localhost";
+        let exact = name_ok
+            && self.include.iter().any(|e| matches!(e.pattern, Pattern::Host(_)) && e.matches_name(&host, port));
+        let localhost = exact && host == "localhost";
         let mut ok = Vec::new();
+        let mut refused = None;
         for &ip in addrs {
             if self.exclude.iter().any(|e| e.matches_addr(ip, port)) {
                 continue;
@@ -237,13 +256,23 @@ impl Scope {
             if !(name_ok || addr_ok) {
                 continue;
             }
-            if is_internal(ip)
-                && !self.include.iter().any(|e| e.names_addr_explicitly(ip))
-                && !(localhost && unwrap_v4(ip).is_loopback())
-            {
+            let allowed = match internal(ip) {
+                None => true,
+                _ if self.include.iter().any(|e| e.names_addr_explicitly(ip)) => true,
+                Some(Internal::Sensitive) => localhost && unwrap_v4(ip).is_loopback(),
+                Some(Internal::Private) => exact,
+            };
+            if !allowed {
+                refused.get_or_insert(ip);
                 continue;
             }
             ok.push(ip);
+        }
+        if let (true, Some(ip)) = (ok.is_empty(), refused) {
+            return Err(format!(
+                "{host} resolves to internal address {ip}; add it (or its CIDR) to the {} to allow it",
+                self.origin
+            ));
         }
         if ok.is_empty() {
             return Err(format!("{host}:{port} is outside the {}", self.origin));
@@ -458,16 +487,13 @@ mod tests {
 
     #[test]
     fn names_do_not_reach_internal_addresses() {
-        // #17: an in-scope name pointed at an internal address is refused...
-        let s = Scope::compile(spec(&["*.target.com", "localhost", "10.0.1.0/24"], &[]), "t").unwrap();
-        for ip in [
+        // #17: a wildcard name pointed at any internal address is refused...
+        let s = Scope::compile(spec(&["*.target.com", "app.corp", "localhost", "10.0.1.0/24"], &[]), "t").unwrap();
+        let sensitive = [
             "127.0.0.1",
             "::1",
             "0.0.0.0",
             "::",
-            "10.1.2.3",
-            "172.16.0.1",
-            "192.168.1.1",
             "fd00:ec2::254",
             "64:ff9b::a9fe:a9fe",
             "64:ff9b::7f00:1",
@@ -475,16 +501,27 @@ mod tests {
             "100.100.100.200",
             "169.254.169.254",
             "fe80::1",
-        ] {
-            assert!(s.allowed_addrs("x.target.com", 80, &ips(&[ip])).is_err(), "{ip}");
+        ];
+        let private = ["10.1.2.3", "172.16.0.1", "192.168.1.1", "fd12::1", "::ffff:10.1.2.3"];
+        for ip in sensitive.iter().chain(&private) {
+            let e = s.allowed_addrs("x.target.com", 80, &ips(&[ip])).unwrap_err();
+            assert!(e.contains("internal address") && e.contains("to the t to allow it"), "{ip}: {e}");
         }
         assert!(s.allowed_addrs("x.target.com", 80, &ips(&["93.184.216.34"])).is_ok());
-        // ...unless the scope names the address: by CIDR, or as an IP literal.
+        // ...an exact host entry may reach private addresses (internal pentests),
+        for ip in private {
+            assert!(s.allowed_addrs("app.corp", 80, &ips(&[ip])).is_ok(), "{ip}");
+        }
+        // but never loopback, link-local or metadata.
+        for ip in sensitive {
+            assert!(s.allowed_addrs("app.corp", 80, &ips(&[ip])).is_err(), "{ip}");
+        }
+        // Naming the address (CIDR or IP literal) always allows it.
         assert!(s.allowed_addrs("x.target.com", 80, &ips(&["10.0.1.244"])).is_ok());
         assert!(s.allowed_addrs("10.0.1.244", 80, &ips(&["10.0.1.244"])).is_ok());
-        // A `localhost` entry means this machine: its loopback only.
+        // A `localhost` entry means this machine: loopback, not metadata.
         assert_eq!(s.allowed_addrs("localhost", 80, &ips(&["127.0.0.1", "::1"])).unwrap().len(), 2);
-        assert!(s.allowed_addrs("localhost", 80, &ips(&["10.9.9.9"])).is_err());
+        assert!(s.allowed_addrs("localhost", 80, &ips(&["169.254.169.254"])).is_err());
     }
 
     #[tokio::test]
