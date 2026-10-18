@@ -48,6 +48,7 @@ impl CertAuthority {
         if created {
             Self::generate(dir)?;
         }
+        warn_if_loose(&key_path);
         let ca_pem = std::fs::read_to_string(&cert_path)?;
         let key = KeyPair::from_pem(&std::fs::read_to_string(&key_path)?).map_err(ca_err)?;
         let spki = rcgen::PublicKeyData::subject_public_key_info(&key);
@@ -74,7 +75,8 @@ impl CertAuthority {
         dn.push(DnType::CommonName, "brainproxy CA");
         dn.push(DnType::OrganizationName, "brainproxy");
         params.distinguished_name = dn;
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        // pathlen:0: the CA signs leaves only, never another CA.
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages =
             vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
         let now = OffsetDateTime::now_utc();
@@ -169,8 +171,35 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     opts.mode(0o600);
-    opts.open(path)?.write_all(data)?;
+    let mut f = opts.open(path)?;
+    // `mode` only applies when the file is created; tighten an existing one too
+    // (before writing, so the new key is never readable by others).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    f.write_all(data)?;
     Ok(())
+}
+
+/// Warns on stderr when the CA key is readable or writable by group or others.
+fn warn_if_loose(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                eprintln!(
+                    "brainproxy: warning: CA key {} has mode {mode:o}; anyone who can read it can intercept any host. Run `chmod 600` on it.",
+                    path.display()
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn ca_err(e: impl std::fmt::Display) -> Error {
@@ -198,5 +227,21 @@ mod tests {
         let a = ca2.server_config("Example.test").unwrap();
         let b = ca2.server_config("example.test").unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regenerate_tightens_key_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bp-ca-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        CertAuthority::generate(&dir).unwrap();
+        let key = dir.join(CA_KEY);
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // `ca init --force` over a loose key must leave it 0600.
+        CertAuthority::generate(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+        CertAuthority::load_or_create(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

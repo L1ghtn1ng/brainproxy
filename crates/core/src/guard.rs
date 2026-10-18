@@ -10,8 +10,9 @@
 //! A connection is allowed only if every present source allows it. With no source
 //! at all, nothing is sent. Hostnames are resolved and checked before connecting,
 //! and the connection goes to the checked address, so DNS changes between check
-//! and connect don't matter. Link-local addresses (including cloud metadata at
-//! 169.254.169.254) are refused unless explicitly included by address.
+//! and connect don't matter. Internal addresses (see [`is_internal`]) reached
+//! through a name are refused unless the scope includes them by address.
+//! Hostnames are compared in one canonical form (see [`norm_host`]).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -75,6 +76,8 @@ impl Entry {
         } else {
             (s.clone(), None)
         };
+        // Same canonical form as the hosts it is matched against.
+        let body = body.strip_suffix('.').unwrap_or(&body).to_string();
         let pattern = if let Some((ip, bits)) = body.split_once('/') {
             let ip: IpAddr = ip.parse().map_err(|_| bad())?;
             let bits: u8 = bits.parse().map_err(|_| bad())?;
@@ -147,11 +150,51 @@ fn in_net(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
     }
 }
 
-fn is_link_local(ip: IpAddr) -> bool {
+/// The canonical form every host is compared in: no brackets, lowercase, and one
+/// trailing dot removed (`LOCALHOST.` and `localhost` are the same host).
+fn norm_host(host: &str) -> String {
+    let h = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    h.strip_suffix('.').map(str::to_string).unwrap_or(h)
+}
+
+/// The IPv4 address behind an IPv4-mapped (`::ffff:a.b.c.d`) or NAT64
+/// (`64:ff9b::a.b.c.d`) address; otherwise the address itself.
+fn unwrap_v4(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) if v6.segments()[..6] == [0x64, 0xff9b, 0, 0, 0, 0] => {
+            let o = v6.octets();
+            IpAddr::from([o[12], o[13], o[14], o[15]])
+        }
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
+/// Addresses a name must not lead to on its own: loopback, unspecified / "this
+/// network" (0.0.0.0/8, ::), private (RFC 1918), link-local, IPv6 ULA (fc00::/7,
+/// which holds AWS IMDS fd00:ec2::254) and known metadata IPs outside those ranges
+/// (Alibaba 100.100.100.200), also when wrapped as IPv4-mapped or NAT64
+/// (64:ff9b::/96).
+///
+/// The rule, applied per resolved address in [`Scope::allowed_addrs`]: an internal
+/// address is allowed only if an include entry names it by IP or CIDR (so an IP
+/// literal or an address-scoped lab target always passes), or if it is loopback
+/// and the host is `localhost` matched by name (a scope entry `localhost` means
+/// this machine, nothing else).
+fn is_internal(ip: IpAddr) -> bool {
+    match unwrap_v4(ip) {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.octets()[0] == 0
+                || v4.octets() == [100, 100, 100, 200]
+        }
         IpAddr::V6(v6) => {
-            v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local()) || (v6.segments()[0] & 0xffc0) == 0xfe80
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
 }
@@ -178,12 +221,13 @@ impl Scope {
     /// Whether connecting to `host:port`, resolved to `addrs`, is allowed. Returns
     /// the addresses that may be used.
     fn allowed_addrs(&self, host: &str, port: u16, addrs: &[IpAddr]) -> std::result::Result<Vec<IpAddr>, String> {
-        let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+        let host = norm_host(host);
         let literal = host.parse::<IpAddr>().ok();
         if literal.is_none() && self.exclude.iter().any(|e| e.matches_name(&host, port)) {
             return Err(format!("{host} is excluded by the {}", self.origin));
         }
         let name_ok = literal.is_none() && self.include.iter().any(|e| e.matches_name(&host, port));
+        let localhost = name_ok && host == "localhost";
         let mut ok = Vec::new();
         for &ip in addrs {
             if self.exclude.iter().any(|e| e.matches_addr(ip, port)) {
@@ -193,7 +237,10 @@ impl Scope {
             if !(name_ok || addr_ok) {
                 continue;
             }
-            if is_link_local(ip) && !self.include.iter().any(|e| e.names_addr_explicitly(ip)) {
+            if is_internal(ip)
+                && !self.include.iter().any(|e| e.names_addr_explicitly(ip))
+                && !(localhost && unwrap_v4(ip).is_loopback())
+            {
                 continue;
             }
             ok.push(ip);
@@ -244,17 +291,17 @@ impl Guard {
 
     /// Resolves `host` and returns the socket addresses every scope allows.
     pub async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        // Look the name up as given (a trailing dot stops search-domain expansion),
+        // but check it in canonical form.
+        let lookup = host.trim_start_matches('[').trim_end_matches(']');
+        let bare = &norm_host(host);
         let addrs: Vec<IpAddr> = match bare.parse::<IpAddr>() {
             Ok(ip) => vec![ip],
             Err(_) => {
                 // Refuse names no scope could allow before touching DNS.
                 self.precheck_name(bare, port)?;
-                let named = self
-                    .scopes
-                    .iter()
-                    .all(|sc| sc.include.iter().any(|e| e.matches_name(&bare.to_ascii_lowercase(), port)));
-                match tokio::net::lookup_host((bare, port)).await {
+                let named = self.scopes.iter().all(|sc| sc.include.iter().any(|e| e.matches_name(bare, port)));
+                match tokio::net::lookup_host((lookup, port)).await {
                     Ok(addrs) => addrs.map(|a| a.ip()).collect(),
                     // A name that every scope lists by name is in scope; it just doesn't resolve.
                     Err(e) if named => return Err(Error::Connect(format!("{bare}: {e}"))),
@@ -280,7 +327,7 @@ impl Guard {
 
     /// Quick name-only check (no DNS): false when no scope could ever allow it.
     fn precheck_name(&self, host: &str, port: u16) -> Result<()> {
-        let host = host.to_ascii_lowercase();
+        let host = norm_host(host);
         for scope in &self.scopes {
             if scope.exclude.iter().any(|e| e.matches_name(&host, port)) {
                 return Err(Error::OutOfScope(format!("{host} is excluded by the {}", scope.origin)));
@@ -296,7 +343,7 @@ impl Guard {
     /// Cheap check without DNS: false when the target can't possibly be in scope
     /// (true can still be refused at connect time, e.g. for CIDR-only scopes).
     pub fn may_allow(&self, host: &str, port: u16) -> bool {
-        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let bare = &norm_host(host);
         match bare.parse::<IpAddr>() {
             Ok(ip) => self.scopes.iter().all(|s| s.allowed_addrs(bare, port, &[ip]).is_ok()),
             Err(_) => self.precheck_name(bare, port).is_ok(),
@@ -390,6 +437,54 @@ mod tests {
         assert!(m.allowed_addrs("169.254.169.254", 80, &ips(&["169.254.169.254"])).is_ok());
         // IPv4-mapped IPv6 is treated as IPv4.
         assert!(s.allowed_addrs("::ffff:10.0.0.5", 80, &ips(&["::ffff:10.0.0.5"])).is_ok());
+    }
+
+    #[tokio::test]
+    async fn trailing_dot_and_case_do_not_bypass_name_excludes() {
+        // #16: include by CIDR, exclude by name; `localhost.` resolves into the CIDR.
+        let g = Guard::from_specs(vec![spec(&["127.0.0.0/8", "10.0.0.0/24"], &["localhost", "admin.corp."])]).unwrap();
+        for host in ["localhost", "localhost.", "LOCALHOST.", "[localhost.]"] {
+            assert!(matches!(g.resolve(host, 80).await, Err(Error::OutOfScope(_))), "{host}");
+            assert!(!g.may_allow(host, 80), "{host}");
+        }
+        let s = &g.scopes()[0];
+        for host in ["admin.corp", "admin.corp.", "Admin.Corp."] {
+            assert!(s.allowed_addrs(host, 80, &ips(&["10.0.0.5"])).is_err(), "{host}");
+        }
+        // Includes are normalised the same way.
+        let n = Scope::compile(spec(&["App.Test."], &[]), "t").unwrap();
+        assert!(n.allowed_addrs("app.test.", 80, &ips(&["93.184.216.34"])).is_ok());
+    }
+
+    #[test]
+    fn names_do_not_reach_internal_addresses() {
+        // #17: an in-scope name pointed at an internal address is refused...
+        let s = Scope::compile(spec(&["*.target.com", "localhost", "10.0.1.0/24"], &[]), "t").unwrap();
+        for ip in [
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "::",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "fd00:ec2::254",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "::ffff:127.0.0.1",
+            "100.100.100.200",
+            "169.254.169.254",
+            "fe80::1",
+        ] {
+            assert!(s.allowed_addrs("x.target.com", 80, &ips(&[ip])).is_err(), "{ip}");
+        }
+        assert!(s.allowed_addrs("x.target.com", 80, &ips(&["93.184.216.34"])).is_ok());
+        // ...unless the scope names the address: by CIDR, or as an IP literal.
+        assert!(s.allowed_addrs("x.target.com", 80, &ips(&["10.0.1.244"])).is_ok());
+        assert!(s.allowed_addrs("10.0.1.244", 80, &ips(&["10.0.1.244"])).is_ok());
+        // A `localhost` entry means this machine: its loopback only.
+        assert_eq!(s.allowed_addrs("localhost", 80, &ips(&["127.0.0.1", "::1"])).unwrap().len(), 2);
+        assert!(s.allowed_addrs("localhost", 80, &ips(&["10.9.9.9"])).is_err());
     }
 
     #[tokio::test]
