@@ -3,7 +3,10 @@
 A fast, AI-first web security testing toolkit written in Rust. Some UI elements are modelled
 on other apps, and the scan rules are ported from OWASP ZAP (Apache 2.0, see NOTICE). Its main
 operator is an LLM: **Braintruder** drives it through a Kali runner. Every feature is a
-non-interactive CLI command with structured JSON output. A GUI comes later on the same engine.
+non-interactive CLI command with structured JSON output, and a desktop app for macOS and
+Linux runs on the same engine.
+
+![brainproxy desktop app: a finished guided scan on the Overview](docs/screenshots/overview.png)
 
 Only use it against systems you are authorized to test.
 
@@ -18,6 +21,10 @@ Tagged releases also attach the desktop GUI with the CLI bundled inside:
 `brainproxy-gui-macos-arm64.dmg` and `brainproxy-gui-linux-x86_64.deb` / `.AppImage`. The macOS
 app isn't signed yet, so open it the first time with right-click → Open. See
 [docs/GUI.md](docs/GUI.md).
+
+| Site map | Replay | Fuzzer |
+| --- | --- | --- |
+| [![Site map: recorded requests by host and path, with the request and response](docs/screenshots/sitemap.png)](docs/screenshots/sitemap.png) | [![Replay: editing and resending a request](docs/screenshots/replay.png)](docs/screenshots/replay.png) | [![Fuzzer: payload positions, built-in SQL injection list, match rules](docs/screenshots/fuzzer.png)](docs/screenshots/fuzzer.png) |
 
 ## Install on Kali (CLI only)
 
