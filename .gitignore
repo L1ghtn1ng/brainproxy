@@ -2,3 +2,4 @@ target/
 *.bpdb
 *.bpdb-*
 .claude/worktrees/
+HANDOVER.md
