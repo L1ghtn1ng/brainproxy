@@ -357,7 +357,11 @@ fn usage_hints(state: &ProxyState) -> Value {
     let ca = state.ca_cert.display();
     json!({
         "proxy_url": url,
-        "curl": format!("curl --noproxy '' -x {url} --cacert {ca} https://TARGET/"),
+        // Windows curl (Schannel) also wants a revocation check, which a local CA can't answer.
+        "curl": format!(
+            "curl --noproxy '' -x {url} --cacert {ca}{} https://TARGET/",
+            if cfg!(windows) { " --ssl-no-revoke" } else { "" }
+        ),
         "note": "--noproxy '' stops NO_PROXY (often set to localhost) from bypassing the proxy.",
         "env": format!("export http_proxy={url} https_proxy={url} HTTP_PROXY={url} HTTPS_PROXY={url}"),
         "trust_ca_for_tools": format!("export SSL_CERT_FILE={ca} REQUESTS_CA_BUNDLE={ca} CURL_CA_BUNDLE={ca}"),

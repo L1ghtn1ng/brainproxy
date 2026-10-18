@@ -65,13 +65,18 @@ impl Drop for Env {
 /// curl through the proxy; returns (status, body).
 fn curl(proxy: &str, ca: &Path, url: &str, extra: &[&str]) -> (u16, String) {
     let out = Command::new("curl")
-        .args(["-s", "--noproxy", "", "--max-time", "20", "-x", proxy, "--cacert"])
+        .args(["-sS", "--noproxy", "", "--max-time", "20", "-x", proxy, "--cacert"])
         .arg(ca)
+        // Windows curl (Schannel) also wants a revocation check, which a local CA can't answer.
+        .args(if cfg!(windows) { &["--ssl-no-revoke"][..] } else { &[] })
         .args(extra)
         .args(["-w", "\n%{http_code}", url])
         .output()
         .expect("curl must be installed");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !out.stderr.is_empty() {
+        eprintln!("curl {url}: {}", String::from_utf8_lossy(&out.stderr));
+    }
     let (body, code) = text.rsplit_once('\n').unwrap_or(("", "0"));
     (code.trim().parse().unwrap_or(0), body.to_string())
 }
@@ -493,8 +498,10 @@ fn active_scan_finds_known_issues() {
 /// curl through the proxy; returns (HTTP version, status, body).
 fn curl_version(proxy: &str, ca: &Path, url: &str, extra: &[&str]) -> (String, u16, String) {
     let out = Command::new("curl")
-        .args(["-s", "--noproxy", "", "--max-time", "20", "-x", proxy, "--cacert"])
+        .args(["-sS", "--noproxy", "", "--max-time", "20", "-x", proxy, "--cacert"])
         .arg(ca)
+        // Windows curl (Schannel) also wants a revocation check, which a local CA can't answer.
+        .args(if cfg!(windows) { &["--ssl-no-revoke"][..] } else { &[] })
         .args(extra)
         .args(["-w", "\n%{http_version} %{http_code}", url])
         .output()
