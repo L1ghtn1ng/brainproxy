@@ -7,6 +7,8 @@
 //! All requests go through the normal client, so login traffic is bound by the
 //! engagement scope like everything else.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -18,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capture::{decode_body, Capture};
 use crate::error::{Error, Result};
-use crate::http::request::split_head_body;
+use crate::http::request::{find, split_head_body};
 use crate::http::{parse_response_head, Client, Exchange, RawRequest, Target};
 use crate::scan::message::SetCookie;
 use crate::store::Store;
@@ -227,6 +229,147 @@ impl Store {
     }
 }
 
+/// The text that stands in for a secret value: `«auth:PROFILE:KIND»`, where KIND is
+/// `header:NAME`, `cookie:NAME`, `token`, `password`, `password:form` or `password:json`.
+pub fn placeholder(profile: &str, kind: &str) -> String {
+    format!("«auth:{profile}:{kind}»")
+}
+
+const MARK: &str = "«auth:";
+
+#[derive(Clone)]
+struct VaultEntry {
+    value: String,
+    /// Lowercase header the value may be filled into; None for a password.
+    header: Option<String>,
+    /// Origin a password may be sent to (the login URL's).
+    origin: Option<String>,
+}
+
+/// Current values behind auth placeholders. The auth layer writes placeholders into
+/// requests instead of secrets, so history and every other record of a request
+/// hold the placeholder; [`Vault::resolve`] puts the real values in as the bytes go
+/// on the wire. It lives in the project's [`crate::guard::Guard`], which every client
+/// of a command shares.
+#[derive(Default)]
+pub struct Vault(Mutex<HashMap<String, VaultEntry>>);
+
+impl Clone for Vault {
+    fn clone(&self) -> Self {
+        Vault(Mutex::new(self.0.lock().unwrap().clone()))
+    }
+}
+
+impl std::fmt::Debug for Vault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Vault({} values)", self.0.lock().unwrap().len())
+    }
+}
+
+impl Vault {
+    fn put(&self, ph: String, value: &str, header: Option<&str>, origin: Option<String>) {
+        let entry =
+            VaultEntry { value: value.to_string(), header: header.map(|h| h.trim().to_ascii_lowercase()), origin };
+        self.0.lock().unwrap().insert(ph, entry);
+    }
+
+    /// Registers a profile's session values: cookies, token, static headers.
+    fn put_session(&self, p: &AuthProfile, st: &SessionState) {
+        for (k, v) in &st.cookies {
+            self.put(placeholder(&p.name, &format!("cookie:{k}")), v, Some("cookie"), None);
+        }
+        if let (Some(tpl), Some(tok)) = (&p.token_header, &st.token) {
+            if let Some((k, _)) = tpl.split_once(':') {
+                self.put(placeholder(&p.name, "token"), tok, Some(k), None);
+            }
+        }
+        for (k, v) in &p.headers {
+            self.put(placeholder(&p.name, &format!("header:{k}")), v, Some(k), None);
+        }
+    }
+
+    /// Registers a password, encoded for each login body type, for the login origin only.
+    fn put_password(&self, p: &AuthProfile, password: &str) {
+        let origin = p.login_url.as_deref().and_then(|u| Target::from_url(u).ok()).map(|t| t.origin());
+        for enc in [Enc::Raw, Enc::Form, Enc::Json] {
+            self.put(placeholder(&p.name, enc.password_kind()), &encode(password, enc), None, origin.clone());
+        }
+    }
+
+    /// The request with placeholders replaced by their values. A header value is only
+    /// filled into its own header and a password only into requests to the login
+    /// origin, so a placeholder can't be moved somewhere that reflects it back. Fails
+    /// on a placeholder left over (profile removed, never logged in, password variable
+    /// unset, or the placeholder moved out of its header).
+    pub fn resolve<'a>(&self, raw: &'a [u8], target: &Target) -> Result<Cow<'a, [u8]>> {
+        if find(raw, MARK.as_bytes()).is_none() {
+            return Ok(Cow::Borrowed(raw));
+        }
+        let entries = self.0.lock().unwrap().clone();
+        let origin = target.origin();
+        let anywhere = |e: &VaultEntry| e.header.is_none() && e.origin.as_deref() == Some(origin.as_str());
+        let (head, body) = split_head_body(raw);
+        let mut out = Vec::with_capacity(raw.len());
+        for line in head.split_inclusive(|&b| b == b'\n') {
+            let name = line
+                .iter()
+                .position(|&b| b == b':')
+                .map(|i| String::from_utf8_lossy(&line[..i]).trim().to_ascii_lowercase());
+            let mut line = line.to_vec();
+            for (ph, e) in &entries {
+                if anywhere(e) || (e.header.is_some() && e.header == name) {
+                    line = replace(&line, ph.as_bytes(), e.value.as_bytes());
+                }
+            }
+            out.extend(line);
+        }
+        let mut new_body = body.to_vec();
+        for (ph, e) in entries.iter().filter(|(_, e)| anywhere(e)) {
+            new_body = replace(&new_body, ph.as_bytes(), e.value.as_bytes());
+        }
+        let body_changed = new_body != body;
+        out.extend(new_body);
+        if let Some(i) = find(&out, MARK.as_bytes()) {
+            let rest = String::from_utf8_lossy(&out[i..]);
+            let ph: String = rest.chars().take(120).take_while(|&c| c != '»').chain(Some('»')).collect();
+            return Err(Error::InvalidInput(format!(
+                "no value for {ph} in this request: the auth profile was removed, has not logged in \
+                 (`auth login`), its password variable is unset, or the placeholder is outside its header"
+            )));
+        }
+        if body_changed {
+            out = RawRequest::from_bytes(out).update_content_length().into_bytes();
+        }
+        Ok(Cow::Owned(out))
+    }
+}
+
+fn replace(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hay.len());
+    let mut rest = hay;
+    while let Some(i) = find(rest, from) {
+        out.extend_from_slice(&rest[..i]);
+        out.extend_from_slice(to);
+        rest = &rest[i + from.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+impl Store {
+    /// Loads every profile's stored values into `vault`, so requests re-sent from
+    /// history (replay, `send`, scans of stored requests) get their placeholders filled.
+    pub(crate) fn auth_fill_vault(&self, vault: &Vault) -> Result<()> {
+        for (p, st) in self.auth_list()? {
+            vault.put_session(&p, &st);
+            if let Some(pw) = p.password.as_ref().and_then(|s| s.resolve().ok()) {
+                vault.put_password(&p, &pw);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Outcome of a login attempt.
 #[derive(Debug, Clone, Serialize)]
 pub struct LoginResult {
@@ -367,12 +510,17 @@ impl AuthSession {
         h
     }
 
-    /// Adds the session's cookies and headers to a raw request. Cookies the
-    /// session knows replace the request's values (stale captures), except
-    /// cookies named in `keep`, which are left as the caller set them (e.g. a
-    /// cookie being attacked or fuzzed).
+    /// Adds the session's cookies and headers to a raw request, as placeholders
+    /// ([`placeholder`]) that the client fills in on the wire, so no record of the
+    /// request holds the secret. Cookies the session knows replace the request's
+    /// values (stale captures), except cookies named in `keep`, which are left as
+    /// the caller set them (e.g. a cookie being attacked or fuzzed).
     pub fn apply(&self, raw: &[u8], keep: &[&str]) -> Vec<u8> {
         let st = self.state.lock().unwrap();
+        if let Some(g) = &self.client.options().guard {
+            g.vault.put_session(&self.profile, &st);
+        }
+        let ph = |kind: &str| placeholder(&self.profile.name, kind);
         let mut req = RawRequest::from_bytes(raw.to_vec());
         if !st.cookies.is_empty() {
             let existing = request_cookies(raw);
@@ -383,21 +531,21 @@ impl AuthSession {
                     merged.push((k.clone(), v.clone()));
                 }
             }
-            for (k, v) in &st.cookies {
+            for (k, _) in &st.cookies {
                 if !merged.iter().any(|(n, _)| n == k) {
-                    merged.push((k.clone(), v.clone()));
+                    merged.push((k.clone(), ph(&format!("cookie:{k}"))));
                 }
             }
             let value = merged.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; ");
             req = req.set_header("Cookie", &value);
         }
-        if let (Some(tpl), Some(tok)) = (&self.profile.token_header, &st.token) {
-            if let Some((k, v)) = tpl.replace("{{token}}", tok).split_once(':') {
+        if let (Some(tpl), Some(_)) = (&self.profile.token_header, &st.token) {
+            if let Some((k, v)) = tpl.replace("{{token}}", &ph("token")).split_once(':') {
                 req = req.set_header(k.trim(), v.trim());
             }
         }
-        for (k, v) in &self.profile.headers {
-            req = req.set_header(k, v);
+        for (k, _) in &self.profile.headers {
+            req = req.set_header(k, &ph(&format!("header:{k}")));
         }
         req.into_bytes()
     }
@@ -539,6 +687,9 @@ impl AuthSession {
         let mut history = Vec::new();
         let username = p.username.clone().unwrap_or_default();
         let password = p.password.as_ref().map(Secret::resolve).transpose()?.unwrap_or_default();
+        if let Some(g) = &self.client.options().guard {
+            g.vault.put_password(p, &password);
+        }
 
         let mut csrf = String::new();
         if let (Some(url), Some(re)) = (&p.csrf_url, &self.re.csrf) {
@@ -564,7 +715,7 @@ impl AuthSession {
                 } else {
                     Enc::Raw
                 };
-                let text = substitute(tpl, &username, &password, &csrf, enc);
+                let text = substitute(tpl, &username, &placeholder(&p.name, enc.password_kind()), &csrf, enc);
                 RawRequest::from_bytes(text.into_bytes()).normalize_line_endings().update_content_length()
             }
             None => {
@@ -575,7 +726,8 @@ impl AuthSession {
                     let ct = if json { "application/json" } else { "application/x-www-form-urlencoded" };
                     headers.push(("Content-Type".into(), ct.into()));
                 }
-                let body = substitute(&body, &username, &password, &csrf, if json { Enc::Json } else { Enc::Form });
+                let enc = if json { Enc::Json } else { Enc::Form };
+                let body = substitute(&body, &username, &placeholder(&p.name, enc.password_kind()), &csrf, enc);
                 RawRequest::build(&p.login_method, login_url, &headers, body.as_bytes())?.0
             }
         };
@@ -671,16 +823,33 @@ enum Enc {
     Raw,
 }
 
-fn substitute(tpl: &str, user: &str, pass: &str, csrf: &str, enc: Enc) -> String {
-    let e = |v: &str| match enc {
+impl Enc {
+    fn password_kind(self) -> &'static str {
+        match self {
+            Enc::Raw => "password",
+            Enc::Form => "password:form",
+            Enc::Json => "password:json",
+        }
+    }
+}
+
+fn encode(v: &str, enc: Enc) -> String {
+    match enc {
         Enc::Form => url::form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>(),
         Enc::Json => {
             let s = serde_json::to_string(v).unwrap_or_default();
             s[1..s.len() - 1].to_string()
         }
         Enc::Raw => v.to_string(),
-    };
-    tpl.replace("{{username}}", &e(user)).replace("{{password}}", &e(pass)).replace("{{csrf}}", &e(csrf))
+    }
+}
+
+/// Fills a login template. `pass` goes in as given (the password placeholder for
+/// `enc`; the vault holds the encoded password); username and CSRF token are encoded.
+fn substitute(tpl: &str, user: &str, pass: &str, csrf: &str, enc: Enc) -> String {
+    tpl.replace("{{username}}", &encode(user, enc))
+        .replace("{{password}}", pass)
+        .replace("{{csrf}}", &encode(csrf, enc))
 }
 
 fn response_text(response: &[u8]) -> String {
@@ -703,8 +872,17 @@ mod tests {
     fn session(profile: AuthProfile) -> AuthSession {
         let dir = std::env::temp_dir().join(format!("bp-auth-unit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        AuthSession::new(&dir.join("p.bpdb"), profile, SessionState::default(), Client::new(Default::default()))
-            .unwrap()
+        let scope = crate::guard::ScopeSpec { name: None, include: vec!["a.test".into()], exclude: vec![] };
+        let opts = crate::http::SendOptions {
+            guard: Some(crate::guard::Guard::from_specs(vec![scope]).unwrap()),
+            ..Default::default()
+        };
+        AuthSession::new(&dir.join("p.bpdb"), profile, SessionState::default(), Client::new(opts)).unwrap()
+    }
+
+    fn wire(s: &AuthSession, req: &[u8]) -> Result<String> {
+        let target = Target::from_url("https://a.test").unwrap();
+        Ok(String::from_utf8(s.client.fill_auth(req, &target)?.into_owned()).unwrap())
     }
 
     #[test]
@@ -717,14 +895,20 @@ mod tests {
             ..Default::default()
         });
         s.observe(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=new; Path=/\r\nSet-Cookie: theme=dark\r\n\r\n");
-        let out =
-            String::from_utf8(s.apply(b"GET / HTTP/1.1\r\nHost: a.test\r\nCookie: sid=old; other=1\r\n\r\n", &[]))
-                .unwrap();
-        assert!(out.contains("Cookie: other=1; sid=new; theme=dark\r\n"), "{out}");
-        assert!(out.contains("X-Api-Key: k\r\n"));
+        let applied = s.apply(b"GET / HTTP/1.1\r\nHost: a.test\r\nCookie: sid=old; other=1\r\n\r\n", &[]);
+        // The request (as recorded) holds placeholders; the wire form holds the values.
+        let out = String::from_utf8(applied.clone()).unwrap();
+        assert!(out.contains("Cookie: other=1; sid=«auth:t:cookie:sid»; theme=«auth:t:cookie:theme»\r\n"), "{out}");
+        assert!(out.contains("X-Api-Key: «auth:t:header:X-Api-Key»\r\n"), "{out}");
+        let sent = wire(&s, &applied).unwrap();
+        assert!(sent.contains("Cookie: other=1; sid=new; theme=dark\r\n"), "{sent}");
+        assert!(sent.contains("X-Api-Key: k\r\n"));
         // The attacked cookie is left alone.
         let out = String::from_utf8(s.apply(b"GET / HTTP/1.1\r\nCookie: sid=PAYLOAD\r\n\r\n", &["sid"])).unwrap();
-        assert!(out.contains("sid=PAYLOAD") && !out.contains("sid=new"), "{out}");
+        assert!(out.contains("sid=PAYLOAD") && !out.contains("sid=«"), "{out}");
+        // A placeholder moved out of its header, or of an unknown profile, is refused.
+        assert!(wire(&s, b"GET /?x=\xc2\xabauth:t:header:X-Api-Key\xc2\xbb HTTP/1.1\r\n\r\n").is_err());
+        assert!(wire(&s, "GET / HTTP/1.1\r\nX-Api-Key: «auth:gone:header:X-Api-Key»\r\n\r\n".as_bytes()).is_err());
         // Deletion cookies are forgotten.
         s.observe(b"HTTP/1.1 200 OK\r\nSet-Cookie: theme=; Max-Age=0\r\n\r\n");
         assert_eq!(s.state().cookies, vec![("sid".to_string(), "new".to_string())]);
@@ -747,8 +931,22 @@ mod tests {
 
     #[test]
     fn substitution_encodes_for_context() {
-        assert_eq!(substitute("u={{username}}&p={{password}}", "a b", "p&w", "", Enc::Form), "u=a+b&p=p%26w");
-        assert_eq!(substitute(r#"{"p":"{{password}}"}"#, "", "q\"x", "", Enc::Json), r#"{"p":"q\"x"}"#);
+        assert_eq!(substitute("u={{username}}&p={{password}}", "a b", "PW", "", Enc::Form), "u=a+b&p=PW");
+        assert_eq!(encode("p&w", Enc::Form), "p%26w");
+        assert_eq!(encode("q\"x", Enc::Json), r#"q\"x"#);
+    }
+
+    #[test]
+    fn password_fills_login_origin_only() {
+        let p = AuthProfile { name: "t".into(), login_url: Some("https://a.test/login".into()), ..Default::default() };
+        let s = session(p.clone());
+        s.client.options().guard.as_ref().unwrap().vault.put_password(&p, "p&w");
+        let body = substitute("p={{password}}", "", &placeholder("t", "password:form"), "", Enc::Form);
+        let req = format!("POST /login HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let sent = wire(&s, req.as_bytes()).unwrap();
+        assert!(sent.ends_with("Content-Length: 7\r\n\r\np=p%26w"), "{sent}");
+        let other = Target::from_url("https://b.test").unwrap();
+        assert!(s.client.fill_auth(req.as_bytes(), &other).is_err());
     }
 
     #[test]

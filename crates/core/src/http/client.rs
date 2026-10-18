@@ -157,17 +157,27 @@ impl Client {
         }
     }
 
+    /// The bytes to put on the wire: auth placeholders replaced with their values
+    /// from the guard's vault. Callers record the original bytes.
+    pub fn fill_auth<'a>(&self, bytes: &'a [u8], target: &Target) -> Result<std::borrow::Cow<'a, [u8]>> {
+        match &self.opts.guard {
+            Some(g) => g.vault.resolve(bytes, target),
+            None => Ok(std::borrow::Cow::Borrowed(bytes)),
+        }
+    }
+
     pub async fn send(&self, req: &RawRequest, target: &Target) -> Result<Exchange> {
         let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
         let started = Instant::now();
         if self.opts.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2")) {
-            let h2req = H2Request::from_raw(req.as_bytes(), target)?;
+            let h2req = H2Request::from_raw(&self.fill_auth(req.as_bytes(), target)?, target)?;
             let response = tokio::time::timeout(self.opts.timeout, self.round_trip_h2(&h2req, target))
                 .await
                 .map_err(|_| Error::Timeout(self.opts.timeout))??;
             return Ok(Exchange {
                 target: target.clone(),
-                request: h2req.recorded,
+                // Recorded with the auth placeholders, not the values sent.
+                request: H2Request::from_raw(req.as_bytes(), target)?.recorded,
                 response,
                 duration_ms: started.elapsed().as_millis() as u64,
             });
@@ -197,6 +207,7 @@ impl Client {
     /// retried once on a new connection. The caller decides whether to
     /// [`Client::checkin`] the connection afterwards.
     pub async fn exchange(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Conn, Vec<u8>)> {
+        let bytes = &*self.fill_auth(bytes, target)?;
         let mut c = self.checkout(target).await?;
         loop {
             let result = async {

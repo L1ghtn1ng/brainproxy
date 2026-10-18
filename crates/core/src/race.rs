@@ -31,6 +31,12 @@ pub const SINGLE_PACKET_MAX: usize = 100;
 /// `duration_ms` is measured from the moment the final bytes were released.
 pub async fn last_byte_sync(client: &Client, target: &Target, requests: Vec<Vec<u8>>) -> Vec<Result<Exchange>> {
     let timeout = client.options().timeout;
+    // What goes on the wire has auth placeholders filled; `requests` stays as recorded.
+    let wire: Vec<Vec<u8>> =
+        match requests.iter().map(|r| client.fill_auth(r, target).map(|b| b.into_owned())).collect() {
+            Ok(w) => w,
+            Err(e) => return requests.iter().map(|_| Err(Error::InvalidInput(e.to_string()))).collect(),
+        };
     // 1. Connect everything up front.
     let mut connects = Vec::new();
     for _ in &requests {
@@ -45,7 +51,7 @@ pub async fn last_byte_sync(client: &Client, target: &Target, requests: Vec<Vec<
     }
 
     // 2. Send everything except the last byte.
-    for (stream, req) in streams.iter_mut().zip(&requests) {
+    for (stream, req) in streams.iter_mut().zip(&wire) {
         if let Ok(s) = stream {
             let body = &req[..req.len().saturating_sub(1)];
             let write = async {
@@ -62,7 +68,7 @@ pub async fn last_byte_sync(client: &Client, target: &Target, requests: Vec<Vec<
 
     // 3. Release the last bytes back to back.
     let released = Instant::now();
-    for (stream, req) in streams.iter_mut().zip(&requests) {
+    for (stream, req) in streams.iter_mut().zip(&wire) {
         if let Ok(s) = stream {
             if let Err(e) = async {
                 s.write_all(&req[req.len().saturating_sub(1)..]).await?;
@@ -111,7 +117,11 @@ pub async fn single_packet(client: &Client, target: &Target, requests: Vec<Vec<u
     if requests.is_empty() || requests.len() > SINGLE_PACKET_MAX {
         return Err(Error::InvalidInput(format!("single-packet races take 1 to {SINGLE_PACKET_MAX} requests")));
     }
-    let converted: Vec<H2Request> = requests.iter().map(|r| H2Request::from_raw(r, target)).collect::<Result<_>>()?;
+    let converted: Vec<H2Request> =
+        requests.iter().map(|r| H2Request::from_raw(&client.fill_auth(r, target)?, target)).collect::<Result<_>>()?;
+    // Recorded with the auth placeholders, not the values sent.
+    let recorded: Vec<Vec<u8>> =
+        requests.iter().map(|r| H2Request::from_raw(r, target).map(|h| h.recorded)).collect::<Result<_>>()?;
     // Kept until the responses are read: dropping every sender closes the connection.
     // The timeout also covers servers allowing fewer concurrent streams than requests.
     let timeout = client.options().timeout;
@@ -139,12 +149,12 @@ pub async fn single_packet(client: &Client, target: &Target, requests: Vec<Vec<u
 
     // 4. Read the responses.
     let mut reads = Vec::new();
-    for (fut, req) in futures.into_iter().zip(converted) {
+    for (fut, request) in futures.into_iter().zip(recorded) {
         let target = target.clone();
         reads.push(tokio::spawn(async move {
             let response =
                 tokio::time::timeout(timeout, read_response(fut)).await.map_err(|_| Error::Timeout(timeout))??;
-            Ok(Exchange { target, request: req.recorded, response, duration_ms: released.elapsed().as_millis() as u64 })
+            Ok(Exchange { target, request, response, duration_ms: released.elapsed().as_millis() as u64 })
         }));
     }
     let mut out = Vec::new();

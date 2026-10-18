@@ -565,3 +565,121 @@ fn stop_never_signals_a_process_it_cannot_verify() {
     child.kill().unwrap();
     child.wait().unwrap();
 }
+
+/// Answers every request with 200 and a session cookie, keeping the raw requests it got.
+fn serve_recording() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut s = stream.unwrap();
+            let mut buf = vec![0u8; 65536];
+            let mut len = 0;
+            loop {
+                let n = s.read(&mut buf[len..]).unwrap();
+                len += n;
+                let text = String::from_utf8_lossy(&buf[..len]).to_string();
+                let Some(i) = text.find("\r\n\r\n") else { continue };
+                let cl = text
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                    .map_or(0, |v| v.parse::<usize>().unwrap());
+                if n == 0 || len >= i + 4 + cl {
+                    break;
+                }
+            }
+            log.lock().unwrap().push(String::from_utf8_lossy(&buf[..len]).to_string());
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=SESSIONVAL77\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            );
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn auth_secrets_stay_out_of_history_and_replay_fills_them_in() {
+    let (port, seen) = serve_recording();
+    let project = tmp_project("auth-history");
+    let base = format!("http://127.0.0.1:{port}");
+    let login_url = format!("{base}/login");
+    let args = [
+        "auth",
+        "add",
+        "p",
+        "--login-url",
+        &login_url,
+        "--login-body",
+        "u={{username}}&pw={{password}}",
+        "--username",
+        "alice",
+        "--password",
+        "S3cretPW",
+        "--header",
+        "X-Api-Key: APIKEY123",
+    ];
+    let (code, v) = run(&args, &project, None);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = run(&["send", "--url", &format!("{base}/data"), "--auth", "p"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let send_id = v["data"]["id"].as_i64().unwrap();
+
+    // The server got the real values: password in the login, key and session cookie after.
+    {
+        let got = seen.lock().unwrap();
+        assert!(got.iter().any(|r| r.starts_with("POST /login") && r.ends_with("pw=S3cretPW")), "{got:?}");
+        let data = got.iter().find(|r| r.starts_with("GET /data")).unwrap();
+        assert!(data.contains("X-Api-Key: APIKEY123\r\n") && data.contains("sid=SESSIONVAL77"), "{data}");
+    }
+
+    // History holds placeholders, whichever way it is read.
+    let secrets = ["S3cretPW", "APIKEY123", "SESSIONVAL77"];
+    let sql = "SELECT url, req_headers, req_body_text, CAST(request AS TEXT) FROM history";
+    let (code, v) = run(&["query", sql], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let rows = v["data"].to_string();
+    assert!(rows.contains("«auth:p:header:X-Api-Key»") && rows.contains("«auth:p:password:form»"), "{rows}");
+    for s in secrets {
+        assert!(!rows.contains(s), "{s} in history: {rows}");
+    }
+    let (_, v) = run(&["history", "show", &send_id.to_string()], &project, None);
+    let shown = v["data"]["request"].to_string();
+    assert!(shown.contains("sid=«auth:p:cookie:sid»"), "{shown}");
+    for s in secrets {
+        assert!(!shown.contains(s), "{s} in history show: {shown}");
+    }
+
+    // Re-sending stored requests (as Replay does) puts the current values back.
+    let (_, v) = run(&["query", "SELECT id FROM history WHERE path = '/login'"], &project, None);
+    let login_id = v["data"]["rows"][0][0].as_i64().unwrap();
+    for id in [send_id, login_id] {
+        let raw = bin()
+            .args(["--project"])
+            .arg(&project)
+            .args(["history", "show", &id.to_string(), "--part", "request", "--raw"])
+            .output()
+            .unwrap()
+            .stdout;
+        let (code, v) = run(&["send", "--scheme", "http", "-"], &project, Some(&raw));
+        assert_eq!(code, 0, "{v}");
+    }
+    {
+        let got = seen.lock().unwrap();
+        let data: Vec<_> = got.iter().filter(|r| r.starts_with("GET /data")).collect();
+        assert_eq!(data.len(), 2);
+        assert!(data[1].contains("X-Api-Key: APIKEY123\r\n") && data[1].contains("sid=SESSIONVAL77"), "{}", data[1]);
+        let logins: Vec<_> = got.iter().filter(|r| r.starts_with("POST /login")).collect();
+        assert!(logins.len() == 2 && logins[1].ends_with("pw=S3cretPW"), "{logins:?}");
+    }
+    let (_, v) = run(&["query", sql], &project, None);
+    assert!(secrets.iter().all(|s| !v["data"].to_string().contains(s)), "{v}");
+
+    // With the profile gone, a re-send fails clearly instead of sending the placeholder.
+    run(&["auth", "remove", "p"], &project, None);
+    let raw = format!("GET /data HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Api-Key: «auth:p:header:X-Api-Key»\r\n\r\n");
+    let (code, v) = run(&["send", "--scheme", "http", "-"], &project, Some(raw.as_bytes()));
+    assert_ne!(code, 0, "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("«auth:p:header:X-Api-Key»"), "{v}");
+}

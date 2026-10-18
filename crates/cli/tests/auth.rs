@@ -385,10 +385,18 @@ fn crawl_with_auth_reaches_protected_pages() {
     let rows = q["rows"].as_array().unwrap();
     assert!(!rows.is_empty(), "{q}");
     assert!(rows.iter().all(|r| r[1] == 200), "protected pages not reached: {q}");
-    // The logout link is excluded by default, and history holds the requests as sent.
+    // The logout link is excluded by default, and history holds the session cookie as a placeholder.
     assert!(!srv.log().iter().any(|l| l.starts_with("GET /logout")));
-    let q = ok(&p, &["query", "SELECT count(*) FROM history WHERE source = 'crawl' AND req_headers LIKE '%sid=s%'"]);
+    let q = ok(
+        &p,
+        &[
+            "query",
+            "SELECT count(*) FROM history WHERE source = 'crawl' AND req_headers LIKE '%sid=«auth:app:cookie:sid»%'",
+        ],
+    );
     assert!(q["rows"][0][0].as_i64().unwrap() > 0, "{q}");
+    let q = ok(&p, &["query", "SELECT count(*) FROM history WHERE req_headers LIKE '%sid=s%'"]);
+    assert_eq!(q["rows"][0][0], 0, "{q}");
 }
 
 #[test]

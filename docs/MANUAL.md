@@ -219,6 +219,16 @@ byte, side by side or unified.
   Optionally add a CSRF token to fetch first, a token to extract for an Authorization
   header, and logged-in/logged-out patterns and a check URL. Scans, crawls, the fuzzer, and
   the proxy then stay logged in and log in again when the session drops.
+  - **Secrets stay out of history:** values the profile adds (its headers, the session
+    cookies and token, the password in the login request) are recorded as placeholders
+    such as `«auth:NAME:header:X-Api-Key»` or `«auth:NAME:cookie:sid»`, so history,
+    `query`, and Traffic never show them. When a stored request is sent again (Replay,
+    `send`, a scan of stored requests), brainproxy fills in the profile's current values.
+    A header value only goes into its own header and the password only to the login URL's
+    origin. If the profile is removed or has no value yet, sending fails and names the
+    placeholder; log in again or edit the request. Responses are stored as received, so
+    session cookies the site sets still appear there. Projects recorded before this kept
+    plaintext values in their older requests.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **TLS / CA:** the certificate to trust in other tools, with per-OS instructions.

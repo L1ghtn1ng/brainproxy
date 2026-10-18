@@ -285,6 +285,8 @@ impl Scope {
 #[derive(Debug, Clone, Default)]
 pub struct Guard {
     scopes: Vec<Scope>,
+    /// Values behind auth placeholders, filled in as requests go out.
+    pub vault: crate::auth::Vault,
 }
 
 impl Guard {
@@ -302,7 +304,7 @@ impl Guard {
                 "no engagement scope: run `brainproxy engagement start --target HOST ...` first".into(),
             ));
         }
-        Ok(Arc::new(Self { scopes }))
+        Ok(Arc::new(Self { scopes, vault: Default::default() }))
     }
 
     /// A guard from explicit specs (no system file), for tests and embedding.
@@ -311,7 +313,7 @@ impl Guard {
         if scopes.is_empty() {
             return Err(Error::OutOfScope("no scope".into()));
         }
-        Ok(Arc::new(Self { scopes }))
+        Ok(Arc::new(Self { scopes, vault: Default::default() }))
     }
 
     pub fn scopes(&self) -> &[Scope] {
@@ -568,9 +570,12 @@ impl crate::store::Store {
         }
     }
 
-    /// The guard for this project: system scope plus engagement scope.
+    /// The guard for this project: system scope plus engagement scope, and the
+    /// project's auth values for filling in placeholders of stored requests.
     pub fn guard(&self) -> Result<Arc<Guard>> {
-        Guard::load(self.engagement()?)
+        let guard = Guard::load(self.engagement()?)?;
+        self.auth_fill_vault(&guard.vault)?;
+        Ok(guard)
     }
 }
 
