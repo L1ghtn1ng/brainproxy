@@ -21,6 +21,8 @@ export interface Handoff {
   raw: string;
   target: string; // scheme://host[:port]
   title?: string;
+  /** `raw` holds a binary body, one char per byte (see `bodyText`); send it with `textBytes(raw, true)`. */
+  binary?: boolean;
 }
 
 export interface RepeaterTab extends Handoff {

@@ -83,7 +83,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
     setChecking(true);
     setProblem("");
     try {
-      const r = await run<{ response: { status: number } | null }>(["send", "--url", url, "--timeout", "10"]);
+      const r = await run<{ response: { status: number } | null }>(["send", `--url=${url}`, "--timeout=10"]);
       if (r.response) setStep(1);
       else setProblem("The site didn't send a response.");
     } catch (e: any) {
@@ -100,7 +100,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
     setBusy(true);
     try {
       const depthArgs = DEPTHS.find((d) => d.id === depth)!.args;
-      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs, ...nuclei, ...(login ? ["--auth", login] : []), "--background"]);
+      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs, ...nuclei, ...(login ? [`--auth=${login}`] : []), "--background"]);
       p.onStarted(d.job);
     } catch (e: any) {
       app.toast(e.message, "error");

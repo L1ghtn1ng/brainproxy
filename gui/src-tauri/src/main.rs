@@ -4,6 +4,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -29,11 +30,25 @@ fn failure(message: String) -> Value {
     json!({"ok": false, "command": "gui", "error": {"kind": "gui", "message": message}})
 }
 
+/// Prefix of the only variables the frontend may set on the child (`env`): secrets the CLI
+/// reads through options like `--password-env`, so they never appear in argv.
+const SECRET_ENV_PREFIX: &str = "BRAINPROXY_SECRET_";
+
 /// Runs `brainproxy --format json --project PROJECT ARGS...` and returns its JSON envelope.
+/// `stdin` is written byte for byte; `env` adds BRAINPROXY_SECRET_* variables to the child.
 #[tauri::command]
-async fn cli(project: String, args: Vec<String>, stdin: Option<String>) -> Value {
+async fn cli(
+    project: String,
+    args: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    env: Option<HashMap<String, String>>,
+) -> Value {
+    let env = env.unwrap_or_default();
+    if let Some(bad) = env.keys().find(|k| !k.starts_with(SECRET_ENV_PREFIX)) {
+        return failure(format!("env {bad:?} is not allowed (only {SECRET_ENV_PREFIX}*)"));
+    }
     let mut cmd = Command::new(binary());
-    cmd.args(["--format", "json", "--project"]).arg(&project).args(&args);
+    cmd.args(["--format", "json", "--project"]).arg(&project).args(&args).envs(&env);
     cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -44,7 +59,7 @@ async fn cli(project: String, args: Vec<String>, stdin: Option<String>) -> Value
     };
     if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
         tokio::spawn(async move {
-            let _ = pipe.write_all(data.as_bytes()).await;
+            let _ = pipe.write_all(&data).await;
         });
     }
     match child.wait_with_output().await {

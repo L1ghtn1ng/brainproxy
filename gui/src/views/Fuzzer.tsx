@@ -3,7 +3,7 @@
 // `fuzz status` / `fuzz results`, and each result's exchange is read with `history show`.
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { bodyText, rawResponse, run, withScheme, type HistoryEntry } from "../api";
+import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { originOf, useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView, normalize } from "../ui/HttpView";
@@ -115,24 +115,9 @@ export function autoMark(raw: string): string {
   return line + (nl < 0 ? "" : head.slice(nl)) + (i < 0 ? "" : "\n\n" + body);
 }
 
-/**
- * `fuzz run --background` can't read the template from stdin, so the raw request is passed as
- * --url/-X/-H/--data. Host and Content-Length come from the URL and the body.
- */
-export function requestArgs(raw: string, target: string): string[] {
-  const text = normalize(raw);
-  const i = text.indexOf("\n\n");
-  const head = (i < 0 ? text : text.slice(0, i)).split("\n");
-  const body = i < 0 ? "" : text.slice(i + 2);
-  const [method = "GET", path = "/"] = head[0].trim().split(/\s+/);
-  const url = /^https?:\/\//i.test(path) ? path : target.replace(/\/+$/, "") + (path.startsWith("/") ? path : "/" + path);
-  const args = [`--url=${url}`, `--method=${method}`];
-  for (const h of head.slice(1)) {
-    if (!h.trim() || /^(host|content-length)\s*:/i.test(h)) continue;
-    args.push(`--header=${h}`);
-  }
-  if (body) args.push(`--data=${body}`);
-  return args;
+/** Fills an empty Host header (as in the blank template) from the target scheme://host[:port]. */
+export function fillHost(raw: string, target: string): string {
+  return raw.replace(/^(host:)[ \t]*(?=\r?\n|$)/im, `$1 ${target.replace(/^[a-z]+:\/\//i, "").replace(/\/.*$/, "")}`);
 }
 
 export function payloadSpec(s: PayloadSet): string {
@@ -192,6 +177,8 @@ export function FuzzerView() {
 function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow: () => void }) {
   const app = useApp();
   const [raw, setRaw] = useState(BLANK);
+  // The template holds a binary body, one char per byte (see `bodyText`).
+  const [binary, setBinary] = useState(false);
   const [target, setTarget] = useState("");
   const [mode, setMode] = useState<Mode>("sniper");
   const [sets, setSets] = useState<PayloadSet[]>([{ ...NEW_SET }]);
@@ -210,6 +197,7 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
     const h = app.fuzzerInput;
     if (!h) return;
     setRaw(autoMark(h.raw));
+    setBinary(!!h.binary);
     setTarget(h.target);
     onShow();
   }, [app.fuzzerInput]); // onShow only switches the sub-tab
@@ -238,7 +226,8 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
     if (!positions) return app.toast("Mark at least one payload position with §value§", "error");
     setTarget(to);
     const used = sets.slice(0, needed);
-    const args = ["fuzz", "run", "--background", `--mode=${mode}`, ...requestArgs(raw, to)];
+    // The raw request goes on stdin: argv can't hold NUL bytes or megabytes, and `ps` shows it.
+    const args = ["fuzz", "run", "--background", `--mode=${mode}`, `--target=${to}`];
     used.forEach((s, i) => {
       args.push(`--payloads=${payloadSpec(s)}`);
       if (s.process.trim()) args.push(`--process=${i + 1}=${s.process.trim()}`);
@@ -255,10 +244,10 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
     if (opts.stopOnMatch) args.push("--stop-on-match");
     if (!opts.encode) args.push("--no-encode");
     if (opts.http2) args.push("--http2");
-    args.push(`--store=${opts.store}`);
+    args.push(`--store=${opts.store}`, "-");
     setBusy(true);
     try {
-      const d = await run<{ run: RunInfo }>(args);
+      const d = await run<{ run: RunInfo }>(args, textBytes(fillHost(raw, to), binary));
       onStarted(d.run.id);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -274,6 +263,7 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
     const host = to.replace(/^[a-z]+:\/\//i, "").replace(/\/.*$/, "");
     setTarget(to);
     setRaw(`GET /${M}path${M} HTTP/1.1\nHost: ${host}\nUser-Agent: brainproxy\nAccept: */*\n\n`);
+    setBinary(false);
     setMode("sniper");
     setSets([{ ...NEW_SET, wordlist: "content-discovery" }]);
     setOpts((o) => ({ ...o, matchStatus: "200,204,301,302,307,308,401,403,405,500", stopOnMatch: false }));
@@ -626,7 +616,7 @@ function RunResults({ id, active }: { id: number; active: boolean }) {
   useEffect(() => {
     if (historyId == null) return setEntry(null);
     let live = true;
-    run<HistoryEntry>(["history", "show", String(historyId), "--max-body", "2000000"])
+    run<HistoryEntry>(["history", "show", String(historyId), MAX_BODY])
       .then((e) => live && setEntry(e))
       .catch((e) => live && app.toast(e.message, "error"));
     return () => {
@@ -684,11 +674,11 @@ function RunResults({ id, active }: { id: number; active: boolean }) {
     [summary?.run.mode, outliers],
   );
 
-  const toRepeater = (h: HistoryEntry) => app.sendToRepeater({ raw: bodyText(h.request), target: originOf(h.url), title: `fuzz ${id}` });
+  const toRepeater = (h: HistoryEntry) => app.sendToRepeater({ raw: bodyText(h.request), binary: isBinary(h.request), target: originOf(h.url), title: `fuzz ${id}` });
   const withEntry = (r: Result, f: (h: HistoryEntry) => void) =>
     r.history_id == null
       ? app.toast("This result is not in history (see the run's History setting)", "error")
-      : run<HistoryEntry>(["history", "show", String(r.history_id)]).then(f, (e) => app.toast(e.message, "error"));
+      : historyRequest(r.history_id).then(({ entry }) => f(entry), (e) => app.toast(e.message, "error"));
 
   const rowMenu = (r: Result, ev: React.MouseEvent) =>
     open(ev, [
@@ -744,10 +734,11 @@ function RunResults({ id, active }: { id: number; active: boolean }) {
           empty={live ? "Waiting for results…" : "No results."}
         />
         <Split id="fuzzer-msg" dir="row">
-          <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} placeholder={selectedRow && selectedRow.history_id == null ? "Not stored in history" : "Select a result"} />
+          <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder={selectedRow && selectedRow.history_id == null ? "Not stored in history" : "Select a result"} />
           <HttpView
             title="Response"
             value={entry ? rawResponse(entry) : ""}
+            binary={isBinary(entry?.response?.body)}
             placeholder={selectedRow?.error ?? entry?.entry.error ?? ""}
             extra={entry?.duration_ms != null && <span className="muted">{entry.duration_ms} ms · history #{entry.id}</span>}
           />

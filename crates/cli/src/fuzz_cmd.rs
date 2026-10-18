@@ -114,6 +114,9 @@ pub struct RunArgs {
     top: usize,
     #[arg(long, hide = true)]
     attach_run: Option<i64>,
+    /// Request file a --background parent wrote for its child (read, then deleted).
+    #[arg(long, hide = true)]
+    attach_request: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -259,7 +262,7 @@ fn text_summary(s: &Value) -> String {
     lines.join("\n")
 }
 
-fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Error> {
+fn run(project: &Path, home: &Path, mut args: RunArgs, out: &Out) -> Result<(), Error> {
     let mode = Mode::parse(&args.mode)?;
     let stdin_payloads = args.payloads.iter().filter(|p| *p == "file:-").count();
     if stdin_payloads > 1 || (stdin_payloads == 1 && args.req.reads_stdin()) {
@@ -267,11 +270,19 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
             "only one input can come from stdin (request template or one payload set)".into(),
         ));
     }
-    if args.background && (stdin_payloads > 0 || args.req.reads_stdin()) {
-        return Err(Error::InvalidInput("--background can't read stdin; use files".into()));
+    if args.background && stdin_payloads > 0 {
+        return Err(Error::InvalidInput("--background can't read payloads from stdin; use files".into()));
     }
-
-    let (req, target) = args.req.prepare(Some(&args.marker))?;
+    // A request read from stdin is handed to the --background child in a file.
+    let stdin_request = args.background && args.req.reads_stdin();
+    if let Some(path) = &args.attach_request {
+        args.req.file = Some(path.clone());
+    }
+    let prepared = args.req.prepare(Some(&args.marker));
+    if let Some(path) = &args.attach_request {
+        let _ = std::fs::remove_file(path);
+    }
+    let (req, target) = prepared?;
     let guard = crate::project_guard(project)?;
     crate::require_in_scope(&guard, &target)?;
     let template = Template::parse(req.as_bytes(), &args.marker)?;
@@ -326,7 +337,7 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
             &config,
             req.as_bytes(),
         )?;
-        return spawn_background(project, home, run_id, &store, out);
+        return spawn_background(project, home, run_id, stdin_request.then(|| req.as_bytes()), &store, out);
     }
 
     let run_id = match args.attach_run {
@@ -392,7 +403,14 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
     }
 }
 
-fn spawn_background(project: &Path, home: &Path, run_id: i64, store: &Store, out: &Out) -> Result<(), Error> {
+fn spawn_background(
+    project: &Path,
+    home: &Path,
+    run_id: i64,
+    request: Option<&[u8]>,
+    store: &Store,
+    out: &Out,
+) -> Result<(), Error> {
     let project = std::fs::canonicalize(project)?;
     let log = project.with_extension(format!("fuzz-{run_id}.log"));
     let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
@@ -400,6 +418,11 @@ fn spawn_background(project: &Path, home: &Path, run_id: i64, store: &Store, out
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
     cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&argv);
     cmd.arg("--attach-run").arg(run_id.to_string());
+    if let Some(bytes) = request {
+        let path = project.with_extension(format!("fuzz-{run_id}.req"));
+        std::fs::write(&path, bytes)?;
+        cmd.arg(format!("--attach-request={}", path.display()));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

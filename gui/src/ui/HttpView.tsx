@@ -6,6 +6,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { decode, encodeAll } from "./urlencode";
 import { RENDER_CAP, renderable } from "./render";
+import { textBytes } from "../api";
 
 type Mode = "raw" | "pretty" | "hex" | "render";
 
@@ -85,8 +86,8 @@ function pretty(text: string): string {
   return text;
 }
 
-function hexdump(text: string): string {
-  const bytes = new TextEncoder().encode(text.slice(0, 65536));
+function hexdump(all: Uint8Array): string {
+  const bytes = all.subarray(0, 65536);
   const rows: string[] = [];
   for (let off = 0; off < bytes.length; off += 16) {
     const chunk = bytes.slice(off, off + 16);
@@ -105,6 +106,8 @@ export function HttpView(p: {
   placeholder?: string;
   /** Initial search text, e.g. a finding's evidence. */
   highlight?: string;
+  /** The text holds a binary body, one char per byte (see `bodyText`). */
+  binary?: boolean;
 }) {
   const [mode, setMode] = useState<Mode>("raw");
   const [query, setQuery] = useState(p.highlight ?? "");
@@ -134,7 +137,8 @@ export function HttpView(p: {
   const rendered = useMemo(() => (view === "render" && !tooBig ? renderable(text) : null), [view, tooBig, text]);
   const editable = !!p.onChange && view === "raw";
   const shown = view === "pretty" ? pretty(text) : text;
-  const nodes = useMemo(() => (view === "hex" ? [hexdump(text)] : highlight(shown, query)), [view, shown, text, query]);
+  const bytes = useMemo(() => textBytes(p.value, p.binary), [p.value, p.binary]);
+  const nodes = useMemo(() => (view === "hex" ? [hexdump(bytes)] : highlight(shown, query)), [view, shown, bytes, query]);
   const hits = useMemo(() => {
     if (!query) return 0;
     const l = shown.toLowerCase();
@@ -220,7 +224,7 @@ export function HttpView(p: {
       </div>
       <div className="msg-foot">
         <input className="search" placeholder="Search" value={query} onChange={(e) => setQuery(e.target.value)} />
-        <span className="muted">{query ? `${hits} match${hits === 1 ? "" : "es"}` : `${new TextEncoder().encode(p.value).length} bytes`}</span>
+        <span className="muted">{query ? `${hits} match${hits === 1 ? "" : "es"}` : `${bytes.length} bytes`}</span>
       </div>
     </div>
   );

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { bodyText, run, withScheme, type HistoryEntry } from "../api";
+import { bodyText, isBinary, run, textBytes, withScheme, type HistoryEntry } from "../api";
 import { useApp, type RepeaterTab } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
@@ -133,7 +133,7 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     const { text: sent, encoded } = autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
     let entry: Sent;
     try {
-      const result = await run<SendResult>(["send", "--target", to, "-"], sent);
+      const result = await run<SendResult>(["send", `--target=${to}`, "-"], textBytes(sent, tab.binary));
       entry = { raw, sent, encoded, result, error: null };
     } catch (e: any) {
       entry = { raw, sent, encoded, result: null, error: e.message };
@@ -200,15 +200,16 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
         )}
         {r?.response && (
           <span className="muted">
-            {r.response.status} · {bodyText(r.response.body).length} bytes · {r.duration_ms} ms · history #{r.id}
+            {r.response.status} · {r.response.body.length ?? textBytes(bodyText(r.response.body), isBinary(r.response.body)).length} bytes · {r.duration_ms} ms · history #{r.id}
           </span>
         )}
       </div>
       <Split id="repeater" dir="row">
-        <HttpView title="Request" value={raw} onChange={setRaw} />
+        <HttpView title="Request" value={raw} onChange={setRaw} binary={tab.binary} />
         <HttpView
           title="Response"
           value={responseText(r ?? null)}
+          binary={isBinary(r?.response?.body)}
           placeholder={current?.error ?? (busy ? "Waiting for the response…" : "Send the request to see the response")}
           extra={
             r && (

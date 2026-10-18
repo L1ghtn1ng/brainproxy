@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bodyText, hostOf, pathOf, rawResponse, run, type Body, type HistoryEntry, type HistoryItem } from "../api";
-import { originOf, useApp } from "../store";
+import { bodyText, historyRequest, hostOf, isBinary, MAX_BODY, pathOf, rawResponse, run, textBytes, type Body, type HistoryEntry, type HistoryItem } from "../api";
+import { originOf, useApp, type Handoff } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
@@ -120,17 +120,18 @@ function History() {
     );
   }, [rows, filter]);
 
-  const handoff = async (id: number) => {
-    const e = await run<HistoryEntry>(["history", "show", String(id)]);
-    return { raw: bodyText(e.request), target: originOf(e.url), entry: e };
-  };
+  const handoff = (id: number, f: (h: Handoff & { entry: HistoryEntry }) => void) =>
+    historyRequest(id).then(
+      (h) => f({ raw: h.raw, binary: h.binary, target: originOf(h.entry.url), entry: h.entry }),
+      (e) => app.toast(e.message, "error"),
+    );
 
   const rowMenu = (r: HistoryItem, ev: React.MouseEvent) =>
     open(ev, [
-      { label: "Send to Replay", action: () => handoff(r.id).then((h) => app.sendToRepeater({ ...h, title: pathOf(r.url).slice(0, 24) })) },
-      { label: "Send to Fuzzer", action: () => handoff(r.id).then(app.sendToFuzzer) },
-      { label: "Send request to Diff", action: () => handoff(r.id).then((h) => app.sendToComparer(h.raw)) },
-      { label: "Send response to Diff", action: () => handoff(r.id).then((h) => app.sendToComparer(rawResponse(h.entry))) },
+      { label: "Send to Replay", action: () => handoff(r.id, (h) => app.sendToRepeater({ ...h, title: pathOf(r.url).slice(0, 24) })) },
+      { label: "Send to Fuzzer", action: () => handoff(r.id, app.sendToFuzzer) },
+      { label: "Send request to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(h.raw)) },
+      { label: "Send response to Diff", action: () => handoff(r.id, (h) => app.sendToComparer(rawResponse(h.entry))) },
       "-",
       { label: "Copy URL", action: () => navigator.clipboard.writeText(r.url) },
       {
@@ -138,7 +139,7 @@ function History() {
         action: () => {
           const text = window.prompt("Note for #" + r.id, r.note ?? "");
           if (text == null) return;
-          run(["history", "note", String(r.id), ...(text ? [text] : [])])
+          run(["history", "note", String(r.id), ...(text ? ["--", text] : [])])
             .then(() => setRows((rs) => rs.map((x) => (x.id === r.id ? { ...x, note: text || null } : x))))
             .catch((e) => app.toast(e.message, "error"));
         },
@@ -192,17 +193,18 @@ function History() {
           rowKey={(r) => r.id}
           selected={selected}
           onSelect={(r) => setSelected(r.id)}
-          onActivate={(r) => handoff(r.id).then((h) => app.sendToRepeater({ ...h, title: pathOf(r.url).slice(0, 24) }))}
+          onActivate={(r) => handoff(r.id, (h) => app.sendToRepeater({ ...h, title: pathOf(r.url).slice(0, 24) }))}
           onContextMenu={rowMenu}
           rowClass={(r) => (r.tags.includes("highlight") ? "hl" : undefined)}
           initialSort={{ key: "id", desc: true }}
           empty="No traffic yet. Start the proxy and point a browser at it, or use Replay."
         />
         <Split id="history-msg" dir="row">
-          <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} placeholder="Select a request" />
+          <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder="Select a request" />
           <HttpView
             title="Response"
             value={entry ? rawResponse(entry) : ""}
+            binary={isBinary(entry?.response?.body)}
             placeholder={entry?.entry.error ?? ""}
             extra={entry?.duration_ms != null && <span className="muted">{entry.duration_ms} ms</span>}
           />
@@ -240,7 +242,7 @@ export interface InterceptSettings {
 /** `intercept enable` arguments for these settings. Enable replaces every setting, so the
  * filters are passed back each time or they would be cleared. */
 export function interceptEnableArgs(s: InterceptSettings): string[] {
-  const opt = (flag: string, v?: string) => (v ? [flag, v] : []);
+  const opt = (flag: string, v?: string) => (v ? [`${flag}=${v}`] : []);
   return [
     "intercept",
     "enable",
@@ -261,7 +263,8 @@ function Intercept({ active }: { active: boolean }) {
   const [settings, refreshSettings] = usePoll<{ settings: InterceptSettings; pending: number }>(() => run(["intercept", "status"]), 2000, active);
   const [held, refreshHeld] = usePoll<{ items: Held[] }>(() => run(["intercept", "list"]), 1000, active);
   const [current, setCurrent] = useState<number | null>(null);
-  const [message, setMessage] = useState<{ original: string; text: string } | null>(null);
+  // binary: the text holds one char per byte; truncated: only the first 2 MB arrived, so it can't be edited.
+  const [message, setMessage] = useState<{ original: string; text: string; binary: boolean; truncated: boolean } | null>(null);
   const items = held?.items ?? [];
 
   // Follow the oldest held message unless the user picked one that is still held.
@@ -272,10 +275,10 @@ function Intercept({ active }: { active: boolean }) {
 
   useEffect(() => {
     if (current == null) return setMessage(null);
-    run<{ message: Body }>(["intercept", "show", String(current)])
+    run<{ message: Body }>(["intercept", "show", String(current), MAX_BODY])
       .then((d) => {
         const text = bodyText(d.message);
-        setMessage({ original: text, text });
+        setMessage({ original: text, text, binary: isBinary(d.message), truncated: !!d.message.truncated });
       })
       .catch(() => setMessage(null));
   }, [current]);
@@ -296,7 +299,7 @@ function Intercept({ active }: { active: boolean }) {
     if (current == null || !message) return;
     try {
       if (how === "drop") await run(["intercept", "drop", String(current)]);
-      else if (message.text !== message.original) await run(["intercept", "forward", String(current), "--file", "-"], message.text);
+      else if (message.text !== message.original) await run(["intercept", "forward", String(current), "--file=-"], textBytes(message.text, message.binary));
       else await run(["intercept", "forward", String(current)]);
       setCurrent(null);
       refreshHeld();
@@ -327,11 +330,16 @@ function Intercept({ active }: { active: boolean }) {
         </button>
         <button
           className="btn"
-          disabled={!message || item?.direction !== "request"}
-          onClick={() => item && message && app.sendToRepeater({ raw: message.text, target: originOf(item.url) })}
+          disabled={!message || message.truncated || item?.direction !== "request"}
+          onClick={() => item && message && app.sendToRepeater({ raw: message.text, binary: message.binary, target: originOf(item.url) })}
         >
           Send to Replay
         </button>
+        {message?.truncated && (
+          <span className="tag" title="Only the first 2 MB is shown. Forward or drop it as is, or use the CLI to edit it.">
+            Over 2 MB: read-only
+          </span>
+        )}
         <span className="grow" />
         <span className="muted">{s ? `Unanswered messages are ${s.timeout_action === "drop" ? "dropped" : "forwarded"} after ${s.timeout_secs} s` : ""}</span>
       </div>
@@ -355,7 +363,8 @@ function Intercept({ active }: { active: boolean }) {
         <HttpView
           title={item ? `${item.direction === "request" ? "Request to" : "Response from"} ${hostOf(item.url)}` : "Message"}
           value={message?.text ?? ""}
-          onChange={message ? (text) => setMessage({ ...message, text }) : undefined}
+          binary={message?.binary}
+          onChange={message && !message.truncated ? (text) => setMessage({ ...message, text }) : undefined}
           placeholder="Nothing held"
         />
       </Split>

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { bodyText, rawResponse, run, type Finding, type FindingItem, type HistoryEntry, type Risk } from "../api";
+import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, type Finding, type FindingItem, type HistoryEntry, type Risk } from "../api";
 import { originOf, useApp } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
@@ -54,7 +54,7 @@ export function FindingsView({ active }: { active: boolean }) {
       .then((f) => {
         if (!live) return;
         setFinding(f);
-        if (f.history_id != null) run<HistoryEntry>(["history", "show", String(f.history_id)]).then((e) => live && setEntry(e), () => {});
+        if (f.history_id != null) run<HistoryEntry>(["history", "show", String(f.history_id), MAX_BODY]).then((e) => live && setEntry(e), () => {});
       })
       .catch((e) => app.toast(e.message, "error"));
     return () => {
@@ -137,7 +137,15 @@ export function FindingsView({ active }: { active: boolean }) {
                   ))}
                 </div>
                 {entry && (
-                  <button className="btn small" onClick={() => app.sendToRepeater({ raw: bodyText(entry.request), target: originOf(entry.url), title: finding.name.slice(0, 24) })}>
+                  <button
+                    className="btn small"
+                    onClick={() =>
+                      historyRequest(entry.id).then(
+                        ({ raw, binary }) => app.sendToRepeater({ raw, binary, target: originOf(entry.url), title: finding.name.slice(0, 24) }),
+                        (e) => app.toast(e.message, "error"),
+                      )
+                    }
+                  >
                     Send to Replay
                   </button>
                 )}
@@ -201,8 +209,8 @@ export function FindingsView({ active }: { active: boolean }) {
               )}
             </div>
             <Split id="finding-msg" dir="row">
-              <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} placeholder="No recorded request" />
-              <HttpView title="Response" value={entry ? rawResponse(entry) : ""} placeholder="" highlight={finding.evidence} />
+              <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder="No recorded request" />
+              <HttpView title="Response" value={entry ? rawResponse(entry) : ""} binary={isBinary(entry?.response?.body)} placeholder="" highlight={finding.evidence} />
             </Split>
           </Split>
         ) : (

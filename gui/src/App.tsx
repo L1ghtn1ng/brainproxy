@@ -126,7 +126,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
         await run(["proxy", "start"]);
         refreshStatus();
       }
-      const d = await run<{ browser: { name: string }; note: string | null }>(["browser", "open", "--browser", id]);
+      const d = await run<{ browser: { name: string }; note: string | null }>(["browser", "open", `--browser=${id}`]);
       app.toast(d.note ? `${d.browser.name} opened. ${d.note}` : `${d.browser.name} opened through the proxy. Browse the target; requests appear in Proxy › Traffic.`, "info");
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -144,7 +144,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
       if (cancelled || !s || s.running) return;
       for (const port of PROXY_PORTS) {
         try {
-          await run(["proxy", "start", "--listen", `127.0.0.1:${port}`]);
+          await run(["proxy", "start", `--listen=127.0.0.1:${port}`]);
           startedHere.current = true;
           refreshStatus();
           return;

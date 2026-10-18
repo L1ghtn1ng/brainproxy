@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { bodyText, pathOf, rawResponse, run, type HistoryEntry, type HistoryItem, type Risk } from "../api";
+import { bodyText, historyRequest, isBinary, MAX_BODY, pathOf, rawResponse, run, type HistoryEntry, type HistoryItem, type Risk } from "../api";
 import { originOf, useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { HttpView } from "../ui/HttpView";
@@ -175,18 +175,12 @@ function SiteMap({ active }: { active: boolean }) {
       "objects",
       "--limit",
       "5000",
-      "-p",
-      node.scheme,
-      "-p",
-      node.host,
-      "-p",
-      String(node.port),
-      "-p",
-      node.path,
-      "-p",
-      withAttacks ? "1" : "0",
-      "-p",
-      inScope ? "1" : "0",
+      `--param=${node.scheme}`,
+      `--param=${node.host}`,
+      `--param=${node.port}`,
+      `--param=${node.path}`,
+      `--param=${withAttacks ? "1" : "0"}`,
+      `--param=${inScope ? "1" : "0"}`,
     ])
       .then((d) => live && setRows(d.rows.map((r) => ({ ...r, tags: JSON.parse(r.tags ?? "[]") }))))
       .catch((e) => live && app.toast(e.message, "error"));
@@ -198,7 +192,7 @@ function SiteMap({ active }: { active: boolean }) {
   useEffect(() => {
     if (selected == null) return setEntry(null);
     let live = true;
-    run<HistoryEntry>(["history", "show", String(selected), "--max-body", "2000000"])
+    run<HistoryEntry>(["history", "show", String(selected), MAX_BODY])
       .then((e) => live && setEntry(e))
       .catch((e) => live && app.toast(e.message, "error"));
     return () => {
@@ -207,8 +201,8 @@ function SiteMap({ active }: { active: boolean }) {
   }, [selected, app.toast]);
 
   const toRepeater = (id: number) =>
-    run<HistoryEntry>(["history", "show", String(id)])
-      .then((e) => app.sendToRepeater({ raw: bodyText(e.request), target: originOf(e.url), title: pathOf(e.url).slice(0, 24) }))
+    historyRequest(id)
+      .then(({ raw, binary, entry: e }) => app.sendToRepeater({ raw, binary, target: originOf(e.url), title: pathOf(e.url).slice(0, 24) }))
       .catch((e) => app.toast(e.message, "error"));
 
   // Installed Nuclei templates (high severity and up) join active scans started from here.
@@ -226,7 +220,7 @@ function SiteMap({ active }: { active: boolean }) {
 
   const actions = (url: string, lastId: number, scan: string[], prefix?: string): MenuItem[] => [
     { label: "Send to Replay", action: () => toRepeater(lastId) },
-    { label: "Crawl from here", action: () => launch(["crawl", url, ...(prefix ? ["--path-prefix", prefix] : [])], "Crawl") },
+    { label: "Crawl from here", action: () => launch(["crawl", url, ...(prefix ? [`--path-prefix=${prefix}`] : [])], "Crawl") },
     { label: prefix != null ? "Active scan this branch" : "Active scan this request", action: () => launch(["scan", "active", ...scan, ...nucleiArgs], "Active scan") },
     { label: "Copy URL", action: () => navigator.clipboard.writeText(url) },
   ];
@@ -234,7 +228,7 @@ function SiteMap({ active }: { active: boolean }) {
   const nodeMenu = (n: Node, ev: React.MouseEvent) => {
     ev.preventDefault();
     setNode(n);
-    open(ev, actions(n.origin + (n.path || "/"), n.last, ["--where", whereFor(n)], n.path || "/"));
+    open(ev, actions(n.origin + (n.path || "/"), n.last, [`--where=${whereFor(n)}`], n.path || "/"));
   };
 
   const isOpen = (n: Node, depth: number) => (depth === 0 ? !toggled.has(n.key) : toggled.has(n.key));
@@ -322,8 +316,8 @@ function SiteMap({ active }: { active: boolean }) {
               empty="No requests under this node."
             />
             <Split id="sitemap-msg" dir="row">
-              <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} placeholder="Select a request" />
-              <HttpView title="Response" value={entry ? rawResponse(entry) : ""} placeholder={entry?.entry.error ?? ""} />
+              <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} binary={isBinary(entry?.request)} placeholder="Select a request" />
+              <HttpView title="Response" value={entry ? rawResponse(entry) : ""} binary={isBinary(entry?.response?.body)} placeholder={entry?.entry.error ?? ""} />
             </Split>
           </Split>
         ) : (
@@ -393,8 +387,8 @@ function Scope({ active }: { active: boolean }) {
   const save = () =>
     scopeCmd([
       "set",
-      ...lines(edit.include).flatMap((p) => ["--include", p]),
-      ...lines(edit.exclude).flatMap((p) => ["--exclude", p]),
+      ...lines(edit.include).map((p) => `--include=${p}`),
+      ...lines(edit.exclude).map((p) => `--exclude=${p}`),
       ...(edit.record ? ["--record-out-of-scope"] : []),
     ]);
 
@@ -405,9 +399,9 @@ function Scope({ active }: { active: boolean }) {
       await run([
         "engagement",
         "start",
-        ...targets.flatMap((t) => ["--target", t]),
-        ...lines(form.exclude).flatMap((t) => ["--exclude", t]),
-        ...(form.name.trim() ? ["--name", form.name.trim()] : []),
+        ...targets.map((t) => `--target=${t}`),
+        ...lines(form.exclude).map((t) => `--exclude=${t}`),
+        ...(form.name.trim() ? [`--name=${form.name.trim()}`] : []),
       ]);
       app.toast("Engagement started");
       refreshEng();
@@ -421,8 +415,8 @@ function Scope({ active }: { active: boolean }) {
     const h = host.trim();
     if (!h) return;
     const [e, p] = await Promise.all([
-      run<{ results: { port: number; allowed: boolean; reason?: string }[] }>(["engagement", "check", h]).then((d) => d.results, (x) => String(x.message)),
-      run<{ in_scope: boolean }>(["scope", "check", h.replace(/:\d+$/, "")]).then((d) => d.in_scope, (x) => String(x.message)),
+      run<{ results: { port: number; allowed: boolean; reason?: string }[] }>(["engagement", "check", "--", h]).then((d) => d.results, (x) => String(x.message)),
+      run<{ in_scope: boolean }>(["scope", "check", "--", h.replace(/:\d+$/, "")]).then((d) => d.in_scope, (x) => String(x.message)),
     ]);
     setCheck({ engagement: e, proxy: p });
   };

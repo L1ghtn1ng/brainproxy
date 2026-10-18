@@ -14,9 +14,21 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
 - **Every engine call is a CLI invocation** returning the JSON envelope, exactly like
   `mcp serve` runs tools. The GUI has no second code path into the engine: scope checks,
   errors, and output are the CLI's, and anything the GUI can do an agent can do too.
-- The shell (`src-tauri/src/main.rs`) has one command, `cli(project, args, stdin)`. The
+- The shell (`src-tauri/src/main.rs`) has one command, `cli(project, args, stdin, env)`. The
   binary is `$BRAINPROXY_BIN`, else a `brainproxy` next to the app executable (bundle the
   sidecar there), else `brainproxy` on PATH.
+  - `stdin` is bytes (a number array, `Vec<u8>`), written to the child unchanged; `api.ts`
+    sends text as UTF-8. Bodies the CLI returns as base64 are shown one char per byte
+    (`bodyText`), and `textBytes(text, true)` turns them back into the same bytes, so
+    Replay, intercept forwarding, the Fuzzer, the Decoder, Hex, and byte counts keep binary
+    bodies exact.
+  - `env` adds variables to the child, only names starting with `BRAINPROXY_SECRET_`, for
+    secrets that shouldn't be in argv (visible in `ps`).
+- Value flags are passed as `--flag=value` and free-text positionals after `--`, so values
+  starting with `-` aren't read as flags.
+- Messages the GUI edits or resends are loaded with `--max-body=2000000`. One larger than
+  that arrives truncated; the GUI then refuses to send it to Replay or the Fuzzer and shows
+  an intercepted one read-only (forward or drop it as is).
 - `npm run dev` also serves the UI to a plain browser: `vite.config.ts` adds `POST /api/cli`
   (dev server only; localhost Host and an `X-Brainproxy: 1` header required). It runs
   `../target/debug/brainproxy` unless `BRAINPROXY_BIN` is set.
@@ -137,13 +149,18 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
 
 ## Known gaps
 
-- `fuzz run --background` doesn't read the request from stdin, so the Fuzzer rebuilds it
-  as `--url/--method/--header/--data` (positions in the Host header are lost; the request
-  line's HTTP version is ignored). List payloads go inline as `list:a,b,...`.
+- The Fuzzer sends the raw request on stdin (`fuzz run --background --target=... -`); the
+  background run gets it through a file next to the project that it deletes once read. An
+  empty `Host:` is filled from the target. List payloads go inline as `list:a,b,...`.
 - `fuzz results --after IDX` pages by attack index, which can skip rows finished out of
   order; the GUI refetches everything when a run ends.
 - Changing intercept filters needs `intercept enable` (there is no "set" that keeps it
   off), so Settings briefly turns intercept on and off again when it is off.
 - `auth add` replaces the whole profile, so editing one with a stored password needs it
   typed again; `--login-request` only takes a file.
+- A literal auth password and the login body still go in argv: `auth add` can read neither
+  from stdin or the environment (`--password-env` names a variable read at each login, so
+  a variable set only for `auth add` would be gone by then).
+- The dev bridge (`npm run dev`) passes stdin as text and ignores `env`, so binary bodies
+  are not exact there.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).

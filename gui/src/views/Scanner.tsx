@@ -287,7 +287,8 @@ function ResultFacts({ kind, r }: { kind: string; r: Record<string, any> }) {
 const list = (s: string) => s.split(/[\n,]/).map((x) => x.trim()).filter(Boolean);
 /** Seed/target URLs; ones typed without a scheme get one (shown in the command preview). */
 const urls = (s: string) => list(s).map(withScheme);
-const opt = (flag: string, v: string) => (v.trim() ? [flag, v.trim()] : []);
+// --flag=value, so a value starting with "-" isn't read as a flag.
+const opt = (flag: string, v: string) => (v.trim() ? [`${flag}=${v.trim()}`] : []);
 const flag = (f: string, on: boolean) => (on ? [f] : []);
 
 const SCAN_DEFAULTS = {
@@ -406,8 +407,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ...(mode === "recorded" ? [] : urls(f.urls)),
           ...(mode === "crawl" ? ["--crawl"] : []),
           ...opt("--where", f.where),
-          "--strength",
-          f.strength,
+          `--strength=${f.strength}`,
           ...opt("--rules", f.rules),
           ...opt("--exclude-rules", f.excludeRules),
           ...flag("--no-rules", f.noRules),
@@ -421,7 +421,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ...opt("--timeout", f.timeout),
           ...opt("--max-minutes", f.maxMinutes),
           ...opt("--max-targets", f.maxTargets),
-          ...list(f.injectHeaders).flatMap((h) => ["--inject-header", h]),
+          ...list(f.injectHeaders).map((h) => `--inject-header=${h}`),
           ...flag("--cookies", f.cookies),
           ...flag("--no-query", f.noQuery),
           ...flag("--no-form", f.noForm),

@@ -2,7 +2,7 @@
 // previous panel's output by `brainproxy encode|decode|hash KIND -`.
 
 import { useEffect, useState } from "react";
-import { bodyText, run, type Body } from "../api";
+import { bodyText, isBinary, run, textBytes, type Body } from "../api";
 
 type Op = "encode" | "decode" | "hash";
 
@@ -27,15 +27,18 @@ export function DecoderView() {
     const t = setTimeout(async () => {
       const out: { text: string; error?: string }[] = [];
       let text = input;
+      let binary = false; // text holds a binary step output, one char per byte
       for (const s of steps) {
         if (out.some((o) => o.error) || !text) {
           out.push({ text: "" });
           continue;
         }
         try {
-          const d = await run<{ output: Body | unknown }>([s.op, s.kind, "-"], text);
+          const d = await run<{ output: Body | unknown }>([s.op, s.kind, "-"], textBytes(text, binary));
           const o = d.output as Body;
-          text = o && typeof o === "object" && "content" in o ? bodyText(o) : JSON.stringify(d.output, null, 2);
+          const body = o && typeof o === "object" && "content" in o;
+          text = body ? bodyText(o) : JSON.stringify(d.output, null, 2);
+          binary = body && isBinary(o);
           out.push({ text });
         } catch (e: any) {
           out.push({ text: "", error: e.message });

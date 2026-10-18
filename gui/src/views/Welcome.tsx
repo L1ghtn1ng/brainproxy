@@ -163,7 +163,7 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
       await run([
         "engagement",
         "start",
-        ...(name.trim() ? ["--name", name.trim()] : []),
+        ...(name.trim() ? [`--name=${name.trim()}`] : []),
         ...included.map((t) => `--target=${t.value}`),
         ...excluded.map((t) => `--exclude=${t.value}`),
       ]);

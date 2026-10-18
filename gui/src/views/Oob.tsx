@@ -84,7 +84,7 @@ export function OobView({ active }: { active: boolean }) {
 
   const start = async () => {
     const o = opts;
-    const flag = (f: string, v: string) => (v.trim() ? [f, v.trim()] : []);
+    const flag = (f: string, v: string) => (v.trim() ? [`${f}=${v.trim()}`] : []);
     setBusy(true);
     try {
       await run([
@@ -115,9 +115,9 @@ export function OobView({ active }: { active: boolean }) {
 
   const generate = async () => {
     try {
-      const args = ["oob", "payload", "--count", gen.count || "1"];
-      if (gen.note) args.push("--note", gen.note);
-      if (gen.target) args.push("--target", gen.target);
+      const args = ["oob", "payload", `--count=${gen.count || "1"}`];
+      if (gen.note) args.push(`--note=${gen.note}`);
+      if (gen.target) args.push(`--target=${gen.target}`);
       const d = await run<{ payloads: Payload[] }>(args);
       setPayloads((p) => [...d.payloads.map((x) => ({ ...x, note: gen.note })), ...p]);
     } catch (e: any) {

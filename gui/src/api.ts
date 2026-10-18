@@ -7,33 +7,49 @@ export type Envelope<T = any> =
   | { ok: false; command?: string; error: { kind: string; message: string } };
 
 export class CliError extends Error {
-  constructor(public kind: string, message: string) {
+  kind: string;
+  constructor(kind: string, message: string) {
     super(message);
+    this.kind = kind;
   }
 }
 
-export const inTauri = "__TAURI_INTERNALS__" in window;
+export const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window; // no window under node --test
 
 let project = "";
 export const setProject = (p: string) => (project = p);
 export const getProject = () => project;
 
-export async function cli<T = any>(args: string[], stdin?: string): Promise<Envelope<T>> {
+/**
+ * Input for one CLI call. `stdin` text is sent as UTF-8; pass bytes (see `textBytes`) when it
+ * holds a binary body. `env` sets BRAINPROXY_SECRET_* variables on the child, so secrets stay
+ * off the command line (point the CLI at them with e.g. --password-env).
+ */
+export interface CliInput {
+  stdin?: string | Uint8Array;
+  env?: Record<string, string>;
+}
+
+export async function cli<T = any>(args: string[], input: string | Uint8Array | CliInput = {}): Promise<Envelope<T>> {
+  const { stdin, env } = typeof input === "string" || input instanceof Uint8Array ? { stdin: input, env: undefined } : input;
   if (inTauri) {
     const { invoke } = await import("@tauri-apps/api/core");
-    return invoke<Envelope<T>>("cli", { project, args, stdin: stdin ?? null });
+    // Bytes go over IPC as a number array (Vec<u8> on the Rust side), so nothing is re-encoded.
+    const bytes = stdin == null ? null : Array.from(typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin);
+    return invoke<Envelope<T>>("cli", { project, args, stdin: bytes, env: env ?? null });
   }
+  // ponytail: the dev bridge (vite.config.ts) takes stdin as text and no env, so binary stdin is lossy there.
   const res = await fetch("/api/cli", {
     method: "POST",
     headers: { "content-type": "application/json", "x-brainproxy": "1" },
-    body: JSON.stringify({ project, args, stdin }),
+    body: JSON.stringify({ project, args, stdin: stdin instanceof Uint8Array ? new TextDecoder().decode(stdin) : stdin, env }),
   });
   return res.json();
 }
 
 /** Runs a command and returns its data, throwing CliError when ok is false. */
-export async function run<T = any>(args: string[], stdin?: string): Promise<T> {
-  const env = await cli<T>(args, stdin);
+export async function run<T = any>(args: string[], input?: string | Uint8Array | CliInput): Promise<T> {
+  const env = await cli<T>(args, input);
   if (!env.ok) throw new CliError(env.error.kind, env.error.message);
   return env.data;
 }
@@ -113,6 +129,25 @@ export interface Finding extends FindingItem {
   source: string;
 }
 
+/** True when a body came as base64, i.e. `bodyText` gives one char per byte (Latin-1). */
+export const isBinary = (b: Body | undefined | null): boolean => b?.encoding === "base64";
+
+/**
+ * Bytes of message text. Text from a binary body (`binary`) holds one byte per char; a char
+ * above 0xFF (typed in by hand) goes in as UTF-8. Other text is UTF-8.
+ */
+export function textBytes(text: string, binary = false): Uint8Array {
+  const enc = new TextEncoder();
+  if (!binary) return enc.encode(text);
+  const out: number[] = [];
+  for (const ch of text) {
+    const c = ch.codePointAt(0)!;
+    if (c <= 0xff) out.push(c);
+    else out.push(...enc.encode(ch));
+  }
+  return Uint8Array.from(out);
+}
+
 /** Text of a body: UTF-8 as is, base64 decoded as Latin-1 so every byte stays visible. */
 export function bodyText(b: Body | undefined | null): string {
   if (!b) return "";
@@ -122,6 +157,21 @@ export function bodyText(b: Body | undefined | null): string {
   } catch {
     return b.content;
   }
+}
+
+/** --max-body for messages the GUI edits or resends, so they arrive whole (the CLI default is 64 KiB). */
+export const MAX_BODY = "--max-body=2000000";
+
+/** Throws when a body arrived cut short: editing or sending it would lose the rest. */
+export function requireWhole(b: Body, what = "This message"): void {
+  if (b.truncated) throw new CliError("truncated", `${what} is ${b.length ?? "over 2000000"} bytes, too large to edit or send from the app; use the CLI.`);
+}
+
+/** The request of a history entry, ready for Replay or the Fuzzer. Throws when it is truncated. */
+export async function historyRequest(id: number): Promise<{ raw: string; binary: boolean; entry: HistoryEntry }> {
+  const entry = await run<HistoryEntry>(["history", "show", String(id), MAX_BODY]);
+  requireWhole(entry.request, `Request #${id}`);
+  return { raw: bodyText(entry.request), binary: isBinary(entry.request), entry };
 }
 
 /** A raw HTTP response rebuilt from `history show` (status line, headers, body). */

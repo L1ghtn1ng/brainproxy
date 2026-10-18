@@ -203,23 +203,25 @@ function formOf(p: Profile): Form {
   };
 }
 
+/** `auth add` arguments: --flag=value so values may start with "-", and the name last after "--". */
 function addArgs(f: Form): string[] {
-  const args = ["auth", "add", f.name.trim()];
-  const opt = (flag: string, v: string) => v.trim() && args.push(flag, v.trim());
+  const args = ["auth", "add"];
+  const opt = (flag: string, v: string) => v.trim() && args.push(`${flag}=${v.trim()}`);
   const lines = (flag: string, v: string) =>
     v
       .split("\n")
       .map((l) => l.trim())
       .filter(Boolean)
-      .forEach((l) => args.push(flag, l));
+      .forEach((l) => args.push(`${flag}=${l}`));
   opt("--login-url", f.loginUrl);
   opt("--login-method", f.loginMethod);
-  if (f.loginBody) args.push("--login-body", f.loginBody);
+  // ponytail: the CLI has no stdin/env option for the login body, so it stays in argv.
+  if (f.loginBody) args.push(`--login-body=${f.loginBody}`);
   opt("--login-request", f.loginRequestFile);
   lines("--login-header", f.loginHeaders);
   opt("--username", f.username);
   if (f.passwordMode === "env") opt("--password-env", f.passwordEnv);
-  if (f.passwordMode === "literal" && f.password) args.push("--password", f.password);
+  if (f.passwordMode === "literal" && f.password) args.push(`--password=${f.password}`);
   opt("--csrf-url", f.csrfUrl);
   opt("--csrf-regex", f.csrfRegex);
   opt("--token-regex", f.tokenRegex);
@@ -230,6 +232,7 @@ function addArgs(f: Form): string[] {
   lines("--header", f.headers);
   opt("--relogin-interval", f.reloginInterval);
   opt("--max-relogins", f.maxRelogins);
+  args.push("--", f.name.trim());
   return args;
 }
 
@@ -257,7 +260,7 @@ function Auth() {
     if (d) setList(d.profiles);
   };
   const show = async (name: string) => {
-    const d = await exec<{ profile: Profile; session: Session }>(["auth", "show", name]);
+    const d = await exec<{ profile: Profile; session: Session }>(["auth", "show", "--", name]);
     if (d) setShown(d);
   };
   useEffect(() => {
@@ -291,7 +294,7 @@ function Auth() {
   };
 
   const remove = async (name: string) => {
-    if (!(await exec(["auth", "remove", name]))) return;
+    if (!(await exec(["auth", "remove", "--", name]))) return;
     setSelected(null);
     load();
   };
@@ -548,8 +551,8 @@ function Rules() {
   }, []);
 
   const add = async () => {
-    const args = ["rules", "add", "--location", draft.location, "--match", draft.match, "--replace", draft.replace];
-    if (draft.comment) args.push("--comment", draft.comment);
+    const args = ["rules", "add", `--location=${draft.location}`, `--match=${draft.match}`, `--replace=${draft.replace}`];
+    if (draft.comment) args.push(`--comment=${draft.comment}`);
     if (draft.disabled) args.push("--disabled");
     if (await apply(args)) setDraft({ ...draft, match: "", replace: "", comment: "" });
   };
@@ -818,7 +821,7 @@ function RuleData() {
     load();
   };
 
-  const from = (flag: string, ref: string, dir: string) => (dir.trim() ? ["--from", dir.trim()] : [flag, ref.trim() || "main"]);
+  const from = (flag: string, ref: string, dir: string) => [dir.trim() ? `--from=${dir.trim()}` : `${flag}=${ref.trim() || "main"}`];
   const n = checks?.nuclei;
   return (
     <div className="detail">
