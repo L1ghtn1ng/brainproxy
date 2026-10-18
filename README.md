@@ -3,8 +3,8 @@
 A fast, AI-first web security testing toolkit written in Rust. Some UI elements are modelled
 on other apps, and the scan rules are ported from OWASP ZAP (Apache 2.0, see NOTICE). Its main
 operator is an AI pentesting platform: **Braintruder** drives it through a Kali runner. Every feature is a
-non-interactive CLI command with structured JSON output, and a desktop app for macOS and
-Linux runs on the same engine.
+non-interactive CLI command with structured JSON output, and a desktop app for macOS,
+Linux, and Windows runs on the same engine.
 
 ![brainproxy desktop app: a finished guided scan on the Overview](docs/screenshots/overview.png)
 
@@ -18,8 +18,10 @@ tool in the desktop app, the command line, agents, and troubleshooting.
 ## Desktop app
 
 Tagged releases also attach the desktop GUI with the CLI bundled inside:
-`brainproxy-gui-macos-arm64.dmg` and `brainproxy-gui-linux-x86_64.deb` / `.AppImage`. The macOS
-app isn't signed yet, so open it the first time with right-click → Open. See
+`brainproxy-gui-macos-arm64.dmg`, `brainproxy-gui-linux-x86_64.deb` / `.AppImage`, and
+`brainproxy-gui-windows-x86_64.msi` / `-setup.exe`. The apps aren't signed yet: on macOS open
+the app the first time with right-click → Open; on Windows choose More info → Run anyway. The
+command line alone for Windows is `brainproxy-windows-x86_64.exe`. See
 [docs/GUI.md](docs/GUI.md).
 
 | Site map | Replay | Fuzzer |
@@ -84,7 +86,9 @@ agent could start a new project. For a hard lock, the runner writes the scope to
 
 While that file exists it is always enforced (on top of any engagement scope), and no flag
 or environment variable can override it; an unreadable or invalid file blocks all traffic.
-Run the agent as a non-root user. For defence in depth, also restrict the runner's egress
+Run the agent as a non-root user. On Windows the file is
+`C:\ProgramData\brainproxy\scope.json`; create it as an administrator and run the agent as
+a standard user, who can read it but not change it. For defence in depth, also restrict the runner's egress
 with a firewall, since other tools on the box (curl, sqlmap, ...) aren't bound by brainproxy.
 
 ## Usage
@@ -113,7 +117,7 @@ curl --noproxy '' -x http://127.0.0.1:8080 --cacert ~/.local/share/brainproxy/ca
 # Clients that offer h2 on intercepted TLS get HTTP/2 (--no-http2 turns it off); each
 # stream is recorded as "GET /x HTTP/2" and goes upstream over HTTP/2 when the origin
 # negotiates it, else as HTTP/1.1. Rules, intercept, auth, and passive scans apply as usual.
-sudo brainproxy ca install-system                 # or trust the CA system-wide (Kali/Debian)
+sudo brainproxy ca install-system                 # or trust the CA system-wide (Kali/Debian; Windows: current user, no sudo)
 brainproxy scope set --include '(^|\.)target\.test$' # only intercept/record these hosts
 brainproxy rules add --location request-header --replace 'X-Forwarded-For: 127.0.0.1'
 brainproxy rules add --location response-body --match 'disabled' --replace ''

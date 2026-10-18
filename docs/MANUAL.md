@@ -22,7 +22,9 @@ Downloads are on the GitHub release page. Each file has a `.sha256` next to it.
 | Desktop app on a Mac (Apple silicon) | `brainproxy-gui-macos-arm64.dmg` |
 | Desktop app on Debian, Ubuntu, or Kali | `brainproxy-gui-linux-x86_64.deb` |
 | Desktop app on another Linux, no install | `brainproxy-gui-linux-x86_64.AppImage` |
+| Desktop app on Windows 10 or 11 | `brainproxy-gui-windows-x86_64-setup.exe` (or the `.msi`) |
 | Command line only (servers, agents, Kali) | `brainproxy-linux-x86_64` or `brainproxy-linux-arm64` |
+| Command line only on Windows | `brainproxy-windows-x86_64.exe` |
 
 - **macOS:** open the `.dmg` and drag brainproxy to Applications. The app isn't signed
   yet, so open it the first time with right-click → Open, or run
@@ -31,7 +33,11 @@ Downloads are on the GitHub release page. Each file has a `.sha256` next to it.
   WebKitGTK if it is missing and adds a menu entry.
 - **AppImage:** `chmod +x brainproxy-gui-linux-x86_64.AppImage`, then run it. It needs
   WebKitGTK 4.1, which current distributions include.
-- **Command line:** the binaries are static with no dependencies:
+- **Windows:** run the `-setup.exe` (installs for your user) or the `.msi`. The installer
+  isn't signed yet, so SmartScreen shows "Windows protected your PC": choose More info →
+  Run anyway. The app uses the WebView2 runtime that comes with Windows 10 and 11. The
+  command-line `.exe` needs no install; rename it `brainproxy.exe` and put it on your `PATH`.
+- **Command line:** the Linux binaries are static with no dependencies:
   `chmod +x brainproxy-linux-x86_64 && sudo mv brainproxy-linux-x86_64 /usr/local/bin/brainproxy`.
 
 The desktop app includes the command-line tool, so you don't need both.
@@ -56,7 +62,9 @@ recorded and intercepted. It is empty by default, which means everything the eng
 allows.
 
 **Data folder.** The interception certificate (CA), downloaded rule data, and Nuclei
-templates live once per user (`~/.local/share/brainproxy`) and are shared by all projects.
+templates live once per user (`~/.local/share/brainproxy`, on Windows
+`%LOCALAPPDATA%\brainproxy`) and are shared by all projects. A project file gets the
+permissions of the folder it is saved in: keep it in your own folders on a shared machine.
 
 ---
 
@@ -334,8 +342,10 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | HTTPS certificate warnings in your own browser | Use **Open browser**, or trust the CA from Settings › TLS / CA. |
 | Firefox shows certificate errors in the opened browser | Import the CA once in that profile (the app shows how when it opens Firefox). |
 | `browser open` says it can only open http(s) URLs | Give a full `http://` or `https://` address (or none for a blank page). Other schemes and anything starting with `-` are refused so they can't be read as browser options. |
-| `proxy stop` / `oob stop` says it won't send SIGKILL | The saved state comes from an older version and the process ignored SIGTERM, so brainproxy can't tell it is the proxy. Check it with `ps -p PID` and stop it yourself. |
+| `proxy stop` / `oob stop` says it won't send SIGKILL | The saved state comes from an older version and the process ignored SIGTERM, so brainproxy can't tell it is the proxy. Check it with `ps -p PID` (Windows: Task Manager, Details tab) and stop it yourself. |
 | curl or a tool skips the proxy for localhost | Pass `--noproxy ''` (curl), or unset `NO_PROXY`. |
 | "The proxy didn't start: ports … are all in use" | Another program uses ports 8080-8089. Stop it, or start the proxy on another port: `brainproxy proxy start --listen 127.0.0.1:9090`. |
 | A scan finds little | Make sure it covers the site: use *Crawl and audit*, browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |
+| Windows says "Windows protected your PC" | The installer isn't signed yet: More info → Run anyway. |
+| Windows: tools other than the opened browser reject the CA | `brainproxy ca install-system` adds it to your user's Trusted Root store (Windows asks you to confirm). Firefox keeps its own store; import it there. |
 | macOS says the app can't be opened | Right-click → Open the first time, or run the `xattr` command in [Install](#install). |
