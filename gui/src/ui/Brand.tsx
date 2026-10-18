@@ -1,4 +1,4 @@
-// Assertive Infosec branding: the "A" mark and the "By AssertiveInfosec" byline.
+// Assertive Infosec branding: the "A" mark and the clickable logo.
 
 import { inTauri } from "../api";
 
@@ -27,8 +27,8 @@ export function AssertiveMark({ size }: { size: number }) {
   );
 }
 
-/** "By AssertiveInfosec", linking to the site. */
-function Byline({ className }: { className: string }) {
+/** The AssertiveInfosec logo, linking to the site. */
+function BrandLink({ className }: { className: string }) {
   return (
     <a
       href={SITE}
@@ -39,7 +39,6 @@ function Byline({ className }: { className: string }) {
       className={className}
       title="Assertive Infosec: makers of brainproxy"
     >
-      <span className="byline-by">By</span>
       <AssertiveMark size={14} />
       <span className="madeby-word">
         Assertive<span>Infosec</span>
@@ -50,10 +49,10 @@ function Byline({ className }: { className: string }) {
 
 /** Welcome screen: who makes brainproxy. */
 export function MadeBy() {
-  return <Byline className="madeby" />;
+  return <BrandLink className="madeby" />;
 }
 
-/** Sidebar, above Collapse: the byline, or just the mark when the sidebar is collapsed. */
+/** Sidebar, above Collapse: the logo, or just the mark when the sidebar is collapsed. */
 export function SideBrand({ collapsed }: { collapsed: boolean }) {
   if (collapsed)
     return (
@@ -64,10 +63,10 @@ export function SideBrand({ collapsed }: { collapsed: boolean }) {
           openExternal(SITE);
         }}
         className="side-brand-mark"
-        title="By Assertive Infosec"
+        title="Assertive Infosec: makers of brainproxy"
       >
         <AssertiveMark size={18} />
       </a>
     );
-  return <Byline className="side-brand" />;
+  return <BrandLink className="side-brand" />;
 }

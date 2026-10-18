@@ -351,7 +351,7 @@ select {
   font-family: inherit;
 }
 
-/* "By AssertiveInfosec" byline (Welcome screen and sidebar). */
+/* Clickable AssertiveInfosec logo (Welcome screen and sidebar). */
 .madeby,
 .side-brand {
   display: flex;
@@ -2015,7 +2015,7 @@ button.chip {
   order: -1;
 }
 
-/* Sidebar byline, above Collapse. */
+/* Sidebar logo, above Collapse. */
 .side-brand {
   margin: 6px 0 4px;
   padding: 8px 11px;
