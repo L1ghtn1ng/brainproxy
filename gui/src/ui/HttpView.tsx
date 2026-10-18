@@ -1,0 +1,197 @@
+// Viewer and editor for one raw HTTP message: Raw (highlighted, editable when onChange is
+// given), Pretty (JSON and form bodies formatted), and Hex, with a search bar.
+// Line endings are shown and edited as \n; `send` normalizes them back to CRLF.
+
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { decode, encodeAll } from "./urlencode";
+
+type Mode = "raw" | "pretty" | "hex";
+
+export function normalize(raw: string): string {
+  return raw.replace(/\r\n/g, "\n");
+}
+
+function splitMessage(text: string): [string, string, string] {
+  const i = text.indexOf("\n\n");
+  return i < 0 ? [text, "", ""] : [text.slice(0, i), "\n\n", text.slice(i + 2)];
+}
+
+function marks(text: string, query: string, key: string): ReactNode[] {
+  if (!query) return [text];
+  const out: ReactNode[] = [];
+  const lower = text.toLowerCase();
+  const q = query.toLowerCase();
+  let at = 0;
+  for (let i = lower.indexOf(q); i >= 0; i = lower.indexOf(q, i + q.length)) {
+    out.push(text.slice(at, i), <mark key={`${key}${i}`}>{text.slice(i, i + q.length)}</mark>);
+    at = i + q.length;
+  }
+  out.push(text.slice(at));
+  return out;
+}
+
+/** Colors the start line and header names; marks search matches everywhere. */
+function highlight(text: string, query: string): ReactNode[] {
+  const [head, sep, body] = splitMessage(text);
+  const lines = head.split("\n");
+  const out: ReactNode[] = [];
+  lines.forEach((line, n) => {
+    if (n > 0) out.push("\n");
+    if (n === 0) {
+      const m = /^(\S+)(\s+)(\S+)(.*)$/.exec(line);
+      if (m && /^HTTP\//.test(m[1])) {
+        const cls = Number(m[3]) >= 500 ? "s5" : Number(m[3]) >= 400 ? "s4" : Number(m[3]) >= 300 ? "s3" : "s2";
+        out.push(<span key="v" className="h-ver">{m[1]}</span>, m[2], <span key="s" className={`h-status ${cls}`}>{m[3]}</span>, <span key="r" className="h-reason">{m[4]}</span>);
+      } else if (m) {
+        out.push(<span key="m" className="h-method">{m[1]}</span>, m[2], <span key="u" className="h-url">{marks(m[3], query, "u")}</span>, <span key="v" className="h-ver">{m[4]}</span>);
+      } else out.push(...marks(line, query, `l${n}`));
+      return;
+    }
+    const c = line.indexOf(":");
+    if (c > 0) {
+      out.push(<span key={`h${n}`} className="h-name">{marks(line.slice(0, c), query, `n${n}`)}</span>, ":", <span key={`v${n}`} className="h-value">{marks(line.slice(c + 1), query, `v${n}`)}</span>);
+    } else out.push(...marks(line, query, `l${n}`));
+  });
+  out.push(sep, <span key="body" className="h-body">{marks(body, query, "b")}</span>);
+  return out;
+}
+
+function pretty(text: string): string {
+  const [head, sep, body] = splitMessage(text);
+  const t = body.trim();
+  if (/^[[{]/.test(t)) {
+    try {
+      return head + sep + JSON.stringify(JSON.parse(t), null, 2);
+    } catch {
+      /* not JSON */
+    }
+  }
+  if (/content-type:\s*application\/x-www-form-urlencoded/i.test(head) && t) {
+    const lines = t.split("&").map((kv) => {
+      const [k, v = ""] = kv.split("=");
+      const dec = (s: string) => {
+        try {
+          return decodeURIComponent(s.replace(/\+/g, " "));
+        } catch {
+          return s;
+        }
+      };
+      return `${dec(k)} = ${dec(v)}`;
+    });
+    return head + sep + lines.join("\n");
+  }
+  return text;
+}
+
+function hexdump(text: string): string {
+  const bytes = new TextEncoder().encode(text.slice(0, 65536));
+  const rows: string[] = [];
+  for (let off = 0; off < bytes.length; off += 16) {
+    const chunk = bytes.slice(off, off + 16);
+    const hex = Array.from(chunk, (b) => b.toString(16).padStart(2, "0")).join(" ");
+    const ascii = Array.from(chunk, (b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : ".")).join("");
+    rows.push(`${off.toString(16).padStart(8, "0")}  ${hex.padEnd(47)}  ${ascii}`);
+  }
+  return rows.join("\n");
+}
+
+export function HttpView(p: {
+  value: string;
+  onChange?: (v: string) => void;
+  title: ReactNode;
+  extra?: ReactNode;
+  placeholder?: string;
+  /** Initial search text, e.g. a finding's evidence. */
+  highlight?: string;
+}) {
+  const [mode, setMode] = useState<Mode>("raw");
+  const [query, setQuery] = useState(p.highlight ?? "");
+  useEffect(() => setQuery(p.highlight ?? ""), [p.highlight]);
+  const back = useRef<HTMLPreElement>(null);
+  const editor = useRef<HTMLTextAreaElement>(null);
+
+  // Replaces the editor's selection with f(selection) and keeps the result selected.
+  const transformSelection = (f: (s: string) => string) => {
+    const el = editor.current;
+    if (!el || !p.onChange || el.selectionStart === el.selectionEnd) return;
+    const { selectionStart: a, selectionEnd: b, value } = el;
+    const next = f(value.slice(a, b));
+    p.onChange(value.slice(0, a) + next + value.slice(b));
+    requestAnimationFrame(() => {
+      el.focus();
+      el.setSelectionRange(a, a + next.length);
+    });
+  };
+  const text = useMemo(() => normalize(p.value), [p.value]);
+  const editable = !!p.onChange && mode === "raw";
+  const shown = mode === "pretty" ? pretty(text) : text;
+  const nodes = useMemo(() => (mode === "hex" ? [hexdump(text)] : highlight(shown, query)), [mode, shown, text, query]);
+  const hits = useMemo(() => {
+    if (!query) return 0;
+    const l = shown.toLowerCase();
+    const q = query.toLowerCase();
+    let n = 0;
+    for (let i = l.indexOf(q); i >= 0; i = l.indexOf(q, i + q.length)) n++;
+    return n;
+  }, [shown, query]);
+
+  return (
+    <div className="msg">
+      <div className="msg-bar">
+        <span className="msg-title">{p.title}</span>
+        <div className="seg">
+          {(["raw", "pretty", "hex"] as Mode[]).map((m) => (
+            <button key={m} className={mode === m ? "on" : ""} onClick={() => setMode(m)}>
+              {m === "raw" ? "Raw" : m === "pretty" ? "Pretty" : "Hex"}
+            </button>
+          ))}
+        </div>
+        <span className="grow" />
+        {editable && (
+          <div className="seg">
+            <button onMouseDown={(e) => e.preventDefault()} onClick={() => transformSelection(encodeAll)} title="URL-encode the selection (⌘/Ctrl+U)">
+              Encode
+            </button>
+            <button onMouseDown={(e) => e.preventDefault()} onClick={() => transformSelection((s) => decode(s, true))} title="URL-decode the selection (⌘/Ctrl+Shift+U)">
+              Decode
+            </button>
+          </div>
+        )}
+        {p.extra}
+      </div>
+      <div className="code-wrap">
+        {editable ? (
+          <>
+            <pre className="code backdrop" ref={back} aria-hidden>
+              {nodes}
+              {"\n"}
+            </pre>
+            <textarea
+              ref={editor}
+              className="code editor"
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "u") {
+                  e.preventDefault();
+                  transformSelection(e.shiftKey ? (s) => decode(s, true) : encodeAll);
+                }
+              }}
+              spellCheck={false}
+              value={text}
+              placeholder={p.placeholder}
+              onChange={(e) => p.onChange!(e.target.value)}
+              onScroll={(e) => {
+                if (back.current) back.current.scrollTop = e.currentTarget.scrollTop;
+              }}
+            />
+          </>
+        ) : (
+          <pre className="code">{text ? nodes : <span className="muted">{p.placeholder}</span>}</pre>
+        )}
+      </div>
+      <div className="msg-foot">
+        <input className="search" placeholder="Search" value={query} onChange={(e) => setQuery(e.target.value)} />
+        <span className="muted">{query ? `${hits} match${hits === 1 ? "" : "es"}` : `${new TextEncoder().encode(p.value).length} bytes`}</span>
+      </div>
+    </div>
+  );
+}

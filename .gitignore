@@ -1,0 +1,4 @@
+target/
+*.bpdb
+*.bpdb-*
+.claude/worktrees/

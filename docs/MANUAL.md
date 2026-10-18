@@ -1,0 +1,295 @@
+# brainproxy manual
+
+brainproxy is a web application security testing tool: an intercepting proxy, a request
+editor, a fuzzer, a crawler, passive and active scanners, out-of-band callbacks, and
+reports. Every feature is a command-line tool with JSON output, so scripts and AI agents
+can drive it. The desktop app is optional and runs the same commands underneath.
+
+Only test systems you are authorized to test.
+
+Contents: [Install](#install) · [Concepts](#concepts) · [First engagement (desktop app)](#first-engagement-desktop-app)
+· [The tools](#the-tools) · [Command line](#command-line) · [Agents and MCP](#agents-and-mcp)
+· [Rules, checks, and wordlists](#rules-checks-and-wordlists) · [Troubleshooting](#troubleshooting)
+
+---
+
+## Install
+
+Downloads are on the GitHub release page. Each file has a `.sha256` next to it.
+
+| You want | Download |
+| --- | --- |
+| Desktop app on a Mac (Apple silicon) | `brainproxy-gui-macos-arm64.dmg` |
+| Desktop app on Debian, Ubuntu, or Kali | `brainproxy-gui-linux-x86_64.deb` |
+| Desktop app on another Linux, no install | `brainproxy-gui-linux-x86_64.AppImage` |
+| Command line only (servers, agents, Kali) | `brainproxy-linux-x86_64` or `brainproxy-linux-arm64` |
+
+- **macOS:** open the `.dmg` and drag brainproxy to Applications. The app isn't signed
+  yet, so open it the first time with right-click → Open, or run
+  `xattr -dr com.apple.quarantine /Applications/brainproxy.app`.
+- **Debian/Ubuntu/Kali:** `sudo apt install ./brainproxy-gui-linux-x86_64.deb`. This installs
+  WebKitGTK if it is missing and adds a menu entry.
+- **AppImage:** `chmod +x brainproxy-gui-linux-x86_64.AppImage`, then run it. It needs
+  WebKitGTK 4.1, which current distributions include.
+- **Command line:** the binaries are static with no dependencies:
+  `chmod +x brainproxy-linux-x86_64 && sudo mv brainproxy-linux-x86_64 /usr/local/bin/brainproxy`.
+
+The desktop app includes the command-line tool, so you don't need both.
+
+---
+
+## Concepts
+
+**Project.** One file (`something.bpdb`) holds everything for an engagement: recorded
+traffic, findings, scans, settings, and login profiles. Copy it to share or archive the
+work. Several tools (the app, the CLI, an agent) can use the same project at the same time.
+
+**Engagement scope.** Each project has a fixed list of targets that may be contacted,
+such as `app.example.com`, `*.example.com`, `10.0.0.0/24`, or `api.example.com:8443`, plus
+optional exclusions. It is set once, when the project is created, and **can never be
+changed**. brainproxy refuses every request outside it, including redirects, links found
+by the crawler, and requests from a browser using the proxy. For a different scope, start
+a new engagement.
+
+**Proxy scope.** A separate, changeable list that decides which proxied traffic is
+recorded and intercepted. It is empty by default, which means everything the engagement
+allows.
+
+**Data folder.** The interception certificate (CA), downloaded rule data, and Nuclei
+templates live once per user (`~/.local/share/brainproxy`) and are shared by all projects.
+
+---
+
+## First engagement (desktop app)
+
+1. **Start a new engagement.** On the welcome screen choose *New engagement*:
+   - Give it a name.
+   - Choose where to save the project file.
+   - List the targets in scope. You can paste URLs; they are reduced to host and port.
+   - Optionally add hosts that must never be contacted.
+   - Read the note that the scope is locked, confirm you have permission, and create it.
+2. **Download rules and checks.** The Overview shows *Download the latest scan rules and
+   checks* until you've done it once. Download both the ZAP rule data and the Nuclei
+   templates.
+3. **Explore the site.** The proxy starts automatically when a project opens (port 8080, or
+   the next free one). Click **Open browser** in the top bar and pick a browser. It opens
+   in its own profile, sends everything through the proxy, and trusts brainproxy's
+   certificate. Your everyday browser is untouched. Log in and click through the
+   application; requests appear in **Proxy › Traffic** and the **Site map**.
+4. **Scan.**
+   - **Guided:** the Overview's *Guided scan* asks for the website, whether to log in, and
+     how thorough to be (Quick, Standard, Thorough), then runs and explains the results.
+   - **Yourself:** in **Scans › New scan**, *Crawl and audit* is the default. It crawls the
+     site, then attacks every request it found, with the Nuclei templates included at high
+     severity and above.
+5. **Review.** **Findings** groups issues by type and risk. Each one shows a description,
+   evidence, the solution, references, and the request and response. Mark false positives
+   and confirmed issues; send a request to **Replay** to verify it by hand.
+6. **Report.** `brainproxy report html -o report.html` (also `markdown`, `json`, `sarif`)
+   creates a report from the findings, leaving out false positives.
+
+---
+
+## The tools
+
+The sidebar groups the tools by what you are doing.
+
+### Overview
+- **Guided scan:** shown until a project has a scan.
+- **Rules and checks:** status of the ZAP rule data and Nuclei templates, with downloads.
+- **Issue counts by risk, recent findings, running tasks, traffic statistics.**
+- **Proxy status:** how to point other tools at the proxy.
+
+### Site map
+- **Map:** a tree of hosts and paths built from recorded traffic. Dots show the highest
+  risk found on each node.
+- **Scope:** *In scope only* (on by default) hides hosts the engagement refused, which are
+  mostly browser background calls. *Include scanner and fuzzer requests* shows attack
+  traffic too.
+- **Actions:** right-click a node or request to send it to Replay, crawl from there, run an
+  active scan of that branch or request, or copy the URL.
+- **Scope tab:** shows the engagement, checks whether a host would be allowed, and edits
+  the proxy scope.
+
+### Proxy
+- **Intercept:** turn it on to hold requests (and optionally responses) before they are
+  sent. Edit a held message and Forward it, or Drop it. Requests outside the engagement are
+  never held, because they are refused anyway. Unanswered messages are forwarded after a
+  timeout (Settings › Intercept options).
+- **Traffic:** everything that went through the proxy, Replay, the crawler, scanners, and
+  imports.
+  - **Filters:** text, source, status, static assets, and out-of-scope requests (hidden by
+    default).
+  - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
+  - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight.
+
+### Replay
+Edit a raw request and send it as often as you like, in separate tabs.
+- **Sending:** ⌘/Ctrl+Enter sends; ‹ › step back and forward through what you sent.
+- **Auto URL-encode** (on by default): on send, characters that aren't valid in a URL
+  (spaces, quotes, `<>`, `#`, non-ASCII) are encoded in the request line and in form bodies.
+  `&`, `=`, `'` and existing `%XX` stay as typed, so `?q=x' OR 1=1--` arrives as
+  `?q=x'%20OR%201=1--`.
+- **Selection:** ⌘U URL-encodes the selected text completely and ⌘⇧U decodes it. This
+  works in every request editor.
+
+### Fuzzer
+Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an
+attack type, and pick payloads:
+- **Attack types:**
+  - **Sniper:** one list, one position at a time.
+  - **Battering ram:** one list, the same payload everywhere.
+  - **Pitchfork:** one list per position, in step.
+  - **Cluster bomb:** every combination.
+- **Payload sources:**
+  - **Built-in:** 17 lists. `sqli`, `sqli-time`, `sqli-login-bypass`, `xss`,
+    `path-traversal`, `command-injection`, `ssti`, `nosqli`, `naughty-strings`,
+    `special-chars`, `content-discovery`, `parameters`, `headers`, `usernames`, `passwords`,
+    `http-methods`, `extensions`. *Edit as list* copies one so you can change it.
+  - **List:** type your own payloads.
+  - **Numbers:** a range.
+  - **File:** a wordlist on disk.
+  - **Processing:** each set can be encoded, hashed, or prefixed.
+- **Matching:** grep for text in responses, extract values, or match status codes.
+- **Encoding:** payloads placed in the URL or a form body are URL-encoded where needed
+  (option on by default).
+- **Results:** show live, with the baseline response and *outliers* (unusual status or size)
+  highlighted.
+- **Discover content:** sets up `GET /§path§` with the content-discovery list to find
+  files and folders such as `.git`, `.env`, backups, admin panels, and debug consoles.
+
+### Scans
+- **New scan › Active scan:**
+  - **Crawl and audit** (default): crawls from the site URLs, then attacks every request
+    recorded on those sites. The crawler follows links and forms, robots.txt and sitemaps,
+    and URL paths mentioned in page text or scripts (error pages included); placeholder
+    values such as `?key=…` or `/users/{id}` are replaced with test values. It keeps the
+    cookies the site sets and sends them back, so tick *Inject into cookies* to attack them
+    (the guided Standard and Thorough scans do). It doesn't run JavaScript: for single-page
+    apps, browse the app through the proxy first.
+  - **Audit everything recorded:** attacks all traffic already in the project.
+  - **Audit specific URLs:** only the requests you list.
+  - **Options:** strength, rules, login profile, speed limits, and *Include Nuclei
+    templates* (on when installed, high severity and above by default).
+- **New scan › Crawl:** explore only, no attacks.
+- **Tasks:** running and finished scans and crawls with progress; Stop; View findings.
+- **Rules:** turn passive rules on or off, choose which traffic is passively scanned, or
+  run the passive scan again.
+
+Passive rules run automatically on everything recorded. Active scans send real attack
+requests that can change data: prefer a test environment.
+
+### Findings
+- **Layout:** issues grouped by type, filterable by risk, with false positives hidden by
+  default.
+- **Detail:** for each issue, the rule, confidence, CWE/WASC, description, solution,
+  references, the evidence highlighted in the response, and the request.
+- **Actions:** mark *open*, *confirmed*, or *false positive*; send the request to Replay.
+
+### Callbacks
+Out-of-band testing for blind vulnerabilities (SSRF, XXE, blind command injection,
+Log4Shell-style lookups).
+- **Listener:** start one, choosing the address the target can reach (and optionally a DNS
+  domain).
+- **Payloads:** generate payload URLs and paste them into requests.
+- **Interactions:** callbacks appear as they arrive, with the raw request.
+
+Active scans use the listener automatically when it runs.
+
+### Codec
+Stacked transforms: encode, decode (base64, URL, hex, HTML, JWT), or hash, each step
+working on the previous output.
+
+### Diff
+Compare two requests or responses (sent from other tools or pasted) by line, word, or
+byte, side by side or unified.
+
+### Settings
+- **Auth profiles:** how to log in. Give a login URL with method and body (or a raw login
+  request), the username, and the password, preferably as an environment variable name.
+  Optionally add a CSRF token to fetch first, a token to extract for an Authorization
+  header, and logged-in/logged-out patterns and a check URL. Scans, crawls, the fuzzer, and
+  the proxy then stay logged in and log in again when the session drops.
+- **Match & replace:** rewrite requests and responses passing through the proxy.
+- **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
+- **TLS / CA:** the certificate to trust in other tools, with per-OS instructions.
+- **Rules & data:** update the ZAP rule data and Nuclei templates.
+- **Project:** project information, the engagement, and *Start the proxy when a project
+  opens*.
+
+---
+
+## Command line
+
+Every app action is a command; `--format json` (the default when output isn't a terminal)
+gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
+`kind`. `brainproxy capabilities` describes all 90 commands, their flags, and exit codes.
+
+```sh
+export BRAINPROXY_PROJECT=~/work/acme.bpdb
+brainproxy engagement start --name "Acme" --target app.acme.test --target '*.api.acme.test'
+
+brainproxy proxy start                       # 127.0.0.1:8080, prints how to trust the CA
+brainproxy browser open --browser chrome https://app.acme.test/
+
+brainproxy send --url https://app.acme.test/search?q=test
+brainproxy crawl https://app.acme.test/ --background
+brainproxy scan active https://app.acme.test/ --crawl --checks nuclei --check-severity high --background
+brainproxy job wait 1
+
+brainproxy fuzz run --url 'https://app.acme.test/search?q=§x§' -p wordlist:sqli --grep 'SQL syntax'
+brainproxy wordlists list
+
+brainproxy findings list
+brainproxy findings show 12
+brainproxy query "SELECT url, status FROM history WHERE status >= 500"
+brainproxy report html -o acme-report.html
+```
+
+More detail: [README](../README.md), [MCP](MCP.md), [checks](CHECKS.md),
+[rule updates](RULE_UPDATES.md), [out-of-band](OOB.md), [desktop app](GUI.md).
+
+---
+
+## Agents and MCP
+
+`brainproxy mcp serve` exposes every command as an MCP tool over stdio. Each tool is marked
+read-only, destructive, or open-world, long calls report progress, and the database schema
+and capabilities are available as resources. Add it to an MCP client:
+
+```json
+{ "mcpServers": { "brainproxy": { "command": "brainproxy", "args": ["--project", "/work/acme.bpdb", "mcp", "serve"] } } }
+```
+
+The agent works under the same engagement scope; it cannot reach anything outside it.
+
+---
+
+## Rules, checks, and wordlists
+
+- **ZAP rules.** The passive (52) and active (48) scan rules are ported from OWASP ZAP,
+  whose code is Apache-2.0. Their pattern files (error messages, hidden files, and similar)
+  are built in, and *Rules and checks › ZAP rule data* fetches the latest ones.
+- **Nuclei templates.** brainproxy runs Nuclei's HTTP templates itself. Most templates load
+  (10,434 of 11,690 at the pinned version); the rest use features it doesn't support yet,
+  and `checks list --skipped` says why. Templates needing a username, password, or other
+  input load when you pass `--check-var`, and those using interactsh need the callback
+  listener.
+- **Wordlists.** The built-in lists come from permissively licensed projects (SecLists,
+  PayloadsAllTheThings, FuzzDB, Param Miner, Big List of Naughty Strings, fuzz.txt), with
+  destructive payloads removed. Attributions are in NOTICE.
+
+---
+
+## Troubleshooting
+
+| Problem | What to do |
+| --- | --- |
+| "is outside the engagement scope" | The host or port isn't in the project's scope. Use an address inside it, or start a new engagement with the right scope. |
+| The site doesn't load through the proxy | Check the address (http or https? a port such as :8080?). The guided scan checks this for you. |
+| HTTPS certificate warnings in your own browser | Use **Open browser**, or trust the CA from Settings › TLS / CA. |
+| Firefox shows certificate errors in the opened browser | Import the CA once in that profile (the app shows how when it opens Firefox). |
+| curl or a tool skips the proxy for localhost | Pass `--noproxy ''` (curl), or unset `NO_PROXY`. |
+| "The proxy didn't start: ports … are all in use" | Another program uses ports 8080-8089. Stop it, or start the proxy on another port: `brainproxy proxy start --listen 127.0.0.1:9090`. |
+| A scan finds little | Make sure it covers the site: use *Crawl and audit*, browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |
+| macOS says the app can't be opened | Right-click → Open the first time, or run the `xattr` command in [Install](#install). |

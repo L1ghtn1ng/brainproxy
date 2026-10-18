@@ -1,0 +1,294 @@
+{
+  "sources": {
+    "seclists": {
+      "repo": "https://github.com/danielmiessler/SecLists",
+      "commit": "c23b603128ed21e46164a0afd357f0c242135f41",
+      "license": "MIT"
+    },
+    "patt": {
+      "repo": "https://github.com/swisskyrepo/PayloadsAllTheThings",
+      "commit": "3ac27901c711bdf3f5b65a7b1d1820a1f65bd09a",
+      "license": "MIT"
+    },
+    "fuzzdb": {
+      "repo": "https://github.com/fuzzdb-project/fuzzdb",
+      "commit": "5656ab25dc6bb43bae32236fab775658a90d7380",
+      "license": "BSD-3-Clause / CC-BY-3.0"
+    },
+    "param-miner": {
+      "repo": "https://github.com/PortSwigger/param-miner",
+      "commit": "e43e3b16be11117ed67cfde60e80acf2e95a4adc",
+      "license": "Apache-2.0"
+    },
+    "blns": {
+      "repo": "https://github.com/minimaxir/big-list-of-naughty-strings",
+      "commit": "db33ec7b1d5d9616a88c76394b7d0897bd0b97eb",
+      "license": "MIT"
+    },
+    "fuzz.txt": {
+      "repo": "https://github.com/Bo0oM/fuzz.txt",
+      "commit": "8512da9892c1f88b5a62b958bec4a6b2974d66ed",
+      "license": "WTFPL"
+    },
+    "brainproxy": {
+      "repo": "https://github.com/r4nd0mth1ngs/brainproxy",
+      "commit": null,
+      "license": "Apache-2.0"
+    }
+  },
+  "lists": {
+    "sqli": {
+      "description": "SQL injection: quotes, operators, comments, error-based payloads, and polyglots",
+      "caution": "OR-true payloads (' or 1=1--) can change every row if the parameter reaches an UPDATE or DELETE",
+      "count": 248,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "brainproxy",
+          "path": "scripts/update-wordlists.py"
+        },
+        {
+          "source": "seclists",
+          "path": "Fuzzing/Databases/SQLi/quick-SQLi.txt"
+        },
+        {
+          "source": "patt",
+          "path": "SQL Injection/Intruder/Generic_ErrorBased.txt"
+        },
+        {
+          "source": "seclists",
+          "path": "Fuzzing/Databases/SQLi/SQLi-Polyglots.txt"
+        }
+      ],
+      "sha256": "7c6a969734e7a2ff24aa6c72419809973ca207e0d216fc67976484968e120e44"
+    },
+    "sqli-time": {
+      "description": "Time-based blind SQL injection (sleep, benchmark, waitfor); look for slow responses",
+      "caution": "each hit makes the server wait; keep concurrency low",
+      "count": 42,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "seclists",
+          "path": "Fuzzing/Databases/SQLi/Generic-BlindSQLi.fuzzdb.txt"
+        }
+      ],
+      "sha256": "22ba3d13dfb64307ecf34aa1c572840774ecd1f84fdd86b44998b0a16d76069a"
+    },
+    "sqli-login-bypass": {
+      "description": "SQL injection login bypass for username/password fields",
+      "caution": null,
+      "count": 96,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "seclists",
+          "path": "Fuzzing/Databases/SQLi/sqli.auth.bypass.txt"
+        }
+      ],
+      "sha256": "07887121de5aeab2d5541c6b40142797addea4e1eaf808f43d236d3a7be2bc82"
+    },
+    "xss": {
+      "description": "Cross-site scripting: tags, event handlers, and polyglots; look for the payload reflected unencoded",
+      "caution": null,
+      "count": 161,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "seclists",
+          "path": "Fuzzing/XSS/robot-friendly/XSS-BruteLogic.txt"
+        },
+        {
+          "source": "seclists",
+          "path": "Fuzzing/XSS/Polyglots/XSS-Polyglots.txt"
+        },
+        {
+          "source": "patt",
+          "path": "XSS Injection/Intruders/xss_payloads_quick.txt"
+        }
+      ],
+      "sha256": "646a18e1c4d00b27b1bda5b5fab664a927115adf7566645bca26f80a2e937b88"
+    },
+    "path-traversal": {
+      "description": "Path traversal and file inclusion (../, encodings, /etc/passwd, win.ini)",
+      "caution": null,
+      "count": 149,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "patt",
+          "path": "Directory Traversal/Intruder/directory_traversal.txt"
+        },
+        {
+          "source": "patt",
+          "path": "File Inclusion/Intruders/simple-check.txt"
+        }
+      ],
+      "sha256": "b992e1e314640c56d30803805ae41c4581944326f11af2ad329dd9e99b59c2d9"
+    },
+    "command-injection": {
+      "description": "OS command injection with harmless commands (id, cat /etc/passwd) and separators",
+      "caution": null,
+      "count": 121,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "patt",
+          "path": "Command Injection/Intruder/command-execution-unix.txt"
+        },
+        {
+          "source": "fuzzdb",
+          "path": "attack/os-cmd-execution/command-injection-template.txt"
+        }
+      ],
+      "sha256": "9e48f919752f3995e210b37ce11238e30c6914d9a020cfefc613880c66eb4687"
+    },
+    "ssti": {
+      "description": "Server-side template injection: expressions that evaluate to 1764 (42*42) in common engines",
+      "caution": null,
+      "count": 11,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "seclists",
+          "path": "Fuzzing/template-engines-expression.txt"
+        }
+      ],
+      "sha256": "a662fb7f107b403beff0ae8287c24f5fd589d3e29f60b103a1a5dfa08ed8831d"
+    },
+    "nosqli": {
+      "description": "NoSQL injection (MongoDB operators and JavaScript)",
+      "caution": null,
+      "count": 24,
+      "dropped_destructive": 4,
+      "sources": [
+        {
+          "source": "patt",
+          "path": "NoSQL Injection/Intruder/NoSQL.txt"
+        },
+        {
+          "source": "patt",
+          "path": "NoSQL Injection/Intruder/MongoDB.txt"
+        }
+      ],
+      "sha256": "d0c9369941151d634b959ca10ab71afeb85e6d5f8fe2bafbf63bdcb2a4bf3a94"
+    },
+    "naughty-strings": {
+      "description": "Strings that often break input handling: unicode, emoji, RTL, format strings, reserved words",
+      "caution": null,
+      "count": 510,
+      "dropped_destructive": 3,
+      "sources": [
+        {
+          "source": "blns",
+          "path": "blns.txt"
+        }
+      ],
+      "sha256": "5f1b20aa25a40f658e5ec212ebfcdcb3599c054daa8d9203c04cd16521cd2660"
+    },
+    "special-chars": {
+      "description": "Single special characters, to see which ones a parameter mishandles",
+      "caution": null,
+      "count": 32,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "seclists",
+          "path": "Fuzzing/special-chars.txt"
+        }
+      ],
+      "sha256": "35d0cac8294508c83d31bcdbd263464c78064ea719be4e5a54ce96f4f24d327c"
+    },
+    "content-discovery": {
+      "description": "Paths worth checking on any web server: VCS and config files, backups, admin panels, debug endpoints",
+      "caution": "send with GET only: some endpoints (e.g. /actuator/shutdown) act on POST",
+      "count": 5384,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "fuzz.txt",
+          "path": "fuzz.txt"
+        }
+      ],
+      "sha256": "8c4b1861ac7b0cfc975e8d9a0eeeb715a0fe5c9b96127b397d02bcff3d0cd2b5"
+    },
+    "parameters": {
+      "description": "Common parameter names, for finding hidden parameters",
+      "caution": null,
+      "count": 6527,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "param-miner",
+          "path": "resources/params"
+        }
+      ],
+      "sha256": "a05729584b434dd51860a585ab2a5de0e486dd62f4d81a1ab1c86cb15a16d169"
+    },
+    "headers": {
+      "description": "Common request header names, for header fuzzing",
+      "caution": null,
+      "count": 1217,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "param-miner",
+          "path": "resources/headers"
+        }
+      ],
+      "sha256": "544948c8606f7f98302356cb8890a286ffa668e3d3e95b4fab81b76688e739f5"
+    },
+    "usernames": {
+      "description": "Most common usernames (root, admin, test, ...)",
+      "caution": null,
+      "count": 17,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "seclists",
+          "path": "Usernames/top-usernames-shortlist.txt"
+        }
+      ],
+      "sha256": "dc44775d12dcdb4027017623ffaa935a018944839ce4b204ccb0c6ef566db5dd"
+    },
+    "passwords": {
+      "description": "The 1,000 most common passwords",
+      "caution": "password guessing can lock accounts; check the engagement rules",
+      "count": 999,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "seclists",
+          "path": "Passwords/Common-Credentials/xato-net-10-million-passwords-1000.txt"
+        }
+      ],
+      "sha256": "3f6eaa0dbd2743fdc2ac48202c7675df66990015f33638cbf40c9c3ad600a4f4"
+    },
+    "http-methods": {
+      "description": "HTTP methods, including WebDAV and nonstandard ones",
+      "caution": "includes DELETE, PUT, and other state-changing methods",
+      "count": 88,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "seclists",
+          "path": "Fuzzing/http-request-methods.txt"
+        }
+      ],
+      "sha256": "b2fa8b6e3036e860d31dabb7f9585f3bc392c89aa24daeca31be6b2e3bb4805f"
+    },
+    "extensions": {
+      "description": "Common file extensions (with the leading dot)",
+      "caution": null,
+      "count": 31,
+      "dropped_destructive": 0,
+      "sources": [
+        {
+          "source": "seclists",
+          "path": "Fuzzing/extensions-most-common.fuzz.txt"
+        }
+      ],
+      "sha256": "f596d5732059df019eb4dad7c527871fe721a303a3b060b3e2d7db9d46143f25"
+    }
+  }
+}

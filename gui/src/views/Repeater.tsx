@@ -1,0 +1,224 @@
+import { useEffect, useState } from "react";
+import { bodyText, run, withScheme, type HistoryEntry } from "../api";
+import { useApp, type RepeaterTab } from "../store";
+import { HttpView } from "../ui/HttpView";
+import { Split } from "../ui/Split";
+import { autoEncodeRequest } from "../ui/urlencode";
+
+type SendResult = Pick<HistoryEntry, "id" | "url" | "duration_ms" | "response">;
+
+interface Sent {
+  raw: string;
+  /** What was actually sent (after auto URL-encoding) and how many characters were encoded. */
+  sent: string;
+  encoded: number;
+  result: SendResult | null;
+  error: string | null;
+}
+
+const BLANK = "GET / HTTP/1.1\nHost: \nUser-Agent: brainproxy\nAccept: */*\n\n";
+
+function responseText(r: SendResult | null): string {
+  const resp = r?.response;
+  if (!resp) return "";
+  return `HTTP/1.1 ${resp.status} ${resp.reason}\n${resp.headers.join("\n")}\n\n${bodyText(resp.body)}`;
+}
+
+/** scheme://host from the Host header, for requests typed by hand. */
+function guessTarget(raw: string, current: string): string {
+  if (current) return current;
+  const host = /^host:\s*(\S+)/im.exec(raw)?.[1];
+  return host ? `${/:443$/.test(host) ? "https" : "http"}://${host.replace(/:443$/, "")}` : "";
+}
+
+export function RepeaterView() {
+  const app = useApp();
+  const tabs = app.repeater;
+  const active = tabs.find((t) => t.key === app.repeaterActive) ?? tabs[tabs.length - 1];
+
+  const newTab = () => app.sendToRepeater({ raw: BLANK, target: "" });
+  const closeTab = (key: number) => {
+    app.setRepeater((ts) => ts.filter((t) => t.key !== key));
+    if (key === active?.key) {
+      const rest = tabs.filter((t) => t.key !== key);
+      app.setRepeaterActive(rest[rest.length - 1]?.key ?? 0);
+    }
+  };
+
+  return (
+    <div className="col fill">
+      <div className="subtabs">
+        {tabs.map((t) => (
+          <button key={t.key} className={t.key === active?.key ? "on" : ""} onClick={() => app.setRepeaterActive(t.key)} onAuxClick={(e) => e.button === 1 && closeTab(t.key)}>
+            {t.title}
+            <span
+              className="x"
+              title="Close"
+              onClick={(e) => {
+                e.stopPropagation();
+                closeTab(t.key);
+              }}
+            >
+              ×
+            </span>
+          </button>
+        ))}
+        <button onClick={newTab} title="New tab">
+          +
+        </button>
+      </div>
+      {active ? (
+        // key: each tab has its own editor state and send history.
+        <RepeaterTabView key={active.key} tab={active} />
+      ) : (
+        <div className="blank">
+          <p>Send a request here from Traffic (right-click → Send to Replay, or double-click), or</p>
+          <button className="btn primary" onClick={newTab}>
+            Start a blank request
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const AUTO_ENCODE = "repeater-auto-encode";
+
+function storedAutoEncode(): boolean {
+  try {
+    return localStorage.getItem(AUTO_ENCODE) !== "off";
+  } catch {
+    return true;
+  }
+}
+
+// Send history survives switching tabs (the tab view remounts), keyed by tab.
+const sentByTab = new Map<number, { list: Sent[]; at: number }>();
+
+function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
+  const app = useApp();
+  const [raw, setRaw] = useState(tab.raw);
+  const [target, setTarget] = useState(tab.target);
+  const [busy, setBusy] = useState(false);
+  const [autoEncode, setAutoEncode] = useState(storedAutoEncode);
+  const [sent, setSent] = useState(() => sentByTab.get(tab.key) ?? { list: [], at: -1 });
+  const current = sent.list[sent.at];
+
+  useEffect(() => {
+    sentByTab.set(tab.key, sent);
+  }, [tab.key, sent]);
+
+  // Keep the edited request in the shared tab list so it survives tab switches. Unchanged
+  // tabs return the same array, so React skips the update; a new array every time changed
+  // the app state, which re-ran this effect every 300 ms and re-ran other views' effects too.
+  const { setRepeater } = app;
+  useEffect(() => {
+    const t = setTimeout(
+      () =>
+        setRepeater((ts) => {
+          const cur = ts.find((x) => x.key === tab.key);
+          if (!cur || (cur.raw === raw && cur.target === target)) return ts;
+          return ts.map((x) => (x.key === tab.key ? { ...x, raw, target } : x));
+        }),
+      300,
+    );
+    return () => clearTimeout(t);
+  }, [raw, target, tab.key, setRepeater]);
+
+  const send = async () => {
+    const to = withScheme(guessTarget(raw, target));
+    if (!to) return app.toast("Set a target (scheme://host[:port]) or a Host header", "error");
+    setTarget(to);
+    setBusy(true);
+    const { text: sent, encoded } = autoEncode ? autoEncodeRequest(raw) : { text: raw, encoded: 0 };
+    let entry: Sent;
+    try {
+      const result = await run<SendResult>(["send", "--target", to, "-"], sent);
+      entry = { raw, sent, encoded, result, error: null };
+    } catch (e: any) {
+      entry = { raw, sent, encoded, result: null, error: e.message };
+    }
+    setBusy(false);
+    setSent((s) => ({ list: [...s.list, entry], at: s.list.length }));
+  };
+
+  const go = (d: number) => {
+    const at = sent.at + d;
+    if (at < 0 || at >= sent.list.length) return;
+    setSent({ ...sent, at });
+    setRaw(sent.list[at].raw);
+  };
+
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        if (!busy) send();
+      }
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  });
+
+  const r = current?.result;
+  return (
+    <div className="col fill" onKeyDown={() => {}}>
+      <div className="toolbar">
+        <button className="btn primary" disabled={busy} onClick={send} title="Send (⌘/Ctrl+Enter)">
+          {busy ? "Sending…" : "Send"}
+        </button>
+        <div className="seg">
+          <button disabled={sent.at <= 0} onClick={() => go(-1)} title="Previous request">
+            ‹
+          </button>
+          <button disabled={sent.at >= sent.list.length - 1} onClick={() => go(1)} title="Next request">
+            ›
+          </button>
+        </div>
+        <span className="label">Target</span>
+        <input className="input mono" style={{ width: 300 }} placeholder="https://example.com" value={target} onChange={(e) => setTarget(e.target.value)} />
+        <label className="check" title="Before sending, percent-encode characters that aren't valid in a URL (spaces, quotes, <>, #, non-ASCII) in the request line and in form bodies. & = ? / and existing %XX stay as typed.">
+          <input
+            type="checkbox"
+            checked={autoEncode}
+            onChange={(e) => {
+              setAutoEncode(e.target.checked);
+              try {
+                localStorage.setItem(AUTO_ENCODE, e.target.checked ? "on" : "off");
+              } catch {
+                /* storage unavailable */
+              }
+            }}
+          />{" "}
+          Auto URL-encode
+        </label>
+        <span className="grow" />
+        {!!current?.encoded && (
+          <span className="tag" title={`Sent as:\n${current.sent.split("\n")[0]}`}>
+            {current.encoded} char{current.encoded === 1 ? "" : "s"} URL-encoded
+          </span>
+        )}
+        {r?.response && (
+          <span className="muted">
+            {r.response.status} · {bodyText(r.response.body).length} bytes · {r.duration_ms} ms · history #{r.id}
+          </span>
+        )}
+      </div>
+      <Split id="repeater" dir="row">
+        <HttpView title="Request" value={raw} onChange={setRaw} />
+        <HttpView
+          title="Response"
+          value={responseText(r ?? null)}
+          placeholder={current?.error ?? (busy ? "Waiting for the response…" : "Send the request to see the response")}
+          extra={
+            r && (
+              <button className="btn small" onClick={() => app.sendToComparer(responseText(r))}>
+                To Diff
+              </button>
+            )
+          }
+        />
+      </Split>
+    </div>
+  );
+}

@@ -1,0 +1,214 @@
+import { useEffect, useMemo, useState } from "react";
+import { bodyText, rawResponse, run, type Finding, type FindingItem, type HistoryEntry, type Risk } from "../api";
+import { originOf, useApp } from "../store";
+import { HttpView } from "../ui/HttpView";
+import { Split } from "../ui/Split";
+import { usePoll } from "../ui/usePoll";
+
+const RISKS: Risk[] = ["high", "medium", "low", "info"];
+const RANK: Record<Risk, number> = { high: 0, medium: 1, low: 2, info: 3 };
+
+export function RiskBadge({ risk }: { risk: Risk }) {
+  return <span className={`risk risk-${risk}`}>{risk}</span>;
+}
+
+interface Group {
+  ref: string;
+  name: string;
+  risk: Risk;
+  items: FindingItem[];
+}
+
+export function FindingsView({ active }: { active: boolean }) {
+  const app = useApp();
+  const [data, refresh] = usePoll<{ items: FindingItem[] }>(() => run(["findings", "list", "--all", "--state", "all", "--limit", "10000"]), 5000, active);
+  const [risks, setRisks] = useState(new Set<Risk>(RISKS));
+  const [hideFp, setHideFp] = useState(true);
+  const [open, setOpen] = useState(new Set<string>());
+  const [selected, setSelected] = useState<number | null>(null);
+  const [finding, setFinding] = useState<Finding | null>(null);
+  const [entry, setEntry] = useState<HistoryEntry | null>(null);
+
+  const groups = useMemo(() => {
+    const by = new Map<string, Group>();
+    for (const f of data?.items ?? []) {
+      if (!risks.has(f.risk) || (hideFp && f.state === "false_positive")) continue;
+      const g = by.get(f.alert_ref) ?? { ref: f.alert_ref, name: f.name, risk: f.risk, items: [] };
+      g.items.push(f);
+      by.set(f.alert_ref, g);
+    }
+    return [...by.values()].sort((a, b) => RANK[a.risk] - RANK[b.risk] || a.name.localeCompare(b.name));
+  }, [data, risks, hideFp]);
+
+  const counts = useMemo(() => {
+    const c: Record<string, number> = {};
+    for (const f of data?.items ?? []) if (f.state !== "false_positive") c[f.risk] = (c[f.risk] ?? 0) + 1;
+    return c;
+  }, [data]);
+
+  useEffect(() => {
+    if (selected == null) return;
+    let live = true;
+    setEntry(null);
+    run<Finding>(["findings", "show", String(selected)])
+      .then((f) => {
+        if (!live) return;
+        setFinding(f);
+        if (f.history_id != null) run<HistoryEntry>(["history", "show", String(f.history_id)]).then((e) => live && setEntry(e), () => {});
+      })
+      .catch((e) => app.toast(e.message, "error"));
+    return () => {
+      live = false;
+    };
+  }, [selected, app.toast]);
+
+  const mark = async (state: string) => {
+    if (!finding) return;
+    try {
+      await run(["findings", "mark", String(finding.id), "--state", state]);
+      setFinding({ ...finding, state });
+      refresh();
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+  };
+
+  const toggle = <T,>(set: Set<T>, v: T) => {
+    const s = new Set(set);
+    s.has(v) ? s.delete(v) : s.add(v);
+    return s;
+  };
+
+  return (
+    <div className="col fill">
+      <div className="toolbar">
+        <div className="seg">
+          {RISKS.map((r) => (
+            <button key={r} className={risks.has(r) ? "on" : ""} onClick={() => setRisks(toggle(risks, r))}>
+              <span className={`dot-risk risk-${r}`} /> {r} <span className="muted">{counts[r] ?? 0}</span>
+            </button>
+          ))}
+        </div>
+        <label className="check">
+          <input type="checkbox" checked={hideFp} onChange={(e) => setHideFp(e.target.checked)} /> Hide false positives
+        </label>
+        <span className="grow" />
+        <span className="muted">{groups.length} issue types</span>
+      </div>
+      <Split id="findings" dir="row" initial={0.34}>
+        <div className="tree">
+          {groups.length === 0 && <div className="empty">No findings. Passive rules run on recorded traffic; active scans add more.</div>}
+          {groups.map((g) => (
+            <div key={g.ref}>
+              <button className="tree-group" onClick={() => setOpen(toggle(open, g.ref))}>
+                <span className="caret">{open.has(g.ref) ? "▾" : "▸"}</span>
+                <span className={`dot-risk risk-${g.risk}`} />
+                <span className="grow ellipsis">{g.name}</span>
+                <span className="muted">{g.items.length}</span>
+              </button>
+              {open.has(g.ref) &&
+                g.items.map((f) => (
+                  <button key={f.id} className={`tree-item ${selected === f.id ? "on" : ""} ${f.state === "false_positive" ? "struck" : ""}`} onClick={() => setSelected(f.id)}>
+                    <span className="ellipsis">
+                      {/* One rule can raise differently named alerts (e.g. 40018 for each database). */}
+                      {f.name !== g.name && <span className="tree-subname">{f.name} · </span>}
+                      {f.url}
+                      {f.param && <span className="muted"> [{f.param}]</span>}
+                    </span>
+                    {f.state === "confirmed" && <span className="tag">confirmed</span>}
+                  </button>
+                ))}
+            </div>
+          ))}
+        </div>
+        {finding ? (
+          <Split id="finding-detail" dir="col" initial={0.5}>
+            <div className="detail">
+              <div className="detail-head">
+                <RiskBadge risk={finding.risk} />
+                <h2>{finding.name}</h2>
+              </div>
+              <div className="toolbar flat">
+                <div className="seg">
+                  {["open", "confirmed", "false_positive"].map((s) => (
+                    <button key={s} className={finding.state === s ? "on" : ""} onClick={() => mark(s)}>
+                      {s.replace("_", " ")}
+                    </button>
+                  ))}
+                </div>
+                {entry && (
+                  <button className="btn small" onClick={() => app.sendToRepeater({ raw: bodyText(entry.request), target: originOf(entry.url), title: finding.name.slice(0, 24) })}>
+                    Send to Replay
+                  </button>
+                )}
+              </div>
+              <dl className="facts">
+                <dt>URL</dt>
+                <dd className="mono">
+                  {finding.method} {finding.url}
+                </dd>
+                {finding.param && (
+                  <>
+                    <dt>Parameter</dt>
+                    <dd className="mono">{finding.param}</dd>
+                  </>
+                )}
+                {finding.attack && (
+                  <>
+                    <dt>Attack</dt>
+                    <dd className="mono">{finding.attack}</dd>
+                  </>
+                )}
+                {finding.evidence && (
+                  <>
+                    <dt>Evidence</dt>
+                    <dd className="mono">{finding.evidence}</dd>
+                  </>
+                )}
+                <dt>Confidence</dt>
+                <dd>{finding.confidence}</dd>
+                <dt>Rule</dt>
+                <dd>
+                  {finding.alert_ref} ({finding.source}){finding.cwe ? ` · CWE-${finding.cwe}` : ""}
+                  {finding.wasc ? ` · WASC-${finding.wasc}` : ""} · {finding.hits} hit{finding.hits === 1 ? "" : "s"}
+                </dd>
+              </dl>
+              <h3>Description</h3>
+              <p className="prose">{finding.description}</p>
+              {finding.other_info && (
+                <>
+                  <h3>Details</h3>
+                  <p className="prose">{finding.other_info}</p>
+                </>
+              )}
+              {finding.solution && (
+                <>
+                  <h3>Solution</h3>
+                  <p className="prose">{finding.solution}</p>
+                </>
+              )}
+              {!!finding.refs?.length && (
+                <>
+                  <h3>References</h3>
+                  <ul className="refs">
+                    {finding.refs.map((r) => (
+                        <li key={r} className="mono">
+                          {r}
+                        </li>
+                      ))}
+                  </ul>
+                </>
+              )}
+            </div>
+            <Split id="finding-msg" dir="row">
+              <HttpView title="Request" value={entry ? bodyText(entry.request) : ""} placeholder="No recorded request" />
+              <HttpView title="Response" value={entry ? rawResponse(entry) : ""} placeholder="" highlight={finding.evidence} />
+            </Split>
+          </Split>
+        ) : (
+          <div className="blank">Select a finding to see its details and evidence.</div>
+        )}
+      </Split>
+    </div>
+  );
+}
