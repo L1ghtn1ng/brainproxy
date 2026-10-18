@@ -197,7 +197,11 @@ Log4Shell-style lookups).
 - **Listener:** start one, choosing the address the target can reach (and optionally a DNS
   domain).
 - **Payloads:** generate payload URLs and paste them into requests.
-- **Interactions:** callbacks appear as they arrive, with the raw request.
+- **Interactions:** callbacks appear as they arrive, with the raw request. Only callbacks
+  carrying one of your payloads' tokens are kept (up to 100 per payload and 10,000 per
+  project); other traffic to the listener, such as internet scanners, is only counted.
+  The listener accepts connections on all interfaces by default so targets can reach it,
+  and says so when it starts.
 
 Active scans use the listener automatically when it runs.
 
@@ -317,6 +321,8 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | The site doesn't load through the proxy | Check the address (http or https? a port such as :8080?). The guided scan checks this for you. |
 | HTTPS certificate warnings in your own browser | Use **Open browser**, or trust the CA from Settings › TLS / CA. |
 | Firefox shows certificate errors in the opened browser | Import the CA once in that profile (the app shows how when it opens Firefox). |
+| `browser open` says it can only open http(s) URLs | Give a full `http://` or `https://` address (or none for a blank page). Other schemes and anything starting with `-` are refused so they can't be read as browser options. |
+| `proxy stop` / `oob stop` says it won't send SIGKILL | The saved state comes from an older version and the process ignored SIGTERM, so brainproxy can't tell it is the proxy. Check it with `ps -p PID` and stop it yourself. |
 | curl or a tool skips the proxy for localhost | Pass `--noproxy ''` (curl), or unset `NO_PROXY`. |
 | "The proxy didn't start: ports … are all in use" | Another program uses ports 8080-8089. Stop it, or start the proxy on another port: `brainproxy proxy start --listen 127.0.0.1:9090`. |
 | A scan finds little | Make sure it covers the site: use *Crawl and audit*, browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |

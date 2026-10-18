@@ -15,7 +15,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::output::Out;
-use crate::proxy_cmd::alive;
+use crate::proxy_cmd::{start_time, still_running, terminate};
 
 #[derive(Subcommand)]
 pub enum OobCmd {
@@ -63,7 +63,8 @@ pub enum OobCmd {
 
 #[derive(clap::Args, Clone)]
 pub struct OobRunArgs {
-    /// TCP address for HTTP/LDAP/TLS callbacks. Port 0 picks a free port.
+    /// TCP address for HTTP/LDAP/TLS callbacks; all interfaces by default so targets can
+    /// reach it. Port 0 picks a free port.
     #[arg(long, default_value = "0.0.0.0:8880")]
     listen: String,
     /// UDP address for the DNS server (e.g. 0.0.0.0:53); needs --domain.
@@ -93,7 +94,7 @@ pub struct OobRunArgs {
 /// The running listener for this project, clearing stale state left by a crash.
 pub(crate) fn running(store: &Store) -> Result<Option<OobState>, Error> {
     match oob::read_state(store)? {
-        Some(s) if alive(s.pid) => Ok(Some(s)),
+        Some(s) if still_running(s.pid, s.start_time) != Some(false) => Ok(Some(s)),
         Some(_) => {
             store.meta_set(STATE_KEY, None)?;
             Ok(None)
@@ -110,7 +111,22 @@ fn state_json(s: &OobState) -> Value {
     let example = s.endpoint.payload_for("bpEXAMPLETOKEN".into());
     let mut v = json!(s);
     v["payload_example"] = json!({"host": example.host, "url": example.url, "dns": example.dns});
+    v["warning"] = json!(exposure_warning(s));
     v
+}
+
+/// Listening on all interfaces is the default (targets must reach us), so say so.
+fn exposure_warning(s: &OobState) -> Option<String> {
+    let all = s.tcp_listen.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_unspecified())
+        || s.dns_listen
+            .as_deref()
+            .and_then(|d| d.parse::<std::net::SocketAddr>().ok())
+            .is_some_and(|a| a.ip().is_unspecified());
+    all.then(|| {
+        "listening on all interfaces: anyone who can reach this host can connect. Only callbacks carrying a \
+         registered token are stored; pass --listen 127.0.0.1:8880 (or a firewall) to limit who can reach it"
+            .into()
+    })
 }
 
 pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
@@ -120,15 +136,7 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
         OobCmd::Stop => {
             let store = Store::open(project)?;
             let state = running(&store)?.ok_or_else(not_running)?;
-            unsafe { libc::kill(state.pid as libc::pid_t, libc::SIGTERM) };
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while alive(state.pid) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            let forced = alive(state.pid);
-            if forced {
-                unsafe { libc::kill(state.pid as libc::pid_t, libc::SIGKILL) };
-            }
+            let forced = terminate(state.pid, state.start_time, "OOB listener")?;
             store.meta_set(STATE_KEY, None)?;
             out.ok(json!({"stopped": state.pid, "forced": forced}), || {
                 format!("stopped OOB listener (pid {})", state.pid)
@@ -138,13 +146,15 @@ pub fn oob(project: &Path, cmd: OobCmd, out: &Out) -> Result<(), Error> {
         OobCmd::Status => {
             let store = Store::open(project)?;
             let state = running(&store)?;
-            let (payloads, interactions, unmatched) = store.oob_counts()?;
+            let (payloads, interactions, unmatched, dropped) = store.oob_counts()?;
             let data = json!({
                 "running": state.is_some(),
                 "listener": state.as_ref().map(state_json),
                 "payloads": payloads,
                 "interactions": interactions,
                 "unmatched_interactions": unmatched,
+                "dropped_interactions": dropped,
+                "caps": {"interactions": oob::MAX_INTERACTIONS, "per_token": oob::MAX_PER_TOKEN},
             });
             out.ok(data, || match &state {
                 Some(s) => format!(
@@ -293,9 +303,12 @@ fn start(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Error> {
         }
         if let Some(state) = oob::read_state(&store)?.filter(|s| s.pid == child.id()) {
             out.ok(state_json(&state), || {
-                format!("OOB listener on {} (pid {}), payload host {}", state.tcp_listen, state.pid, {
-                    state.endpoint.payload_for("bpEXAMPLETOKEN".into()).host
-                })
+                let host = state.endpoint.payload_for("bpEXAMPLETOKEN".into()).host;
+                let mut t = format!("OOB listener on {} (pid {}), payload host {host}", state.tcp_listen, state.pid);
+                if let Some(w) = exposure_warning(&state) {
+                    t.push_str(&format!("\nwarning: {w}"));
+                }
+                t
             });
             return Ok(());
         }
@@ -374,9 +387,13 @@ fn run_foreground(project: &Path, args: OobRunArgs, out: &Out) -> Result<(), Err
             public_ip: public_ip.map(|i| i.to_string()),
             endpoint,
             log: args.log.clone(),
+            start_time: start_time(std::process::id()),
         };
         store.meta_set(STATE_KEY, Some(&serde_json::to_string(&state).unwrap_or_default()))?;
-        out.ok(state_json(&state), || format!("OOB listener on {addr}"));
+        out.ok(state_json(&state), || match exposure_warning(&state) {
+            Some(w) => format!("OOB listener on {addr}\nwarning: {w}"),
+            None => format!("OOB listener on {addr}"),
+        });
 
         let shutdown = async {
             use tokio::signal::unix::{signal, SignalKind};

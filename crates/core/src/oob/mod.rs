@@ -23,6 +23,24 @@ use crate::store::Store;
 /// `meta` key holding the running listener's [`OobState`].
 pub const STATE_KEY: &str = "oob.state";
 
+/// Stored interactions per project; beyond it they are counted, not stored.
+pub const MAX_INTERACTIONS: i64 = 10_000;
+/// Stored interactions per token (repeated DNS lookups and retries stay well below).
+pub const MAX_PER_TOKEN: i64 = 100;
+/// `meta` counters: interactions without a registered token, and ones over the caps.
+const UNMATCHED_KEY: &str = "oob.unmatched";
+const DROPPED_KEY: &str = "oob.dropped";
+
+/// What [`Store::oob_add_interaction`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recorded {
+    Stored(i64),
+    /// Carried a registered token, but a cap was reached; counted.
+    Dropped,
+    /// No registered token; nothing stored or counted.
+    Unknown,
+}
+
 /// Tokens are `bp` followed by this many base32 characters.
 const TOKEN_RANDOM: usize = 18;
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
@@ -112,6 +130,10 @@ pub struct OobState {
     pub public_ip: Option<String>,
     pub endpoint: Endpoint,
     pub log: Option<std::path::PathBuf>,
+    /// The listener's process start time, so a later process reusing `pid` isn't
+    /// taken for it. States written by older versions lack it.
+    #[serde(default)]
+    pub start_time: Option<u64>,
 }
 
 /// One payload: put `host` or `url` into an attack.
@@ -262,24 +284,63 @@ impl Store {
         Ok(())
     }
 
-    /// Records a received interaction; the token is the first registered one in
-    /// `raw`, else the first token-shaped string.
-    pub fn oob_add_interaction(&self, protocol: &str, remote: &str, summary: &str, raw: &[u8]) -> Result<i64> {
-        let tokens = find_tokens(raw);
-        let mut token = tokens.first().cloned();
-        for t in &tokens {
+    /// Records a received interaction if it carries a registered token (the first one in
+    /// `raw`) and the caps allow it. Anything without one is unauthenticated noise
+    /// (scanners, attackers) and is not stored: the caller retries or counts it with
+    /// [`Store::oob_count_unmatched`].
+    pub fn oob_add_interaction(&self, protocol: &str, remote: &str, summary: &str, raw: &[u8]) -> Result<Recorded> {
+        self.oob_add_capped(protocol, remote, summary, raw, MAX_INTERACTIONS, MAX_PER_TOKEN)
+    }
+
+    fn oob_add_capped(
+        &self,
+        protocol: &str,
+        remote: &str,
+        summary: &str,
+        raw: &[u8],
+        max_rows: i64,
+        max_per_token: i64,
+    ) -> Result<Recorded> {
+        let mut token = None;
+        for t in find_tokens(raw) {
             let known: Option<i64> =
-                self.conn.query_row("SELECT 1 FROM oob_payloads WHERE token = ?1", [t], |r| r.get(0)).optional()?;
+                self.conn.query_row("SELECT 1 FROM oob_payloads WHERE token = ?1", [&t], |r| r.get(0)).optional()?;
             if known.is_some() {
-                token = Some(t.clone());
+                token = Some(t);
                 break;
             }
+        }
+        let Some(token) = token else { return Ok(Recorded::Unknown) };
+        // A target that got a payload knows its token and can replay it: cap per token
+        // and per project so the project file can't be filled.
+        let (rows, for_token): (i64, i64) = self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM oob_interactions), (SELECT COUNT(*) FROM oob_interactions WHERE token = ?1)",
+            [&token],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if rows >= max_rows || for_token >= max_per_token {
+            self.oob_bump(DROPPED_KEY)?;
+            return Ok(Recorded::Dropped);
         }
         self.conn.execute(
             "INSERT INTO oob_interactions (protocol, remote, token, summary, raw) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![protocol, remote, token, summary, raw],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(Recorded::Stored(self.conn.last_insert_rowid()))
+    }
+
+    /// Counts an interaction that carried no registered token.
+    pub fn oob_count_unmatched(&self) -> Result<()> {
+        self.oob_bump(UNMATCHED_KEY)
+    }
+
+    fn oob_bump(&self, key: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, '1')
+             ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+            [key],
+        )?;
+        Ok(())
     }
 
     /// Interactions after `since`, newest last, with their payload's details.
@@ -326,14 +387,17 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// (payloads, interactions, interactions without a known token).
-    pub fn oob_counts(&self) -> Result<(i64, i64, i64)> {
+    /// (payloads, stored interactions, interactions without a known token (not stored,
+    /// plus rows older versions kept), interactions dropped by the caps).
+    pub fn oob_counts(&self) -> Result<(i64, i64, i64, i64)> {
         Ok(self.conn.query_row(
             "SELECT (SELECT COUNT(*) FROM oob_payloads), (SELECT COUNT(*) FROM oob_interactions),
                     (SELECT COUNT(*) FROM oob_interactions i WHERE NOT EXISTS
-                        (SELECT 1 FROM oob_payloads p WHERE p.token = i.token))",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        (SELECT 1 FROM oob_payloads p WHERE p.token = i.token))
+                    + COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?1), 0),
+                    COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?2), 0)",
+            [UNMATCHED_KEY, DROPPED_KEY],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?)
     }
 
@@ -548,29 +612,31 @@ mod tests {
             .unwrap();
         let manual = new_token().unwrap();
         store.oob_add_manual_payload(&manual, Some("by hand")).unwrap();
-        // Two DNS lookups of the scan token, one manual hit, one stray.
+        // Two DNS lookups of the scan token, one manual hit, strays (not stored).
         let q = format!("A {tok}.oob.test");
         store.oob_add_interaction("dns", "10.0.0.1:5353", &q, q.as_bytes()).unwrap();
         store.oob_add_interaction("dns", "10.0.0.2:5353", &q, q.as_bytes()).unwrap();
         store.oob_add_interaction("http", "10.0.0.1:1", "GET /", format!("GET /{manual}").as_bytes()).unwrap();
-        store.oob_add_interaction("tcp", "10.0.0.9:1", "junk", b"junk").unwrap();
+        assert_eq!(store.oob_add_interaction("tcp", "10.0.0.9:1", "junk", b"junk").unwrap(), Recorded::Unknown);
+        let unknown = new_token().unwrap();
+        assert_eq!(store.oob_add_interaction("tcp", "10.0.0.9:1", "x", unknown.as_bytes()).unwrap(), Recorded::Unknown);
+        store.oob_count_unmatched().unwrap();
 
         let lookup = |r: &str| (r == "40043-1").then_some(&DEF);
         let c = correlate(&mut store, lookup).unwrap();
-        assert_eq!((c.interactions, c.matched, c.new_findings), (4, 2, 1), "{c:?}");
+        assert_eq!((c.interactions, c.matched, c.new_findings), (3, 2, 1), "{c:?}");
         assert_eq!(c.raised, vec!["40043-1", "40043-1"]);
         // Nothing left to process.
         let c = correlate(&mut store, lookup).unwrap();
         assert_eq!((c.interactions, c.matched), (0, 0));
 
         let all = store.oob_interactions(0, None, 10, 100).unwrap();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 3);
         assert_eq!(all[0]["payload"]["alert_ref"], "40043-1");
         assert!(all[0]["payload"]["history_id"].as_i64().is_some());
         assert_eq!(all[2]["payload"]["note"], "by hand");
-        assert!(all[3]["payload"].is_null());
         assert_eq!(store.oob_interactions(2, Some(&tok), 10, 100).unwrap().len(), 0);
-        assert_eq!(store.oob_counts().unwrap(), (2, 4, 1));
+        assert_eq!(store.oob_counts().unwrap(), (2, 3, 1, 0));
 
         let ro = store
             .query("SELECT param, evidence, other_info FROM findings WHERE alert_ref = '40043-1'", &[], 10, 1000)
@@ -579,6 +645,24 @@ mod tests {
         assert_eq!(ro.rows[0][0], "q");
         assert_eq!(ro.rows[0][1], "");
         assert!(ro.rows[0][2].as_str().unwrap().contains("Received dns interaction from 10.0.0.1:5353"));
+    }
+
+    #[test]
+    fn interactions_are_capped_per_token_and_project() {
+        let store = Store::open_in_memory().unwrap();
+        let (a, b, c) = (new_token().unwrap(), new_token().unwrap(), new_token().unwrap());
+        for t in [&a, &b, &c] {
+            store.oob_add_manual_payload(t, None).unwrap();
+        }
+        let add = |t: &str| store.oob_add_capped("http", "10.0.0.1:1", "GET /", t.as_bytes(), 5, 3).unwrap();
+        // Per token: a replayed token stops being stored after 3.
+        let got: Vec<bool> = (0..4).map(|_| matches!(add(&a), Recorded::Stored(_))).collect();
+        assert_eq!(got, [true, true, true, false]);
+        // Per project: 5 rows in all.
+        assert!(matches!(add(&b), Recorded::Stored(_)));
+        assert!(matches!(add(&b), Recorded::Stored(_)));
+        assert_eq!(add(&c), Recorded::Dropped);
+        assert_eq!(store.oob_counts().unwrap(), (3, 5, 0, 2));
     }
 
     #[test]

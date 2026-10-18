@@ -25,7 +25,7 @@ pub enum BrowserCmd {
         /// Browser id from `browser list` (default: the first one found, Chromium-based first).
         #[arg(long)]
         browser: Option<String>,
-        /// Page to open.
+        /// Page to open: an http(s) URL or about:blank.
         url: Option<String>,
     },
 }
@@ -104,6 +104,8 @@ pub fn browser(project: &Path, home: &Path, cmd: BrowserCmd, out: &Out) -> Resul
             Ok(())
         }
         BrowserCmd::Open { browser, url } => {
+            let page = url.unwrap_or_else(|| "about:blank".into());
+            check_url(&page)?;
             let b = match &browser {
                 Some(id) => found.iter().find(|f| f.id == id).ok_or_else(|| {
                     let ids: Vec<&str> = found.iter().map(|f| f.id).collect();
@@ -127,7 +129,6 @@ pub fn browser(project: &Path, home: &Path, cmd: BrowserCmd, out: &Out) -> Resul
             let (port, host) = proxy.rsplit_once(':').map(|(h, p)| (p.to_string(), h.to_string())).unwrap_or_default();
             let profile = profile_dir(project, b.id);
             std::fs::create_dir_all(&profile)?;
-            let page = url.unwrap_or_else(|| "about:blank".into());
             let mut cmd = Command::new(&b.path);
             let mut note = Value::Null;
             match b.kind {
@@ -143,6 +144,8 @@ pub fn browser(project: &Path, home: &Path, cmd: BrowserCmd, out: &Out) -> Resul
                         .args(["--disable-component-update", "--disable-sync", "--disable-domain-reliability"])
                         .args(["--disable-client-side-phishing-detection", "--disable-default-apps", "--no-pings"])
                         .arg("--disable-features=OptimizationHints,MediaRouter,Translate,AutofillServerCommunication")
+                        // Everything after `--` is a URL to Chromium, never a switch.
+                        .arg("--")
                         .arg(&page);
                 }
                 Kind::Firefox => {
@@ -174,6 +177,18 @@ pub fn browser(project: &Path, home: &Path, cmd: BrowserCmd, out: &Out) -> Resul
             out.ok(data, || format!("{} started through the proxy at http://{proxy}", b.name));
             Ok(())
         }
+    }
+}
+
+/// Only http(s) URLs and about:blank: anything else (`--renderer-cmd-prefix=...`,
+/// `-profile`, `file:`, `javascript:`) could be read as a launch switch or open local files.
+fn check_url(url: &str) -> Result<(), Error> {
+    let lower = url.to_ascii_lowercase();
+    let web = (lower.starts_with("http://") || lower.starts_with("https://")) && url.len() > "https://".len();
+    if (web || lower == "about:blank") && !url.starts_with('-') && !url.chars().any(char::is_control) {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!("can only open http(s) URLs or about:blank, not {url:?}")))
     }
 }
 
@@ -223,6 +238,25 @@ mod tests {
     #[test]
     fn profile_next_to_project() {
         assert_eq!(profile_dir(Path::new("/w/acme.bpdb"), "chrome"), Path::new("/w/acme.bpdb.browsers/chrome"));
+    }
+
+    #[test]
+    fn only_web_urls_are_opened() {
+        for ok in ["https://app.test/", "HTTP://a.test:8080/x?y=1", "about:blank"] {
+            assert!(check_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "--renderer-cmd-prefix=/usr/bin/touch /tmp/pwned",
+            "-profile",
+            "--user-data-dir=/home/u/.config/chromium",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "http://",
+            "https://a.test/\n--x",
+            "",
+        ] {
+            assert!(check_url(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

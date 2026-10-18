@@ -2,6 +2,7 @@
 //! for clients to send their token (HTTP 200, LDAP bind success, DNS answers
 //! with our own address). It never opens outbound connections.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::Instant;
 
+use super::{find_tokens, Recorded};
 use crate::error::{Error, Result};
 use crate::store::Store;
 
@@ -19,6 +21,10 @@ use crate::store::Store;
 pub const MAX_RECORD: usize = 16 * 1024;
 const CONN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 128;
+/// How long an interaction with an unregistered token waits for its payload to be registered.
+const HOLD: Duration = Duration::from_secs(60);
+/// Interactions waiting for that at once (at most 16 KiB each).
+const MAX_PENDING: usize = 256;
 const HTTP_REPLY: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
@@ -38,7 +44,8 @@ struct Interaction {
     raw: Vec<u8>,
 }
 
-/// Serves until `shutdown` resolves; every interaction is written to the project.
+/// Serves until `shutdown` resolves; interactions carrying a registered token are written
+/// to the project (within its caps), the rest only counted.
 pub async fn serve(
     tcp: TcpListener,
     dns: Option<UdpSocket>,
@@ -48,9 +55,42 @@ pub async fn serve(
     let (tx, rx) = mpsc::channel::<Interaction>();
     let store = Store::open(&opts.project)?;
     let writer = std::thread::spawn(move || {
-        while let Ok(i) = rx.recv() {
-            if let Err(e) = store.oob_add_interaction(i.protocol, &i.remote.to_string(), &i.summary, &i.raw) {
-                eprintln!("oob: cannot record interaction: {e}");
+        // A scan registers its payload once the attack's response is in, so a callback
+        // can arrive before its token is known: token-shaped ones wait up to HOLD.
+        // ponytail: oldest dropped beyond MAX_PENDING, so a flood of fake tokens can
+        // push out an early real callback; a per-remote quota would fix that.
+        let mut pending: VecDeque<(std::time::Instant, Interaction)> = VecDeque::new();
+        loop {
+            let next = rx.recv_timeout(Duration::from_secs(1));
+            let closed = matches!(next, Err(mpsc::RecvTimeoutError::Disconnected));
+            if let Ok(i) = next {
+                if find_tokens(&i.raw).is_empty() {
+                    count_unmatched(&store);
+                } else {
+                    pending.push_back((std::time::Instant::now() + HOLD, i));
+                }
+            }
+            while pending.len() > MAX_PENDING {
+                pending.pop_front();
+                count_unmatched(&store);
+            }
+            let now = std::time::Instant::now();
+            pending.retain(|(until, i)| {
+                match store.oob_add_interaction(i.protocol, &i.remote.to_string(), &i.summary, &i.raw) {
+                    Ok(Recorded::Unknown) if !closed && now < *until => true,
+                    Ok(Recorded::Unknown) => {
+                        count_unmatched(&store);
+                        false
+                    }
+                    Ok(_) => false,
+                    Err(e) => {
+                        eprintln!("oob: cannot record interaction: {e}");
+                        false
+                    }
+                }
+            });
+            if closed {
+                break;
             }
         }
     });
@@ -95,6 +135,12 @@ pub async fn serve(
         .await
         .map_err(|e| Error::Protocol(e.to_string()))?
         .map_err(|_| Error::Protocol("oob writer panicked".into()))
+}
+
+fn count_unmatched(store: &Store) {
+    if let Err(e) = store.oob_count_unmatched() {
+        eprintln!("oob: cannot count interaction: {e}");
+    }
 }
 
 /// Reads once into `buf` (up to MAX_RECORD); false on EOF, error, or timeout.
@@ -359,6 +405,16 @@ mod tests {
         let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf)).await.unwrap().unwrap();
         assert_eq!(&buf[n - 4..n], &[127, 0, 0, 1]);
 
+        // Unauthenticated noise: counted, never stored.
+        let mut s = TcpStream::connect(tcp_addr).await.unwrap();
+        s.write_all(b"GET /wp-login.php HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        s.read_to_end(&mut Vec::new()).await.unwrap();
+
+        // The token is registered after its callbacks arrived (as a scan does once the
+        // attack's response is in): they were held, not dropped.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        store.oob_add_manual_payload(&tok, None).unwrap();
+
         // Wait for all three to be written.
         let deadline = Instant::now() + Duration::from_secs(10);
         let rows = loop {
@@ -374,6 +430,7 @@ mod tests {
         assert_eq!(http["summary"], format!("GET /{tok} HTTP/1.1 (Host: cb.test)"));
         let _ = stop_tx.send(());
         server.await.unwrap().unwrap();
+        assert_eq!(store.oob_counts().unwrap(), (1, 3, 1, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

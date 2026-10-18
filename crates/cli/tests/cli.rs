@@ -522,3 +522,46 @@ fn scan_active_skips_state_changing_methods_by_default() {
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["data"]["targets"], 1, "{v}");
 }
+
+#[test]
+fn stop_never_signals_a_process_it_cannot_verify() {
+    use brainproxy_core::store::Store;
+    use serde_json::json;
+    let project = tmp_project("pids");
+    let set = |key: &str, v: &Value| Store::open(&project).unwrap().meta_set(key, Some(&v.to_string())).unwrap();
+    let proxy = |pid: u64, start: Option<u64>| json!({"pid": pid, "listen": "127.0.0.1:1", "started": "0", "ca_cert": "/x", "log": null, "start_time": start});
+    let oob = |pid: u64| {
+        json!({"pid": pid, "started": "0", "tcp_listen": "127.0.0.1:1", "dns_listen": null, "public_ip": null,
+               "endpoint": {"domain": null, "public_host": "127.0.0.1", "public_port": 1}, "log": null})
+    };
+    // kill(-1) / kill(0) / init, and a reused pid (this test, with another start time):
+    // none is taken for a running proxy or listener, so nothing gets signalled.
+    let me = std::process::id() as u64;
+    for (pid, start) in [(4294967295, None), (0, None), (1, None), (me, Some(1))] {
+        set("proxy.state", &proxy(pid, start));
+        let (_, v) = run(&["proxy", "status"], &project, None);
+        assert_eq!(v["data"]["running"], false, "{pid}: {v}");
+        set("proxy.state", &proxy(pid, start));
+        let (code, v) = run(&["proxy", "stop"], &project, None);
+        assert_eq!((code, v["error"]["kind"].as_str()), (4, Some("not_found")), "{pid}: {v}");
+        let mut o = oob(pid);
+        o["start_time"] = json!(start);
+        set("oob.state", &o);
+        let (code, v) = run(&["oob", "stop"], &project, None);
+        assert_eq!((code, v["error"]["kind"].as_str()), (4, Some("not_found")), "{pid}: {v}");
+    }
+    // State from an older version (no start time) for a live process that ignores
+    // SIGTERM: it gets SIGTERM, never SIGKILL, and the user is told.
+    let mut child = Command::new("sh").args(["-c", "trap '' TERM; sleep 30"]).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    set("oob.state", &oob(child.id() as u64));
+    let (_, v) = run(&["oob", "status"], &project, None);
+    assert_eq!(v["data"]["running"], true, "old state is still read: {v}");
+    set("proxy.state", &proxy(child.id() as u64, None));
+    let (_, v) = run(&["proxy", "stop"], &project, None);
+    assert_eq!(v["error"]["kind"], "conflict", "{v}");
+    assert!(v["error"]["message"].as_str().unwrap().contains("not sending SIGKILL"), "{v}");
+    assert!(child.try_wait().unwrap().is_none(), "the unverified process was killed");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}

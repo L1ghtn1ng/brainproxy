@@ -7,7 +7,7 @@ back to us.
 ## Shape
 
 ```
-brainproxy oob start [--http-listen 0.0.0.0:8880] [--dns-listen 0.0.0.0:53 --domain oob.example.com]
+brainproxy oob start [--listen 0.0.0.0:8880] [--dns-listen 0.0.0.0:53 --domain oob.example.com]
                      [--public-host H] [--public-port P] [--public-ip IP]
 brainproxy oob run     # same, in the foreground
 brainproxy oob status | stop
@@ -18,13 +18,22 @@ brainproxy scan active ... [--oob-wait SECS] [--no-oob]
 
 - **Listener** (`crates/core/src/oob/server.rs`) runs in one background process per
   project, like the proxy (state in `meta` key `oob.state`). It only receives:
-  - TCP (`--http-listen`): HTTP requests get an empty `200`; an LDAP bind (first byte
+  - TCP (`--listen`): HTTP requests get an empty `200`; an LDAP bind (first byte
     `0x30`, what JNDI sends for `ldap://`) gets a minimal bind-success so the client goes
     on to send the search request whose DN carries the token; a TLS ClientHello (`https://`
     payloads) is recorded for its SNI and closed. Anything else is recorded as `tcp`.
-  - UDP DNS (`--dns-listen`, needs `--domain`): every query is recorded; names under the
+  - UDP DNS (`--dns-listen`, needs `--domain`): every query is answered; names under the
     domain get an `A`/`AAAA` answer with `--public-ip` (TTL 0), others `REFUSED`.
-  - Bounded: 16 KiB recorded per interaction, 5 s per connection, 128 connections at once.
+  - Only interactions carrying a registered token are stored. One with a token-shaped
+    string that isn't registered yet waits up to 60 s (scans register a payload once the
+    attack's response is in); the rest, such as internet scanners, is only counted
+    (`oob status`: `unmatched_interactions`).
+  - Bounded: 16 KiB recorded per interaction, 5 s per connection, 128 connections at once,
+    100 stored interactions per token and 10,000 per project; beyond that they are counted
+    (`dropped_interactions`).
+  - The TCP listener binds `0.0.0.0:8880` by default because targets must reach it.
+    `start`/`run`/`status` then carry a `warning`; pass `--listen 127.0.0.1:8880` for
+    local targets.
 - **Reachability / NAT**: payloads use the public names, not the listen address.
   - DNS mode (`--domain`): payload host is `<token>.<domain>` (delegate the domain's NS to
     the runner, or point a wildcard A record at it). URLs are `http://<token>.<domain>[:port]/`.
