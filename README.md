@@ -2,7 +2,7 @@
 
 A fast, AI-first web security testing toolkit written in Rust. Some UI elements are modelled
 on other apps, and the scan rules are ported from OWASP ZAP (Apache 2.0, see NOTICE). Its main
-operator is an LLM: **Braintruder** drives it through a Kali runner. Every feature is a
+operator is an AI pentesting platform: **Braintruder** drives it through a Kali runner. Every feature is a
 non-interactive CLI command with structured JSON output, and a desktop app for macOS and
 Linux runs on the same engine.
 
