@@ -211,8 +211,10 @@ fn concurrent_calls_and_cancellation() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (closed_tx, closed) = std::sync::mpsc::channel();
+    let (connected_tx, connected) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let (mut s, _) = listener.accept().unwrap();
+        let _ = connected_tx.send(());
         let mut buf = [0u8; 4096];
         while s.read(&mut buf).is_ok_and(|n| n > 0) {}
         let _ = closed_tx.send(());
@@ -232,7 +234,9 @@ fn concurrent_calls_and_cancellation() {
     m.send_line(&json!({"jsonrpc": "2.0", "id": "slow", "method": "tools/call", "params": hang}).to_string());
     assert_eq!(m.read()["error"]["code"], -32600);
 
-    // Cancelled: the child is killed and no response is sent for it.
+    // Cancelled: the child is killed and no response is sent for it. Wait for it to connect
+    // first, or a cancel that wins the race leaves nothing to hang up (slow starts on Windows).
+    connected.recv_timeout(std::time::Duration::from_secs(20)).expect("send never connected");
     let started = std::time::Instant::now();
     m.send_line(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"slow"}}"#);
     closed.recv_timeout(std::time::Duration::from_secs(5)).expect("cancelled send still connected");
