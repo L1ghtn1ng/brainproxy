@@ -21,7 +21,9 @@ Tagged releases also attach the desktop GUI with the CLI bundled inside:
 `brainproxy-gui-macos-arm64.dmg`, `brainproxy-gui-linux-x86_64.deb` / `.AppImage`, and
 `brainproxy-gui-windows-x86_64.msi` / `-setup.exe`. The apps aren't signed yet: on macOS open
 the app the first time with right-click → Open; on Windows choose More info → Run anyway. The
-command line alone for Windows is `brainproxy-windows-x86_64.exe`. See
+command line alone for Windows is `brainproxy-windows-x86_64.exe`; the bundled one is
+`C:\Program Files\brainproxy\brainproxy.exe` (`.msi`) or `%LOCALAPPDATA%\brainproxy\brainproxy.exe`
+(`-setup.exe`). See
 [docs/GUI.md](docs/GUI.md).
 
 | Site map | Replay | Fuzzer |
