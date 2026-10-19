@@ -63,8 +63,9 @@ jobs:
         run: |
           bin=target/${{ matrix.target }}/release/brainproxy
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            sudo apt-get install -y qemu-user-static
-            run="qemu-aarch64-static $bin"
+            # Newer Ubuntu images ship qemu-user only (static, no -static suffix).
+            sudo apt-get install -y qemu-user
+            run="qemu-aarch64 $bin"
           else
             run="$bin"
           fi
