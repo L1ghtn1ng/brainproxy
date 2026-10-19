@@ -4,7 +4,7 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: daily
     # Let a release age a week before adopting it (security updates skip this).
     cooldown:
       default-days: 7
@@ -25,7 +25,7 @@ updates:
       - /
       - /gui/src-tauri
     schedule:
-      interval: weekly
+      interval: daily
     cooldown:
       default-days: 7
     groups:
@@ -41,7 +41,7 @@ updates:
   - package-ecosystem: npm
     directory: /gui
     schedule:
-      interval: weekly
+      interval: daily
     cooldown:
       default-days: 7
     groups:
