@@ -8,18 +8,31 @@ on:
   # Manual runs build the desktop bundles without publishing a release.
   workflow_dispatch:
 
+# Read-only by default; the jobs that publish release assets ask for more.
 permissions:
-  contents: write
+  contents: read
+
+# A newer push to the same PR supersedes the running checks; main and tags always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
@@ -27,6 +40,9 @@ jobs:
   static:
     needs: check
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # upload release assets on tags
     strategy:
       fail-fast: false
       matrix:
@@ -35,19 +51,27 @@ jobs:
             asset: brainproxy-linux-x86_64
           - target: aarch64-unknown-linux-musl
             asset: brainproxy-linux-arm64
+    env:
+      TARGET: ${{ matrix.target }}
+      ASSET: ${{ matrix.asset }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET" --no-self-update
+          rustup default stable
+      # No cache on release builds, so a poisoned cache can't reach published binaries.
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
       - name: Build (x86_64, musl-gcc)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           sudo apt-get update && sudo apt-get install -y musl-tools
-          make static TARGET=${{ matrix.target }}
+          make static TARGET="$TARGET"
       - name: Build (arm64, zig as cross C compiler)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
@@ -56,8 +80,8 @@ jobs:
           make static-arm64
       - name: Smoke test
         run: |
-          bin=target/${{ matrix.target }}/release/brainproxy
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+          bin="target/$TARGET/release/brainproxy"
+          if [ "$TARGET" = "aarch64-unknown-linux-musl" ]; then
             sudo apt-get install -y qemu-user-static
             run="qemu-aarch64-static $bin"
           else
@@ -68,16 +92,16 @@ jobs:
           $run --format json --project /tmp/smoke.bpdb capabilities > /dev/null
           $run --format json --project /tmp/smoke.bpdb engagement start --target 127.0.0.1
       - run: |
-          cp target/${{ matrix.target }}/release/brainproxy ${{ matrix.asset }}
-          sha256sum ${{ matrix.asset }} > ${{ matrix.asset }}.sha256
-      - uses: actions/upload-artifact@v4
+          cp "target/$TARGET/release/brainproxy" "$ASSET"
+          sha256sum "$ASSET" > "$ASSET.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.asset }}
           path: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
       - if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             ${{ matrix.asset }}
@@ -86,12 +110,15 @@ jobs:
   # The desktop GUI (gui/): type-check and build the frontend on every push.
   gui-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: gui
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
@@ -105,6 +132,9 @@ jobs:
     needs: [check, gui-check]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: write # upload release assets on tags
     strategy:
       fail-fast: false
       matrix:
@@ -115,21 +145,29 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset: brainproxy-gui-linux-x86_64
+    env:
+      TARGET: ${{ matrix.target }}
+      ASSET: ${{ matrix.asset }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET" --no-self-update
+          rustup default stable
+      # No caches on release builds, so a poisoned cache can't reach published bundles.
+      - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: gui-${{ matrix.target }}
           workspaces: |
             . -> target
             gui/src-tauri -> target
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
-          cache: npm
+          cache: ${{ !startsWith(github.ref, 'refs/tags/') && 'npm' || '' }}
           cache-dependency-path: gui/package-lock.json
       - name: Linux webview dependencies
         if: runner.os == 'Linux'
@@ -138,31 +176,31 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - name: Build the CLI sidecar
         run: |
-          cargo build --release --target ${{ matrix.target }} -p brainproxy
+          cargo build --release --target "$TARGET" -p brainproxy
           mkdir -p gui/src-tauri/binaries
-          cp target/${{ matrix.target }}/release/brainproxy gui/src-tauri/binaries/brainproxy-${{ matrix.target }}
+          cp "target/$TARGET/release/brainproxy" "gui/src-tauri/binaries/brainproxy-$TARGET"
       - run: npm ci
         working-directory: gui
       - name: Bundle
         working-directory: gui
         # externalBin only here, so local `cargo tauri dev` needs no sidecar file.
-        run: npx tauri build --target ${{ matrix.target }} --config '{"bundle":{"externalBin":["binaries/brainproxy"]}}'
+        run: npx tauri build --target "$TARGET" --config '{"bundle":{"externalBin":["binaries/brainproxy"]}}'
       - name: Collect bundles
         run: |
-          dir=gui/src-tauri/target/${{ matrix.target }}/release/bundle
+          dir="gui/src-tauri/target/$TARGET/release/bundle"
           mkdir -p out
-          if [ "${{ runner.os }}" = macOS ]; then
-            cp "$dir"/dmg/*.dmg out/${{ matrix.asset }}.dmg
+          if [ "$RUNNER_OS" = macOS ]; then
+            cp "$dir"/dmg/*.dmg "out/$ASSET.dmg"
           else
-            cp "$dir"/deb/*.deb out/${{ matrix.asset }}.deb
-            cp "$dir"/appimage/*.AppImage out/${{ matrix.asset }}.AppImage
+            cp "$dir"/deb/*.deb "out/$ASSET.deb"
+            cp "$dir"/appimage/*.AppImage "out/$ASSET.AppImage"
           fi
           cd out && for f in *; do shasum -a 256 "$f" > "$f.sha256"; done && ls -la
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.asset }}
           path: out/*
       - if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: out/*
