@@ -135,7 +135,7 @@ to the app executable as `brainproxy`, where the shell looks first. Assets:
 | `brainproxy-gui-linux-x86_64.deb`, `.AppImage` | Linux x86_64 (needs WebKitGTK 4.1) |
 
 Each has a `.sha256`. The macOS app is not signed or notarized: after copying it to
-Applications, open it once with right-click → Open, or run
+Applications, open it once, then choose System Settings → Privacy & Security → Open Anyway, or run
 `xattr -dr com.apple.quarantine /Applications/brainproxy.app`.
 
 The same bundle locally (macOS):
