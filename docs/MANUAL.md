@@ -27,7 +27,7 @@ Downloads are on the GitHub release page. Each file has a `.sha256` next to it.
 | Command line only on Windows | `brainproxy-windows-x86_64.exe` |
 
 - **macOS:** open the `.dmg` and drag brainproxy to Applications. The app isn't signed
-  yet, so open it the first time with right-click → Open, or run
+  yet: open it once, then choose System Settings → Privacy & Security → Open Anyway, or run
   `xattr -dr com.apple.quarantine /Applications/brainproxy.app`.
 - **Debian/Ubuntu/Kali:** `sudo apt install ./brainproxy-gui-linux-x86_64.deb`. This installs
   WebKitGTK if it is missing and adds a menu entry.
@@ -348,4 +348,4 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | A scan finds little | Make sure it covers the site: use *Crawl and audit*, browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |
 | Windows says "Windows protected your PC" | The installer isn't signed yet: More info → Run anyway. |
 | Windows: tools other than the opened browser reject the CA | `brainproxy ca install-system` adds it to your user's Trusted Root store (Windows asks you to confirm). Firefox keeps its own store; import it there. |
-| macOS says the app can't be opened | Right-click → Open the first time, or run the `xattr` command in [Install](#install). |
+| macOS says the app can't be opened or is damaged | System Settings → Privacy & Security → Open Anyway, or run the `xattr` command in [Install](#install). |
