@@ -50,6 +50,8 @@ def ported_classes():
         classes, addons = split(m.group(1)), split(m.group(2))
         for i, cls in enumerate(classes):
             addon = addons[min(i, len(addons) - 1)]
+            # "commonlib AbstractAppFilePlugin", "the `ssti` package (TemplateFormat", "ReflectedSinkPoint)"
+            cls = re.search(r"([A-Za-z]\w*)\W*$", cls).group(1)
             found.setdefault((addon, cls), []).append(str(path.relative_to(ROOT)))
     return found
 
@@ -72,13 +74,18 @@ def main():
 
     report = {"pinned": pinned, "upstream": head, "changed": [], "missing_upstream": [], "data_changed": [], "unported": []}
     ported = ported_classes()
+    tree = git(repo, "ls-tree", "-r", "--name-only", head).splitlines()
     for (addon, cls), ours in sorted(ported.items()):
         tmpl = ADDON_JAVA.get(addon)
         if not tmpl:
             continue
+        # The class may sit in a subpackage of the add-on (ascanrules/ssti/TemplateFormat.java).
+        base = tmpl.rsplit("/", 1)[0] + "/"
         java = tmpl.format(cls)
-        exists = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{head}:{java}"], capture_output=True).returncode == 0
-        if not exists:
+        if java not in tree:
+            java = next((t for t in tree if t.startswith(base) and t.endswith(f"/{cls}.java")), None)
+        if not java:
+            java = tmpl.format(cls)
             report["missing_upstream"].append({"class": cls, "upstream_path": java, "ours": ours})
             continue
         diff = git(repo, "diff", "--stat", pinned, head, "--", java).strip()
