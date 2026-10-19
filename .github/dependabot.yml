@@ -1,0 +1,55 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Let a release age a week before adopting it (security updates skip this).
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns: ["*"]
+      github-actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  # The CLI workspace and the Tauri app are separate Cargo workspaces;
+  # one grouped PR covers both.
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /gui/src-tauri
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        applies-to: version-updates
+        patterns: ["*"]
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: npm
+    directory: /gui
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      npm:
+        applies-to: version-updates
+        patterns: ["*"]
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: deps
