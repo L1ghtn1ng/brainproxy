@@ -236,6 +236,14 @@ fn filter_and_load_dedupes() {
     assert!(!Filter { exclude_tags: vec!["exposure".into()], ..Default::default() }.keep(c));
     assert!(!Filter { min_risk: Some(Risk::High), ..Default::default() }.keep(c));
     assert!(!Filter { ids: vec!["other".into()], ..Default::default() }.keep(c));
+    // Included tags win over the other filters; a folder of that name counts too.
+    let high = Filter { min_risk: Some(Risk::High), include_tags: vec!["git".into()], ..Default::default() };
+    assert!(high.keep(c));
+    let mut in_eol = c.clone();
+    in_eol.tags.clear();
+    in_eol.file = std::path::PathBuf::from("nuclei/http/technologies/eol/x-eol.yaml");
+    assert!(Filter { min_risk: Some(Risk::High), include_tags: vec!["eol".into()], ..Default::default() }.keep(&in_eol));
+    assert!(!Filter { min_risk: Some(Risk::High), ..Default::default() }.keep(&in_eol));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -432,4 +440,22 @@ fn interactions_are_matched_against_interactsh_matchers() {
     assert!(interaction_matches(&ip, "dns", "[10.0.0.5]:53", b""));
     let neg = serde_json::json!({"matchers": [{"type": "word", "part": "interactsh_protocol", "words": ["dns"], "negative": true}]});
     assert!(interaction_matches(&neg, "http", "x:1", b"") && !interaction_matches(&neg, "dns", "x:1", b""));
+}
+
+#[test]
+fn raw_annotations() {
+    let raw = |r: &str| {
+        format!(
+            "id: t\ninfo: {{name: t, severity: high}}\nhttp:\n  - raw:\n      - |\n{}\n    matchers:\n      - type: status\n        status: [200]\n",
+            r.lines().map(|l| format!("        {l}")).collect::<Vec<_>>().join("\n")
+        )
+    };
+    let c = parse_str(&raw("@timeout: 20s\nGET / HTTP/1.1\nHost: {{Hostname}}")).unwrap();
+    assert_eq!(c.blocks[0].timeout, Some(std::time::Duration::from_secs(20)));
+    assert!(c.blocks[0].raws[0].starts_with("GET / HTTP/1.1"), "{:?}", c.blocks[0].raws[0]);
+    assert_eq!(parse_str(&raw("@timeout:5\nGET / HTTP/1.1")).unwrap().blocks[0].timeout.unwrap().as_secs(), 5);
+    assert_eq!(parse_str(&raw("@timeout 15s\nGET / HTTP/1.1")).unwrap().blocks[0].timeout.unwrap().as_secs(), 15);
+    assert_eq!(parse_str(&raw("GET / HTTP/1.1")).unwrap().blocks[0].timeout, None);
+    assert!(unsupported_reason(&raw("@Host: https://other:443\nGET / HTTP/1.1")).contains("@Host"));
+    assert!(invalid_reason(&raw("@timeout: soon\nGET / HTTP/1.1")).contains("@timeout"));
 }

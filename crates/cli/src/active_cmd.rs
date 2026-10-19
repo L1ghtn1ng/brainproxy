@@ -66,6 +66,10 @@ pub struct ActiveArgs {
     /// Skip checks with any of these tags.
     #[arg(long, value_delimiter = ',', default_value = "dos,fuzz,intrusive")]
     check_exclude_tags: Vec<String>,
+    /// Also run checks with any of these tags (or in a folder of that name), whatever
+    /// --check-severity and the other check filters say (Nuclei's -itags), e.g. eol.
+    #[arg(long, value_delimiter = ',')]
+    check_include_tags: Vec<String>,
     /// Only these check ids (comma-separated).
     #[arg(long, value_delimiter = ',')]
     check_ids: Vec<String>,
@@ -97,6 +101,10 @@ pub struct ActiveArgs {
     /// Per-request timeout in seconds.
     #[arg(long, default_value_t = 30.0)]
     timeout: f64,
+    /// Per-request timeout in seconds for `--checks` templates (at most --timeout); a
+    /// template's own `@timeout` overrides it.
+    #[arg(long, default_value_t = 10.0)]
+    check_timeout: f64,
     /// Stop the scan after this many minutes.
     #[arg(long)]
     max_minutes: Option<f64>,
@@ -188,7 +196,10 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         rules: (!args.rules.is_empty()).then(|| args.rules.clone()),
         exclude_rules: args.exclude_rules.clone(),
         no_rules: args.no_rules,
-        checks: brainproxy_core::checks::into_rules(checks),
+        checks: brainproxy_core::checks::into_rules(
+            checks,
+            Duration::from_secs_f64(args.check_timeout.clamp(0.1, args.timeout.max(0.1))),
+        ),
         max_duration: args.max_minutes.map(|m| Duration::from_secs_f64(m * 60.0)),
         auth: auth.clone(),
         oob,
@@ -297,6 +308,7 @@ fn load_checks(home: &Path, args: &ActiveArgs, oob: bool) -> Result<(Vec<checks:
         tags: args.check_tags.clone(),
         exclude_tags: args.check_exclude_tags.iter().filter(|t| !t.is_empty()).cloned().collect(),
         min_risk: args.check_severity.map(crate::scan_cmd::RiskArg::get),
+        include_tags: args.check_include_tags.clone(),
     };
     let total = loaded.checks.len();
     let selected: Vec<checks::Check> = loaded.checks.iter().filter(|c| filter.keep(c)).cloned().collect();

@@ -636,3 +636,129 @@ fn proxy_serves_http2() {
     let (version, status, body) = curl_version(&proxy, &env.ca(), &url, &["--http2"]);
     assert_eq!((version.as_str(), status), ("1.1", 200), "{body}");
 }
+
+/// A small app with a CSRF-protected login form and a session cookie. Returns its port.
+fn spawn_login_app() -> u16 {
+    use std::collections::HashSet;
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let state = Arc::new(Mutex::new((HashSet::<String>::new(), HashSet::<String>::new(), 0u32))); // (csrf, sessions, n)
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let req = loop {
+                    let n = s.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse().unwrap_or(0))
+                            })
+                            .unwrap_or(0usize);
+                        if buf.len() >= end + 4 + len || n == 0 {
+                            break text;
+                        }
+                    } else if n == 0 {
+                        break text;
+                    }
+                };
+                let line = req.lines().next().unwrap_or("").to_string();
+                let cookie = req
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Cookie: ").or_else(|| l.strip_prefix("cookie: ")))
+                    .unwrap_or("");
+                let sid = cookie.split(';').find_map(|c| c.trim().strip_prefix("sid=")).unwrap_or("").to_string();
+                let body = req.split_once("\r\n\r\n").map(|x| x.1).unwrap_or("").to_string();
+                let mut st = state.lock().unwrap();
+                st.2 += 1;
+                let n = st.2;
+                let page = |extra: &str, html: &str| {
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len())
+                };
+                let form = |st: &mut (HashSet<String>, HashSet<String>, u32)| {
+                    let token = format!("t0k{:08x}{n}", n.wrapping_mul(2654435761));
+                    st.0.insert(token.clone());
+                    page(
+                        &format!("Set-Cookie: sid=anon{n}; Path=/\r\n"),
+                        &format!(
+                            r#"<form method=post action=/login><input type=hidden name=csrf value="{token}"><input name=user><input type=password name=pass></form>"#
+                        ),
+                    )
+                };
+                let resp = if line.starts_with("GET /login") {
+                    form(&mut st)
+                } else if line.starts_with("POST /login") {
+                    let f: std::collections::HashMap<_, _> =
+                        body.split('&').filter_map(|p| p.split_once('=')).collect();
+                    if f.get("user") == Some(&"alice")
+                        && f.get("pass") == Some(&"Wonder-1")
+                        && st.0.remove(*f.get("csrf").unwrap_or(&""))
+                    {
+                        let live = format!("live{n}");
+                        st.1.insert(live.clone());
+                        format!("HTTP/1.1 302 Found\r\nLocation: /account\r\nSet-Cookie: sid={live}; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    } else {
+                        form(&mut st)
+                    }
+                } else if line.starts_with("GET /account") && st.1.contains(&sid) {
+                    page("", "<p>Welcome alice</p><a href=/logout>Log out</a>")
+                } else {
+                    "HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn auth_record_turns_a_browser_login_into_a_working_profile() {
+    let env = Env::new("record");
+    let app = spawn_login_app();
+    let started = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"]);
+    let proxy = started["usage"]["proxy_url"].as_str().unwrap().to_string();
+    let jar = env.dir.join("jar.txt");
+    let jar = jar.to_str().unwrap();
+    let base = format!("http://127.0.0.1:{app}");
+
+    // The "browser": open the form, log in with its token, open the account page.
+    let (_, form) = curl(&proxy, &env.ca(), &format!("{base}/login"), &["-c", jar, "-b", jar]);
+    let token = form.split("value=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let body = format!("csrf={token}&user=alice&pass=Wonder-1");
+    let (code, _) = curl(&proxy, &env.ca(), &format!("{base}/login"), &["-c", jar, "-b", jar, "-d", &body]);
+    assert_eq!(code, 302);
+    let (code, page) = curl(&proxy, &env.ca(), &format!("{base}/account"), &["-c", jar, "-b", jar]);
+    assert_eq!((code, page.contains("Welcome alice")), (200, true));
+    // The proxy records in the background (the first page also compiles the passive rules).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while env.count("SELECT count(*) FROM history WHERE source = 'proxy'") < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let v = env.ok(&["auth", "record", "finish", "app", "--since", "0", "--save"]);
+    assert_eq!(v["mode"], "replay", "{v}");
+    let p = &v["profile"];
+    assert_eq!(p["csrf_url"], format!("{base}/login"), "{v}");
+    assert_eq!(p["check_url"], format!("{base}/account"), "{v}");
+    assert_eq!(p["username"], "alice");
+    assert_eq!(p["password"]["literal"], "********");
+
+    // The saved profile logs in by itself: a fresh token, the password, the session.
+    let login = env.ok(&["auth", "login", "app"]);
+    assert_eq!(login["login"]["success"], true, "{login}");
+    assert_eq!(login["login"]["reason"], "logged-in pattern matched", "{login}");
+    let status = env.ok(&["auth", "status", "app"]);
+    assert_eq!(status["check"]["logged_in"], true, "{status}");
+}

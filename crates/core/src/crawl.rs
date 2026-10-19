@@ -5,14 +5,13 @@
 //! site sets are kept in a per-crawl jar and sent back. Every fetched exchange is
 //! recorded (source "crawl") and passively scanned.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use regex::Regex;
 use serde::Serialize;
-use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::auth::AuthSession;
@@ -156,7 +155,30 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
         exclude: cfg.exclude.clone(),
     };
 
+    // Saving and the passive scan run on their own thread, beside the fetches.
+    let (save, saved) = std::sync::mpsc::channel::<Capture>();
     let mut store = Store::open(project)?;
+    let writer = std::thread::spawn(move || -> Result<(usize, usize)> {
+        let (mut new_findings, mut record_errors) = (0, 0);
+        while let Ok(first) = saved.recv() {
+            let mut captures = vec![first];
+            captures.extend(saved.try_iter().take(255));
+            // One unsavable exchange (e.g. a huge body) must not abort the crawl:
+            // fall back to saving one by one and count what fails.
+            if let Err(e) = store.record_batch(&captures) {
+                eprintln!("brainproxy: crawl: saving {} exchanges failed ({e}); saving one by one", captures.len());
+                for c in &captures {
+                    if let Err(e) = store.record(c) {
+                        eprintln!("brainproxy: crawl: exchange not saved: {e}");
+                        record_errors += 1;
+                    }
+                }
+            }
+            new_findings += crate::scan::passive::scan_pending(&mut store)?.new_findings;
+        }
+        Ok((new_findings, record_errors))
+    });
+
     let client = Arc::new(Client::new(cfg.send.clone()));
     // One limiter for the whole crawl: --rate holds across tasks and depths.
     let limiter = crate::scan::active::Limiter::new(cfg.rate).map(Arc::new);
@@ -167,36 +189,36 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
     let mut out_of_scope: HashSet<String> = HashSet::new();
     let jar = Arc::new(Mutex::new(CookieJar::default()));
 
-    let mut level: Vec<Req> = Vec::new();
-    let push = |req: Req, level: &mut Vec<Req>, seen: &mut HashSet<Req>| {
+    // Breadth first: a FIFO of (request, depth), with up to `concurrency` fetches in flight.
+    let mut queue: VecDeque<(Req, usize)> = VecDeque::new();
+    let push = |req: Req, depth: usize, queue: &mut VecDeque<(Req, usize)>, seen: &mut HashSet<Req>| {
         if seen.insert(req.clone()) {
-            level.push(req);
+            queue.push_back((req, depth));
         }
     };
     for u in &seeds {
-        push(Req { method: "GET".into(), url: strip_fragment(u), body: None }, &mut level, &mut seen);
+        push(Req { method: "GET".into(), url: strip_fragment(u), body: None }, 0, &mut queue, &mut seen);
         let mut origin = u.clone();
         origin.set_query(None);
         if cfg.robots {
             origin.set_path("/robots.txt");
-            push(Req { method: "GET".into(), url: origin.to_string(), body: None }, &mut level, &mut seen);
+            push(Req { method: "GET".into(), url: origin.to_string(), body: None }, 0, &mut queue, &mut seen);
         }
         if cfg.sitemap {
             origin.set_path("/sitemap.xml");
-            push(Req { method: "GET".into(), url: origin.to_string(), body: None }, &mut level, &mut seen);
+            push(Req { method: "GET".into(), url: origin.to_string(), body: None }, 0, &mut queue, &mut seen);
         }
     }
 
-    for depth in 0..=cfg.max_depth {
-        if level.is_empty() || ctl.stopped() {
-            break;
-        }
-        summary.depth_reached = depth;
-        // Enforce the page budget and per-path cap before fetching.
-        let mut batch = Vec::new();
-        for req in level.drain(..) {
-            if summary.requests + batch.len() >= cfg.max_pages {
+    let mut running = tokio::task::JoinSet::new();
+    let mut sent = 0;
+    loop {
+        // Start fetches up to the limit, within the page budget and per-path cap.
+        while running.len() < cfg.concurrency.max(1) && !ctl.stopped() {
+            let Some((req, depth)) = queue.pop_front() else { break };
+            if sent >= cfg.max_pages {
                 summary.limit_reached = true;
+                queue.clear();
                 break;
             }
             let path = Url::parse(&req.url).map(|u| u.path().to_string()).unwrap_or_default();
@@ -205,104 +227,86 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
                 continue;
             }
             *n += 1;
-            batch.push(req);
-        }
-
-        let sem = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
-        let mut tasks = Vec::new();
-        for req in &batch {
-            let (req, sem, client, headers, ctl, auth, jar, limiter) = (
-                req.clone(),
-                sem.clone(),
-                client.clone(),
-                cfg.headers.clone(),
-                ctl.clone(),
-                cfg.auth.clone(),
-                jar.clone(),
-                limiter.clone(),
-            );
-            tasks.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.ok()?;
+            sent += 1;
+            summary.depth_reached = summary.depth_reached.max(depth);
+            let (client, headers, ctl, auth, jar, limiter) =
+                (client.clone(), cfg.headers.clone(), ctl.clone(), cfg.auth.clone(), jar.clone(), limiter.clone());
+            running.spawn(async move {
                 if let Some(l) = &limiter {
                     l.wait().await;
                 }
                 if ctl.stopped() {
                     return None;
                 }
-                Some(fetch(&client, auth.as_deref(), &jar, &req, &headers).await)
+                let result = fetch(&client, auth.as_deref(), &jar, &req, &headers).await;
+                Some((req, depth, result))
+            });
+        }
+        let Some(done) = running.join_next().await else { break };
+        let Ok(Some((req, depth, (target, raw_req, outcome)))) = done else { continue };
+        summary.requests += 1;
+        let capture = match outcome {
+            Err(e) => {
+                summary.errors += 1;
+                *summary.by_status.entry("error".into()).or_default() += 1;
+                Capture::new("crawl", &target, &raw_req, None, None, Some(&e.to_string()))
+            }
+            Ok((response, ms)) => {
+                let page = Url::parse(&req.url).ok();
+                if let (Some(page), Ok(head)) = (page.as_ref(), parse_response_head(&response)) {
+                    *summary.by_status.entry(head.status.to_string()).or_default() += 1;
+                    endpoints.insert(endpoint(&req, page));
+                    let body = decode_body(&head.headers, split_head_body(&response).1);
+                    let found = if depth < cfg.max_depth {
+                        extract(page, &head.headers, &body, cfg.submit_forms)
+                    } else {
+                        vec![]
+                    };
+                    for f in found {
+                        let Ok(mut u) = Url::parse(&f.url) else { continue };
+                        fill_placeholders(&mut u);
+                        if !scope.allows(&u) {
+                            if let Some(h) = u.host_str().filter(|_| !scope.host_allowed(&u)) {
+                                if out_of_scope.len() < 50 {
+                                    out_of_scope.insert(h.to_ascii_lowercase());
+                                }
+                            }
+                            continue;
+                        }
+                        if is_static(&u) {
+                            continue;
+                        }
+                        if f.form {
+                            summary.forms_submitted += 1;
+                        }
+                        push(
+                            Req { method: f.method, url: strip_fragment(&u), body: f.body },
+                            depth + 1,
+                            &mut queue,
+                            &mut seen,
+                        );
+                    }
+                }
+                Capture::new("crawl", &target, &raw_req, Some(&response), Some(ms as i64), None)
+            }
+        };
+        let _ = save.send(capture);
+        if summary.requests % 10 == 0 {
+            ctl.set_progress(serde_json::json!({
+                "depth": summary.depth_reached,
+                "requests": summary.requests,
+                "queued": queue.len(),
+                "endpoints": endpoints.len(),
             }));
         }
-
-        let mut captures = Vec::new();
-        let mut next = Vec::new();
-        for (req, task) in batch.iter().zip(tasks) {
-            let Ok(Some(result)) = task.await else { continue };
-            summary.requests += 1;
-            let (target, raw_req, outcome) = result;
-            match outcome {
-                Err(e) => {
-                    summary.errors += 1;
-                    *summary.by_status.entry("error".into()).or_default() += 1;
-                    captures.push(Capture::new("crawl", &target, &raw_req, None, None, Some(&e.to_string())));
-                }
-                Ok((response, ms)) => {
-                    let page = Url::parse(&req.url).ok();
-                    if let (Some(page), Ok(head)) = (page.as_ref(), parse_response_head(&response)) {
-                        *summary.by_status.entry(head.status.to_string()).or_default() += 1;
-                        endpoints.insert(endpoint(req, page));
-                        let body = decode_body(&head.headers, split_head_body(&response).1);
-                        let found = extract(page, &head.headers, &body, cfg.submit_forms);
-                        for f in found {
-                            let Ok(mut u) = Url::parse(&f.url) else { continue };
-                            fill_placeholders(&mut u);
-                            if !scope.allows(&u) {
-                                if let Some(h) = u.host_str().filter(|_| !scope.host_allowed(&u)) {
-                                    if out_of_scope.len() < 50 {
-                                        out_of_scope.insert(h.to_ascii_lowercase());
-                                    }
-                                }
-                                continue;
-                            }
-                            if is_static(&u) {
-                                continue;
-                            }
-                            if f.form {
-                                summary.forms_submitted += 1;
-                            }
-                            let r = Req { method: f.method, url: strip_fragment(&u), body: f.body };
-                            if seen.insert(r.clone()) {
-                                next.push(r);
-                            }
-                        }
-                    }
-                    captures.push(Capture::new("crawl", &target, &raw_req, Some(&response), Some(ms as i64), None));
-                }
-            }
-        }
-        // One unsavable exchange (e.g. a huge body) must not abort the crawl:
-        // fall back to saving one by one and count what fails.
-        if let Err(e) = store.record_batch(&captures) {
-            eprintln!("brainproxy: crawl: saving {} exchanges failed ({e}); saving one by one", captures.len());
-            for c in &captures {
-                if let Err(e) = store.record(c) {
-                    eprintln!("brainproxy: crawl: exchange not saved: {e}");
-                    summary.record_errors += 1;
-                }
-            }
-        }
-        summary.new_findings += crate::scan::passive::scan_pending(&mut store)?.new_findings;
-        ctl.set_progress(serde_json::json!({
-            "depth": depth,
-            "requests": summary.requests,
-            "queued_next": next.len(),
-            "endpoints": endpoints.len(),
-        }));
-        level = next;
-        if summary.requests >= cfg.max_pages {
-            summary.limit_reached = !level.is_empty();
-            break;
-        }
     }
+    drop(save);
+    let (new_findings, record_errors) = tokio::task::spawn_blocking(move || writer.join())
+        .await
+        .map_err(|e| Error::Protocol(e.to_string()))?
+        .map_err(|_| Error::Protocol("crawl writer panicked".into()))??;
+    summary.new_findings = new_findings;
+    summary.record_errors = record_errors;
 
     summary.stopped = ctl.stopped();
     let mut eps: Vec<Endpoint> = endpoints.into_iter().collect();

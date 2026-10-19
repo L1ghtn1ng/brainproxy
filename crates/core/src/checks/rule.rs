@@ -1,7 +1,9 @@
 //! Runs a declarative check as an active rule. Every request is sent through
 //! `Cx` (scope guard, auth session, rate limit, stop/deadline).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 
 use super::dsl::Value;
 use super::{combos, Block, Check, ExtractKind, Extractor, MatchKind, Matcher, Part, MAX_COMBOS, PLACEHOLDER, RANDSTR};
@@ -9,11 +11,35 @@ use crate::http::RawRequest;
 use crate::oob::Payload;
 use crate::scan::active::{ActiveRule, BoxFuture, Cx, Response, RuleScope};
 use crate::scan::{AlertDef, Confidence, Risk};
+use crate::{Error, Result};
 
 pub struct CheckRule {
     check: Check,
+    /// Per-request timeout unless a request block sets its own (`@timeout`).
+    timeout: Duration,
+    /// Request templates (`template_key`) that other selected checks send too.
+    shared: Arc<HashSet<String>>,
     name: &'static str,
     alerts: &'static [&'static AlertDef],
+}
+
+/// A request template as written, for spotting checks that send the same one.
+/// None when its responses can't be shared: payloads, an OOB URL, a request
+/// sequence, its own timeout, or deliberately malformed (`unsafe`).
+fn template_key(check: &Check, block: &Block, template: &str, raw: bool) -> Option<String> {
+    let plain = block.payloads.is_empty()
+        && !block.req_condition
+        && !check.oob_url
+        && block.timeout.is_none()
+        && !block.unsafe_raw
+        && block.inject.is_empty();
+    plain.then(|| {
+        if raw {
+            template.trim().to_string()
+        } else {
+            format!("{} {template}\n{:?}\n{}\n{}", block.method, block.headers, block.body, block.redirects)
+        }
+    })
 }
 
 fn leak(s: String) -> &'static str {
@@ -22,7 +48,21 @@ fn leak(s: String) -> &'static str {
 
 /// Turns loaded checks into active rules. Their alert definitions must be
 /// `'static` like the ported rules' ones, so they are leaked: load once per process.
-pub fn into_rules(checks: Vec<Check>) -> Vec<&'static dyn ActiveRule> {
+/// `timeout` is the per-request timeout (Nuclei's default is 10 s), capped by the
+/// scan's own.
+pub fn into_rules(checks: Vec<Check>, timeout: Duration) -> Vec<&'static dyn ActiveRule> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for c in &checks {
+        for b in &c.blocks {
+            let templates = b.paths.iter().map(|p| (p, false)).chain(b.raws.iter().map(|r| (r, true)));
+            for (t, raw) in templates {
+                if let Some(k) = template_key(c, b, t, raw) {
+                    *seen.entry(k).or_default() += 1;
+                }
+            }
+        }
+    }
+    let shared: Arc<HashSet<String>> = Arc::new(seen.into_iter().filter(|(_, n)| *n > 1).map(|(k, _)| k).collect());
     checks
         .into_iter()
         .map(|c| {
@@ -44,7 +84,13 @@ pub fn into_rules(checks: Vec<Check>) -> Vec<&'static dyn ActiveRule> {
                 ),
                 tags: Box::leak(c.tags.iter().map(|t| leak(t.clone())).collect::<Vec<_>>().into_boxed_slice()),
             }));
-            let rule = CheckRule { name: def.name, alerts: Box::leak(Box::new([def])), check: c };
+            let rule = CheckRule {
+                name: def.name,
+                alerts: Box::leak(Box::new([def])),
+                check: c,
+                timeout,
+                shared: shared.clone(),
+            };
             &*Box::leak(Box::new(rule)) as &'static dyn ActiveRule
         })
         .collect()
@@ -70,6 +116,27 @@ impl ActiveRule for CheckRule {
     fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a> {
         Box::pin(run(self, cx))
     }
+
+    /// Checks that wait longer on purpose (`@timeout`) or send malformed requests
+    /// (`unsafe`), which can hang until the timeout, start first; the rest are a
+    /// request or two each and fill the gaps at the end.
+    fn order(&self) -> u8 {
+        if self.check.blocks.iter().any(|b| b.timeout.is_some() || b.unsafe_raw) {
+            0
+        } else {
+            3
+        }
+    }
+}
+
+/// `send` with the block's timeout (the check's default unless `@timeout` set one).
+async fn timed(
+    rule: &CheckRule,
+    block: &Block,
+    send: impl std::future::Future<Output = Result<Response>>,
+) -> Result<Response> {
+    let t = block.timeout.unwrap_or(rule.timeout);
+    tokio::time::timeout(t, send).await.unwrap_or(Err(Error::Timeout(t)))
 }
 
 fn rand_alnum(n: usize) -> String {
@@ -220,7 +287,11 @@ async fn run_block(rule: &CheckRule, cx: &Cx, block: &Block, vars: &mut HashMap<
                 out.stop = true;
                 return out;
             }
-            let sent = if block.inject_raw { cx.send_payload_raw(value).await } else { cx.send_payload(value).await };
+            let sent = if block.inject_raw {
+                timed(rule, block, cx.send_payload_raw(value)).await
+            } else {
+                timed(rule, block, cx.send_payload(value)).await
+            };
             let Ok(resp) = sent else { continue };
             if evaluate(rule, cx, block, std::slice::from_ref(&resp), vars, value, None) {
                 out.matched = true;
@@ -255,7 +326,21 @@ async fn run_block(rule: &CheckRule, cx: &Cx, block: &Block, vars: &mut HashMap<
             let req = if raw { build_raw(cx, block, template, &v) } else { build_path(cx, block, template, &v) };
             let Some(req) = req else { continue };
             let sent_req = oob.as_ref().map(|_| req.clone());
-            let sent = if block.redirects { cx.send_following(req).await } else { cx.send(req).await };
+            // Requests other checks send alike go out once (GET/HEAD only: no side effects).
+            let once = (req.starts_with(b"GET ") || req.starts_with(b"HEAD "))
+                && template_key(&rule.check, block, template, raw).is_some_and(|k| rule.shared.contains(&k));
+            let key = once.then(|| [&[block.redirects as u8][..], &req].concat());
+            let send = async {
+                if block.redirects {
+                    timed(rule, block, cx.send_following(req)).await
+                } else {
+                    timed(rule, block, cx.send(req)).await
+                }
+            };
+            let sent = match key {
+                Some(k) => cx.send_once(&k, send).await,
+                None => send.await,
+            };
             let oob_sent = oob.as_ref().zip(sent_req.as_deref());
             let resp = match sent {
                 Ok(r) => r,

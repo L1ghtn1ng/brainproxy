@@ -96,6 +96,8 @@ pub(crate) struct Block {
     pub extractors: Vec<Extractor>,
     /// Some matcher looks at out-of-band interactions (`Matcher::oob`).
     pub oob: bool,
+    /// Per-request timeout from a raw request's `@timeout:` annotation.
+    pub timeout: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -637,7 +639,13 @@ fn compile_block(b: &Value, scope: RuleScope, file: &Path, root: Option<&Path>) 
         return invalid("bad method");
     }
     let paths = list(b.get("path"));
-    let raws = list(b.get("raw"));
+    let mut timeout = None;
+    let mut raws = Vec::new();
+    for raw in list(b.get("raw")) {
+        let (t, raw) = raw_annotations(&raw)?;
+        timeout = timeout.max(t);
+        raws.push(raw);
+    }
     let inject = list(b.get("inject"));
     match scope {
         RuleScope::Param if inject.is_empty() || !paths.is_empty() || !raws.is_empty() => {
@@ -731,7 +739,33 @@ fn compile_block(b: &Value, scope: RuleScope, file: &Path, root: Option<&Path>) 
         oob: matchers.iter().any(|m| m.oob),
         matchers,
         extractors,
+        timeout,
     })
+}
+
+/// Splits Nuclei's annotation lines (`@timeout: 20s`) off the start of a raw
+/// request. `@timeout` is honoured; the others would send elsewhere
+/// (`@Host`, `@tls-sni`), so their templates are not loaded.
+fn raw_annotations(raw: &str) -> std::result::Result<(Option<std::time::Duration>, String), Problem> {
+    let mut timeout = None;
+    let mut rest = raw.trim_start();
+    while let Some(line) = rest.strip_prefix('@') {
+        let (line, next) = line.split_once('\n').unwrap_or((line, ""));
+        // `@timeout: 20s`, or `@timeout 20s` as some templates write it.
+        let end = line.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).unwrap_or(line.len());
+        let (name, value) = line.split_at(end);
+        let value = value.trim_start_matches([':', ' ', '\t']).trim();
+        match name {
+            "timeout" => {
+                let secs = value.strip_suffix('s').unwrap_or(value).trim();
+                let Ok(secs) = secs.parse::<f64>() else { return invalid(format!("bad @timeout {value:?}")) };
+                timeout = Some(std::time::Duration::from_secs_f64(secs.clamp(0.1, 600.0)));
+            }
+            other => return unsupported(format!("raw request annotation @{other}")),
+        }
+        rest = next.trim_start();
+    }
+    Ok((timeout, rest.to_string()))
 }
 
 fn uses_oob_vars(exprs: &[dsl::Expr]) -> bool {
@@ -1108,15 +1142,22 @@ pub struct Filter {
     pub tags: Vec<String>,
     pub exclude_tags: Vec<String>,
     pub min_risk: Option<Risk>,
+    /// Kept whatever the other filters say (Nuclei's -itags): checks with any of these
+    /// tags, or in a folder of that name (nuclei-templates' `technologies/eol` holds
+    /// end-of-life checks that don't all carry the `eol` tag).
+    pub include_tags: Vec<String>,
 }
 
 impl Filter {
     pub fn keep(&self, c: &Check) -> bool {
         let has = |t: &String| c.tags.iter().any(|x| x.eq_ignore_ascii_case(t));
-        (self.ids.is_empty() || self.ids.contains(&c.id))
-            && (self.tags.is_empty() || self.tags.iter().any(has))
-            && !self.exclude_tags.iter().any(has)
-            && self.min_risk.is_none_or(|r| c.risk >= r)
+        let folder = c.file.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_ascii_lowercase());
+        let included = self.include_tags.iter().any(|t| has(t) || folder.as_deref() == Some(&t.to_ascii_lowercase()));
+        included
+            || (self.ids.is_empty() || self.ids.contains(&c.id))
+                && (self.tags.is_empty() || self.tags.iter().any(has))
+                && !self.exclude_tags.iter().any(has)
+                && self.min_risk.is_none_or(|r| c.risk >= r)
     }
 }
 

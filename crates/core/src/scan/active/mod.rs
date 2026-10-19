@@ -67,15 +67,19 @@ pub trait ActiveRule: Send + Sync {
     fn alerts(&self) -> &'static [&'static AlertDef];
     fn scope(&self) -> RuleScope;
     fn scan<'a>(&'a self, cx: &'a Cx) -> BoxFuture<'a>;
-    /// Rules run in phases: every unit of a phase finishes before the next starts
-    /// (ZAP runs a rule's dependencies first).
-    fn phase(&self) -> u8 {
-        0
-    }
-    /// Rules this one needs (ZAP `getDependency`): selected along with it, and
-    /// it is skipped when one of them is excluded.
+    /// Rules this one needs (ZAP `getDependency`): selected along with it, it is
+    /// skipped when one of them is excluded, and its units start only once every
+    /// unit of those rules has finished.
     fn depends_on(&self) -> &'static [u32] {
         &[]
+    }
+    /// Start order, lowest first: units that may run long start early, so the
+    /// scan doesn't end waiting on one of them.
+    fn order(&self) -> u8 {
+        match self.scope() {
+            RuleScope::Param => 1,
+            _ => 2,
+        }
     }
 }
 
@@ -206,7 +210,14 @@ struct Shared {
     oob_payloads: AtomicU64,
     /// Stored-input tracking for the persistent XSS rules.
     source_sink: Mutex<SourceSink>,
+    /// Per origin: no requests before this time (the server asked us to slow down).
+    paused: Mutex<HashMap<String, Instant>>,
+    /// Responses to requests several checks send alike (see `Cx::send_once`).
+    sent_once: Mutex<HashMap<Vec<u8>, SentOnce>>,
 }
+
+/// One response shared by identical requests; an error is kept as its message.
+type SentOnce = Arc<tokio::sync::OnceCell<std::result::Result<Response, String>>>;
 
 /// Everything a rule needs for one unit of work.
 pub struct Cx {
@@ -294,7 +305,30 @@ impl Cx {
 
     /// Sends a raw request to another target (e.g. the same host over http).
     /// Still subject to the engagement scope.
+    /// A 429, or a 503 with Retry-After, pauses every request to that origin for
+    /// the time asked (5 s without one, at most 60 s); the request is then sent once more.
     pub async fn send_to(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
+        let origin = target.origin();
+        let mut retried = false;
+        loop {
+            let until = self.shared.paused.lock().unwrap().get(&origin).copied();
+            while until.is_some_and(|u| Instant::now() < u) && !self.stopped() {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let resp = self.send_to_once(target, request.clone()).await?;
+            let retry_after = resp.header("retry-after").map(|v| v.trim().parse::<u64>().unwrap_or(5));
+            if retried || !(resp.status == 429 || resp.status == 503 && retry_after.is_some()) {
+                return Ok(resp);
+            }
+            let wait = Duration::from_secs(retry_after.unwrap_or(5).clamp(1, 60));
+            let mut paused = self.shared.paused.lock().unwrap();
+            let until = paused.entry(origin.clone()).or_insert_with(Instant::now);
+            *until = (*until).max(Instant::now() + wait);
+            retried = true;
+        }
+    }
+
+    async fn send_to_once(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
         if self.stopped() {
             return Err(Error::Protocol("scan stopped".into()));
         }
@@ -316,6 +350,17 @@ impl Cx {
             auth.observe(&ex.response);
         }
         Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms))
+    }
+
+    /// Runs `send` once per scan for `key` (with the target added): later callers,
+    /// and ones already waiting, get the same response. For side-effect-free
+    /// requests that several checks send byte for byte alike.
+    pub(crate) async fn send_once(&self, key: &[u8], send: impl Future<Output = Result<Response>>) -> Result<Response> {
+        let mut k = self.base.target.origin().into_bytes();
+        k.push(0);
+        k.extend_from_slice(key);
+        let cell = self.shared.sent_once.lock().unwrap().entry(k).or_default().clone();
+        cell.get_or_init(|| async { send.await.map_err(|e| e.to_string()) }).await.clone().map_err(Error::Protocol)
     }
 
     /// A raw TCP connection to `host:port` for rules that speak another protocol
@@ -583,6 +628,15 @@ pub struct ActiveSummary {
     pub elapsed_ms: u64,
 }
 
+/// Counts down a rule's units left when dropped.
+struct Finished<'a>(&'a tokio::sync::watch::Sender<usize>);
+
+impl Drop for Finished<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
+}
+
 /// One rule run on one target (and insertion point, for Param rules).
 type Unit = (Arc<Base>, &'static dyn ActiveRule, Option<InsertionPoint>);
 
@@ -672,6 +726,8 @@ pub async fn run(
         oob_by_origin: Mutex::new(HashMap::new()),
         oob_payloads: AtomicU64::new(0),
         source_sink: Mutex::new(SourceSink::default()),
+        sent_once: Mutex::new(HashMap::new()),
+        paused: Mutex::new(HashMap::new()),
     });
 
     // Build units of work.
@@ -707,40 +763,46 @@ pub async fn run(
     let done = Arc::new(AtomicU64::new(0));
     let sem = Arc::new(tokio::sync::Semaphore::new(cfg.concurrency.max(1)));
     let mut errors = 0;
-    units.sort_by_key(|u| u.1.phase());
-    let mut phases: Vec<Vec<Unit>> = Vec::new();
-    for u in units {
-        match phases.last_mut() {
-            Some(p) if p[0].1.phase() == u.1.phase() => p.push(u),
-            _ => phases.push(vec![u]),
-        }
+    // The semaphore is fair, so units start in this order.
+    units.sort_by_key(|u| u.1.order());
+    // Units left per rule; a rule's units wait for those of the rules it depends on.
+    let mut left: HashMap<u32, usize> = HashMap::new();
+    for u in &units {
+        *left.entry(u.1.id()).or_default() += 1;
     }
-    for units in phases {
-        let mut tasks = Vec::with_capacity(units.len());
-        for (base, rule, point) in units {
-            let (shared, sem, done, ctl) = (shared.clone(), sem.clone(), done.clone(), ctl.clone());
-            tasks.push(tokio::spawn(async move {
-                let Ok(_permit) = sem.acquire().await else { return };
-                let cx = Cx { base, point, shared: shared.clone() };
-                if !cx.stopped() {
-                    rule.scan(&cx).await;
+    let left: Arc<HashMap<u32, tokio::sync::watch::Sender<usize>>> =
+        Arc::new(left.into_iter().map(|(id, n)| (id, tokio::sync::watch::Sender::new(n))).collect());
+    let mut tasks = Vec::with_capacity(units.len());
+    for (base, rule, point) in units {
+        let (shared, sem, done, ctl, left) = (shared.clone(), sem.clone(), done.clone(), ctl.clone(), left.clone());
+        tasks.push(tokio::spawn(async move {
+            // Counts the unit as finished even when the rule panics.
+            let _finished = Finished(&left[&rule.id()]);
+            for dep in rule.depends_on() {
+                if let Some(tx) = left.get(dep) {
+                    let _ = tx.subscribe().wait_for(|n| *n == 0).await;
                 }
-                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % 10 == 0 || n as usize == total {
-                    ctl.set_progress(serde_json::json!({
-                        "units_done": n,
-                        "units": total,
-                        "requests": shared.requests.load(Ordering::Relaxed),
-                        "raised": shared.raised.lock().unwrap().values().sum::<usize>(),
-                    }));
-                }
-            }));
-        }
-        for t in tasks {
-            // A panicking rule is an error, not a silently skipped unit.
-            if t.await.is_err() {
-                errors += 1;
             }
+            let Ok(_permit) = sem.acquire().await else { return };
+            let cx = Cx { base, point, shared: shared.clone() };
+            if !cx.stopped() {
+                rule.scan(&cx).await;
+            }
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 10 == 0 || n as usize == total {
+                ctl.set_progress(serde_json::json!({
+                    "units_done": n,
+                    "units": total,
+                    "requests": shared.requests.load(Ordering::Relaxed),
+                    "raised": shared.raised.lock().unwrap().values().sum::<usize>(),
+                }));
+            }
+        }));
+    }
+    for t in tasks {
+        // A panicking rule is an error, not a silently skipped unit.
+        if t.await.is_err() {
+            errors += 1;
         }
     }
 

@@ -19,6 +19,7 @@ mod sri_missing;
 mod suspicious_comments;
 mod timestamp;
 mod viewstate;
+pub(crate) mod vulnerable_js;
 
 use crate::scan::PassiveRule;
 
@@ -42,5 +43,6 @@ pub fn all() -> Vec<Box<dyn PassiveRule>> {
         Box::new(charset_mismatch::CharsetMismatch),
         Box::new(viewstate::Viewstate),
         Box::new(jsf_viewstate::InsecureJsfViewState),
+        Box::new(vulnerable_js::VulnerableJs),
     ]
 }

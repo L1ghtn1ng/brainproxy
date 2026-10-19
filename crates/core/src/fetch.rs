@@ -1,4 +1,5 @@
-//! Downloads for rule data and check templates (`scan data update`, `checks update`).
+//! Downloads for rule data and check templates (`scan data update`, `checks update`),
+//! and brainproxy's own releases (`update`).
 //!
 //! Only GitHub, only over verified TLS, and only through the guarded client: the
 //! scope for these downloads is exactly the GitHub hosts below, and the system scope
@@ -18,6 +19,14 @@ use crate::http::{parse_response_head, Client, RawRequest, SendOptions};
 
 pub const GITHUB_HOSTS: [&str; 3] = ["api.github.com:443", "raw.githubusercontent.com:443", "codeload.github.com:443"];
 
+/// Release metadata, and the asset downloads it redirects to.
+pub const RELEASE_HOSTS: [&str; 4] = [
+    "api.github.com:443",
+    "github.com:443",
+    "release-assets.githubusercontent.com:443",
+    "objects.githubusercontent.com:443",
+];
+
 /// Largest download accepted (a nuclei-templates tarball is ~10 MiB).
 pub const MAX_DOWNLOAD: usize = 128 << 20;
 
@@ -27,9 +36,18 @@ pub struct GitHub {
 
 impl GitHub {
     pub fn new() -> Result<Self> {
+        Self::scoped("GitHub downloads", &GITHUB_HOSTS)
+    }
+
+    /// For brainproxy's own release metadata and assets.
+    pub fn releases() -> Result<Self> {
+        Self::scoped("brainproxy releases", &RELEASE_HOSTS)
+    }
+
+    fn scoped(name: &str, hosts: &[&str]) -> Result<Self> {
         let spec = ScopeSpec {
-            name: Some("GitHub downloads".into()),
-            include: GITHUB_HOSTS.iter().map(|h| h.to_string()).collect(),
+            name: Some(name.into()),
+            include: hosts.iter().map(|h| h.to_string()).collect(),
             exclude: vec![],
         };
         let guard = Guard::load(Some(spec))?;
@@ -44,12 +62,26 @@ impl GitHub {
         })
     }
 
-    /// GETs `url`; anything but 200 is an error. Returns the decoded body.
+    /// GETs `url`, following up to 5 redirects within the scope; anything but a
+    /// final 200 is an error. Returns the decoded body.
     pub async fn get(&self, url: &str, accept: &str) -> Result<Vec<u8>> {
         let headers = [("Accept".to_string(), accept.to_string())];
-        let (req, target) = RawRequest::build("GET", url, &headers, b"")?;
-        let ex = self.client.send(&req, &target).await?;
-        let head = parse_response_head(&ex.response)?;
+        let mut url = url.to_string();
+        let mut redirects = 0;
+        let (ex, head) = loop {
+            let (req, target) = RawRequest::build("GET", &url, &headers, b"")?;
+            let ex = self.client.send(&req, &target).await?;
+            let head = parse_response_head(&ex.response)?;
+            let location = head.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v);
+            match location.filter(|_| matches!(head.status, 301 | 302 | 303 | 307 | 308) && redirects < 5) {
+                Some(loc) => {
+                    let next = url::Url::parse(&url).and_then(|u| u.join(loc));
+                    url = next.map_err(|e| Error::Protocol(format!("bad redirect {loc:?}: {e}")))?.to_string();
+                    redirects += 1;
+                }
+                None => break (ex, head),
+            }
+        };
         if head.status != 200 {
             let kind = if head.status == 404 || head.status == 422 { Error::NotFound } else { Error::Protocol };
             return Err(kind(format!("{url}: HTTP {}", head.status)));

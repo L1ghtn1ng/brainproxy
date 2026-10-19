@@ -14,8 +14,9 @@ type Depth = "quick" | "standard" | "thorough";
 /** Nuclei templates per depth when installed (none for Quick: thousands of extra requests). */
 const NUCLEI: Record<Depth, string[]> = {
   quick: [],
-  standard: ["--checks", "nuclei", "--check-severity", "high"],
-  thorough: ["--checks", "nuclei", "--check-severity", "medium"],
+  // Plus the end-of-life checks (outdated PHP, nginx, WordPress, ...), which are rated info.
+  standard: ["--checks", "nuclei", "--check-severity", "high", "--check-include-tags", "eol"],
+  thorough: ["--checks", "nuclei", "--check-severity", "medium", "--check-include-tags", "eol"],
 };
 
 const DEPTHS: { id: Depth; title: string; time: string; text: string; args: string[] }[] = [
@@ -43,6 +44,15 @@ const DEPTHS: { id: Depth; title: string; time: string; text: string; args: stri
   },
 ];
 
+type Speed = "gentle" | "normal" | "fast";
+
+/** Requests in flight at once. More only helps when the site keeps up, and it is louder. */
+const SPEEDS: { id: Speed; title: string; text: string; args: string[] }[] = [
+  { id: "gentle", title: "Gentle", text: "For fragile or shared sites. Slower.", args: ["-c", "3"] },
+  { id: "normal", title: "Normal", text: "Suits most sites.", args: [] },
+  { id: "fast", title: "Fast", text: "For robust test servers. Much more load on the site.", args: ["-c", "30"] },
+];
+
 const RISK_TEXT: Record<Risk, string> = {
   high: "Serious: could let an attacker steal data or take over accounts. Fix these first.",
   medium: "Important weaknesses that make attacks easier. Plan fixes soon.",
@@ -59,6 +69,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   const [site, setSite] = useState("");
   const [login, setLogin] = useState<string>(""); // "" = no login, else an auth profile
   const [depth, setDepth] = useState<Depth>("standard");
+  const [speed, setSpeed] = useState<Speed>("normal");
   const [busy, setBusy] = useState(false);
   const [checks] = usePoll<ChecksStatus>(() => run(["checks", "status"]), 30000);
   const nuclei = checks?.nuclei ? NUCLEI[depth] : [];
@@ -100,7 +111,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
     setBusy(true);
     try {
       const depthArgs = DEPTHS.find((d) => d.id === depth)!.args;
-      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs, ...nuclei, ...(login ? [`--auth=${login}`] : []), "--background"]);
+      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs, ...SPEEDS.find((s) => s.id === speed)!.args, ...nuclei, ...(login ? [`--auth=${login}`] : []), "--background"]);
       p.onStarted(d.job);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -200,6 +211,15 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
               </button>
             ))}
           </div>
+          <label className="label">How hard may it push the site?</label>
+          <div className="wiz-choices three">
+            {SPEEDS.map((s) => (
+              <button key={s.id} className={`wiz-choice ${speed === s.id ? "on" : ""}`} onClick={() => setSpeed(s.id)}>
+                <b>{s.title}</b>
+                <span>{s.text}</span>
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
@@ -215,12 +235,14 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
             <dd>
               {DEPTHS.find((d) => d.id === depth)!.title} ({DEPTHS.find((d) => d.id === depth)!.time})
             </dd>
+            <dt>Speed</dt>
+            <dd>{SPEEDS.find((s) => s.id === speed)!.title}</dd>
             <dt>Extra checks</dt>
             <dd>
               {!checks?.nuclei
                 ? "none (download the Nuclei templates on the Overview for thousands more)"
                 : nuclei.length
-                  ? `Nuclei templates, ${nuclei[3]} severity and above`
+                  ? `Nuclei templates, ${nuclei[3]} severity and above, plus end-of-life checks`
                   : "none (Quick skips the Nuclei templates)"}
             </dd>
           </dl>

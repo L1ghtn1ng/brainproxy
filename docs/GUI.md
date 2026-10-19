@@ -65,7 +65,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 
 | Group | Tool | Parts | CLI used |
 | --- | --- | --- | --- |
-| Recon | Overview | Guided scan (below), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats, proxy setup hints | `job list`, `query`, `proxy status/start`, `scan active --crawl`, `scan data status/update`, `checks status/update --background` |
+| Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
 | Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
 | Capture | Proxy | Intercept (held queue, edit, forward/drop), Traffic (filters, request/response) | `intercept *`, `history list/show/note/tag` |
 | Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor | `send --target T -` |
@@ -75,7 +75,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles, match & replace, intercept options, TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *`, `rules *`, `intercept *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `engagement show` |
+| | Settings | Auth profiles, match & replace, intercept options, proxy (status, start, setup for browsers/curl/shell), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *`, `rules *`, `intercept *`, `proxy status/start`, `ca init/export`, `checks *`, `scan data *`, `project info`, `engagement show` |
 
 ### Guided scan
 
@@ -85,7 +85,9 @@ checked with one GET before moving on, with a plain explanation if it doesn't an
 out of scope), login (none, or an existing auth profile, with a pointer to Settings), depth
 (Quick: medium strength, crawl depth 3, 150 pages; Standard: high, 5, 500; Thorough:
 insane, 8, 1500; Standard and Thorough also attack cookies (`--cookies`); once the Nuclei templates are downloaded, Standard adds those of high
-severity and Thorough those of medium and above), and a review with a warning about real
+severity and Thorough those of medium and above, both plus the end-of-life checks via
+`--check-include-tags eol`), speed (Gentle `-c 3`, Normal, Fast `-c 30`),
+and a review with a warning about real
 attack traffic. It runs
 `scan active URL --crawl ... --background`, shows progress as "exploring" then "testing",
 and ends with counts per risk level explained in plain words and a link to Findings. "I'll

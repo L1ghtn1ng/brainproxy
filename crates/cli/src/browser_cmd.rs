@@ -36,7 +36,7 @@ enum Kind {
     Firefox,
 }
 
-struct Found {
+pub(crate) struct Found {
     id: &'static str,
     name: &'static str,
     kind: Kind,
@@ -89,7 +89,7 @@ const KNOWN: &[Known] = &[
     ),
 ];
 
-fn find() -> Vec<Found> {
+pub(crate) fn find() -> Vec<Found> {
     let mut app_dirs = vec![PathBuf::from("/Applications")];
     if let Some(home) = std::env::var_os("HOME") {
         app_dirs.push(PathBuf::from(home).join("Applications"));
@@ -136,76 +136,96 @@ pub fn browser(project: &Path, home: &Path, cmd: BrowserCmd, out: &Out) -> Resul
             Ok(())
         }
         BrowserCmd::Open { browser, url } => {
-            let page = url.unwrap_or_else(|| "about:blank".into());
-            check_url(&page)?;
-            let b = match &browser {
-                Some(id) => found.iter().find(|f| f.id == id).ok_or_else(|| {
-                    let ids: Vec<&str> = found.iter().map(|f| f.id).collect();
-                    Error::NotFound(format!(
-                        "browser {id:?}; found: {}",
-                        if ids.is_empty() { "none".into() } else { ids.join(", ") }
-                    ))
-                })?,
-                None => found.first().ok_or_else(|| {
-                    Error::NotFound("no supported browser found (Chrome, Chromium, Edge, Brave, Firefox)".into())
-                })?,
-            };
-            let store = Store::open(project)?;
-            let state = crate::proxy_cmd::running(&store)?.ok_or_else(|| {
-                Error::Conflict(
-                    "the proxy isn't running for this project; start it with `brainproxy proxy start`".into(),
-                )
-            })?;
-            // A wildcard listen address isn't something to connect to.
-            let proxy = state.listen.replace("0.0.0.0:", "127.0.0.1:").replace("[::]:", "[::1]:");
-            let (port, host) = proxy.rsplit_once(':').map(|(h, p)| (p.to_string(), h.to_string())).unwrap_or_default();
-            let profile = profile_dir(project, b.id);
-            std::fs::create_dir_all(&profile)?;
-            let mut cmd = Command::new(&b.path);
-            let mut note = Value::Null;
-            match b.kind {
-                Kind::Chromium => {
-                    let (ca, _) = crate::proxy_cmd::load_ca(home)?;
-                    cmd.arg(format!("--user-data-dir={}", profile.display()))
-                        .arg(format!("--proxy-server=http://{proxy}"))
-                        // Chromium bypasses the proxy for loopback unless told otherwise.
-                        .arg("--proxy-bypass-list=<-loopback>")
-                        .arg(format!("--ignore-certificate-errors-spki-list={}", ca.spki_sha256_base64()))
-                        // Keep the browser's own background traffic out of the history.
-                        .args(["--no-first-run", "--no-default-browser-check", "--disable-background-networking"])
-                        .args(["--disable-component-update", "--disable-sync", "--disable-domain-reliability"])
-                        .args(["--disable-client-side-phishing-detection", "--disable-default-apps", "--no-pings"])
-                        .arg("--disable-features=OptimizationHints,MediaRouter,Translate,AutofillServerCommunication")
-                        // Everything after `--` is a URL to Chromium, never a switch.
-                        .arg("--")
-                        .arg(&page);
-                }
-                Kind::Firefox => {
-                    std::fs::write(profile.join("user.js"), firefox_prefs(&host, &port))?;
-                    cmd.arg("-profile").arg(&profile).args(["-no-remote", "-new-instance"]).arg(&page);
-                    note = json!(format!(
-                        "Firefox doesn't take the CA from the command line. Once per profile: Settings > Privacy & Security > \
-                         Certificates > View Certificates > Authorities > Import {}, and tick \"Trust this CA to identify websites\".",
-                        state.ca_cert.display()
-                    ));
-                }
-            }
-            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-            // It outlives this command and isn't hit by our signals.
-            crate::process::detach(&mut cmd);
-            let child = cmd.spawn().map_err(|e| Error::InvalidInput(format!("can't start {}: {e}", b.name)))?;
-            let data = json!({
-                "browser": describe(b),
-                "pid": child.id(),
-                "proxy": format!("http://{proxy}"),
-                "profile": profile,
-                "url": page,
-                "note": note,
-            });
-            out.ok(data, || format!("{} started through the proxy at http://{proxy}", b.name));
+            let (data, text) = open(project, home, &found, browser, url.unwrap_or_else(|| "about:blank".into()), None)?;
+            out.ok(data, || text);
             Ok(())
         }
     }
+}
+
+/// Starts a browser through the running proxy at `page`; `fresh` names a separate
+/// profile that starts empty (`auth record`). Returns the output data and a summary.
+pub(crate) fn open(
+    project: &Path,
+    home: &Path,
+    found: &[Found],
+    browser: Option<String>,
+    page: String,
+    fresh: Option<&str>,
+) -> Result<(Value, String), Error> {
+    check_url(&page)?;
+    let b = match &browser {
+        Some(id) => found.iter().find(|f| f.id == id).ok_or_else(|| {
+            let ids: Vec<&str> = found.iter().map(|f| f.id).collect();
+            Error::NotFound(format!(
+                "browser {id:?}; found: {}",
+                if ids.is_empty() { "none".into() } else { ids.join(", ") }
+            ))
+        })?,
+        None => found.first().ok_or_else(|| {
+            Error::NotFound("no supported browser found (Chrome, Chromium, Edge, Brave, Firefox)".into())
+        })?,
+    };
+    let store = Store::open(project)?;
+    let state = crate::proxy_cmd::running(&store)?.ok_or_else(|| {
+        Error::Conflict("the proxy isn't running for this project; start it with `brainproxy proxy start`".into())
+    })?;
+    // A wildcard listen address isn't something to connect to.
+    let proxy = state.listen.replace("0.0.0.0:", "127.0.0.1:").replace("[::]:", "[::1]:");
+    let (port, host) = proxy.rsplit_once(':').map(|(h, p)| (p.to_string(), h.to_string())).unwrap_or_default();
+    let profile = match fresh {
+        // A throwaway profile, emptied first: no earlier session can skip the login.
+        Some(tag) => {
+            let dir = profile_dir(project, &format!("{}-{tag}", b.id));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        }
+        None => profile_dir(project, b.id),
+    };
+    std::fs::create_dir_all(&profile)?;
+    let mut cmd = Command::new(&b.path);
+    let mut note = Value::Null;
+    match b.kind {
+        Kind::Chromium => {
+            let (ca, _) = crate::proxy_cmd::load_ca(home)?;
+            cmd.arg(format!("--user-data-dir={}", profile.display()))
+                .arg(format!("--proxy-server=http://{proxy}"))
+                // Chromium bypasses the proxy for loopback unless told otherwise.
+                .arg("--proxy-bypass-list=<-loopback>")
+                .arg(format!("--ignore-certificate-errors-spki-list={}", ca.spki_sha256_base64()))
+                // Keep the browser's own background traffic out of the history.
+                .args(["--no-first-run", "--no-default-browser-check", "--disable-background-networking"])
+                .args(["--disable-component-update", "--disable-sync", "--disable-domain-reliability"])
+                .args(["--disable-client-side-phishing-detection", "--disable-default-apps", "--no-pings"])
+                .arg("--disable-features=OptimizationHints,MediaRouter,Translate,AutofillServerCommunication")
+                // Everything after `--` is a URL to Chromium, never a switch.
+                .arg("--")
+                .arg(&page);
+        }
+        Kind::Firefox => {
+            std::fs::write(profile.join("user.js"), firefox_prefs(&host, &port))?;
+            cmd.arg("-profile").arg(&profile).args(["-no-remote", "-new-instance"]).arg(&page);
+            note = json!(format!(
+                "Firefox doesn't take the CA from the command line. Once per profile: Settings > Privacy & Security > \
+                 Certificates > View Certificates > Authorities > Import {}, and tick \"Trust this CA to identify websites\".",
+                state.ca_cert.display()
+            ));
+        }
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // It outlives this command and isn't hit by our signals.
+    crate::process::detach(&mut cmd);
+    let child = cmd.spawn().map_err(|e| Error::InvalidInput(format!("can't start {}: {e}", b.name)))?;
+    let data = json!({
+        "browser": describe(b),
+        "pid": child.id(),
+        "proxy": format!("http://{proxy}"),
+        "profile": profile,
+        "url": page,
+        "note": note,
+    });
+    let text = format!("{} started through the proxy at http://{proxy}", b.name);
+    Ok((data, text))
 }
 
 /// Only http(s) URLs and about:blank: anything else (`--renderer-cmd-prefix=...`,

@@ -111,6 +111,10 @@ brainproxy query "SELECT id, header(resp_headers, 'server') FROM history"
 brainproxy query "SELECT rowid FROM history_fts WHERE history_fts MATCH 'password'"
 brainproxy query "SELECT id FROM history WHERE host = ?1 AND path LIKE ?2" -p target.test -p '/api/%'
 
+# New versions: check GitHub, save the verified binary (or --kind gui for the app installer)
+brainproxy update check
+brainproxy update download --dir ~/Downloads
+
 # Intercepting proxy (runs in the background; captures go to the same DB)
 brainproxy proxy start --listen 127.0.0.1:8080    # prints proxy URL, CA path, curl/env hints
 brainproxy browser list                                         # installed Chrome/Chromium/Edge/Brave/Firefox
@@ -188,6 +192,10 @@ brainproxy scan active --where "source = 'import'" --auth api
 # Cookies/tokens are applied to every request, rotated cookies are learned, and a 401, a redirect to the
 # login path, or --logged-out triggers one automatic re-login and a retry.
 export APP_PW='...'                                # read at each login, never stored
+# Easiest: log in once in a browser and let brainproxy work out the profile
+brainproxy auth record start https://app.example.com/login   # fresh browser through the proxy
+brainproxy auth record finish app --save          # login request, CSRF/bearer token, logged-in check
+# Or describe it yourself:
 brainproxy auth add app --login-url https://app.example.com/login \
     --login-body 'user={{username}}&pass={{password}}&csrf={{csrf}}' --username alice --password-env APP_PW \
     --csrf-url https://app.example.com/login --csrf-regex 'name="csrf" value="([^"]+)"' \

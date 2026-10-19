@@ -1,10 +1,11 @@
 //! Ported from ZAP PersistentXssPrimeScanRule, PersistentXssSpiderScanRule and PersistentXssScanRule
 //! (ascanrules, Apache License 2.0).
 //!
-//! Three rules in three engine phases, like ZAP's dependency chain: Prime (40016) stores a
-//! unique marker through every parameter, Spider (40017) re-requests every page and records
-//! where markers show up (`source_sink`), and the attack (40014) stores XSS payloads through
-//! each parameter that has such a sink and looks for them on the sink pages. Behaviour is
+//! Three rules chained through `depends_on`, like ZAP's: each starts once every unit of the
+//! one before has finished. Prime (40016) stores a unique marker through every parameter,
+//! Spider (40017) re-requests every page and records where markers show up (`source_sink`),
+//! and the attack (40014) stores XSS payloads through each parameter that has such a sink and
+//! looks for them on the sink pages. Behaviour is
 //! ZAP's at the MEDIUM alert threshold: attacks are looked for anywhere on the sink page, and
 //! PUT requests are skipped. The attack stops after its first alert.
 
@@ -111,10 +112,6 @@ impl ActiveRule for PersistentXssSpider {
         RuleScope::Page
     }
 
-    fn phase(&self) -> u8 {
-        1
-    }
-
     fn depends_on(&self) -> &'static [u32] {
         &[40016]
     }
@@ -145,10 +142,6 @@ impl ActiveRule for PersistentXss {
 
     fn scope(&self) -> RuleScope {
         RuleScope::Param
-    }
-
-    fn phase(&self) -> u8 {
-        2
     }
 
     fn depends_on(&self) -> &'static [u32] {
@@ -381,7 +374,5 @@ mod tests {
     fn rule_chain() {
         assert_eq!(PersistentXss.depends_on(), [40017]);
         assert_eq!(PersistentXssSpider.depends_on(), [40016]);
-        assert!(PersistentXssPrime.phase() < PersistentXssSpider.phase());
-        assert!(PersistentXssSpider.phase() < PersistentXss.phase());
     }
 }

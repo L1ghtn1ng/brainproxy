@@ -13,7 +13,8 @@ fast, static binary" goal, and auto-translating arbitrary Java at runtime isn't 
 
 What *is* data in ZAP: pattern lists the rules read (`application_errors.xml`,
 `debug-error-messages.txt`, `URL-information-disclosure-messages.txt`,
-`hidden_files.json`) and the alert texts in `Messages.properties`.
+`hidden_files.json`, the retire add-on's Retire.js database `jsrepository.json`) and the
+alert texts in `Messages.properties`.
 
 So "automatic" splits into three layers.
 
@@ -53,7 +54,9 @@ brainproxy scan data reset                   # back to the embedded copies
 
 - The files are the ones in `zap-sync.json`: `application_errors.xml` (90022),
   `debug-error-messages.txt` (10023), `URL-information-disclosure-messages.txt`
-  (10024, 10025), and `hidden_files.json` (40035).
+  (10024, 10025), `hidden_files.json` (40035), and `jsrepository.json` (10003, the
+  Retire.js database of vulnerable JavaScript library versions, which ZAP refreshes from
+  Retire.js regularly).
 - The ref is resolved to a commit (GitHub API) and every file is fetched at that commit
   from raw.githubusercontent.com: only GitHub, verified TLS, through the guarded client
   with the system scope applied (a locked-down runner refuses; the provisioner uses

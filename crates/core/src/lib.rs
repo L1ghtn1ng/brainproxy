@@ -3,6 +3,7 @@
 
 pub mod apiimport;
 pub mod auth;
+pub mod auth_record;
 pub mod capture;
 pub mod checks;
 pub mod codec;
@@ -20,6 +21,7 @@ pub mod proxy;
 pub mod race;
 pub mod scan;
 pub mod store;
+pub mod update;
 pub mod wordlists;
 
 pub use error::{Error, Result};

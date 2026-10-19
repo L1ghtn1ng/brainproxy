@@ -36,7 +36,7 @@ export function progress(j: Job): { text: string; frac: number | null } {
     return { text: `crawling · depth ${p.depth} · ${p.requests ?? 0} req · ${p.endpoints ?? 0} endpoints`, frac: null };
   if (j.kind === "active-scan")
     return { text: `${p.units_done ?? 0}/${p.units ?? 0} units · ${p.requests ?? 0} req · ${p.raised ?? 0} raised`, frac: p.units ? (p.units_done ?? 0) / p.units : null };
-  if (j.kind === "crawl") return { text: `depth ${p.depth ?? 0} · ${p.requests ?? 0} req · ${p.endpoints ?? 0} endpoints · ${p.queued_next ?? 0} queued`, frac: null };
+  if (j.kind === "crawl") return { text: `depth ${p.depth ?? 0} · ${p.requests ?? 0} req · ${p.endpoints ?? 0} endpoints · ${p.queued ?? 0} queued`, frac: null };
   return { text: Object.entries(p).map(([k, v]) => `${k} ${v}`).join(" · "), frac: null };
 }
 
@@ -304,6 +304,7 @@ const SCAN_DEFAULTS = {
   concurrency: "",
   rate: "",
   timeout: "",
+  checkTimeout: "",
   maxMinutes: "",
   maxTargets: "",
   injectHeaders: "",
@@ -412,13 +413,15 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ...opt("--exclude-rules", f.excludeRules),
           ...flag("--no-rules", f.noRules),
           ...opt("--checks", f.checks),
-          ...(nucleiOn ? ["--checks", "nuclei"] : []),
+          // End-of-life checks (outdated PHP, nginx, WordPress, ...) whatever the severity chosen.
+          ...(nucleiOn ? ["--checks", "nuclei", "--check-include-tags", "eol"] : []),
           ...opt("--check-tags", f.checkTags),
           ...opt("--check-severity", f.checkSeverity || (nucleiOn ? nucleiSeverity : "")),
           ...opt("--auth", f.auth),
           ...opt("--concurrency", f.concurrency),
           ...opt("--rate", f.rate),
           ...opt("--timeout", f.timeout),
+          ...opt("--check-timeout", f.checkTimeout),
           ...opt("--max-minutes", f.maxMinutes),
           ...opt("--max-targets", f.maxTargets),
           ...list(f.injectHeaders).map((h) => `--inject-header=${h}`),
@@ -507,7 +510,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
                   <option value="low">low and above</option>
                   <option value="info">all</option>
                 </select>
-                <span className="muted small">Lower severities add thousands of requests.</span>
+                <span className="muted small">Lower severities add thousands of requests. End-of-life checks always run.</span>
               </>
             )}
           </div>
@@ -601,6 +604,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
         {text("Concurrency", "concurrency", "10")}
         {text("Rate (req/s)", "rate", "no limit")}
         {text("Timeout (s)", "timeout", kind === "crawl" ? "15" : "30")}
+        {kind === "scan" && text("Template timeout (s)", "checkTimeout", "10")}
       </div>
       <div className="row gap sc-checks">
         {kind === "scan" ? (

@@ -1678,14 +1678,23 @@ select {
 
 /* ---------- dashboard ---------- */
 
+/* Issues and Tasks side by side (same height), History as a full-width strip below. */
 .dash {
   flex: 1;
   overflow: auto;
   padding: 12px;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
   align-content: start;
+}
+.dash-card.dash-wide {
+  grid-column: 1 / -1;
+}
+@media (max-width: 900px) {
+  .dash {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 .dash-card {
   border: 1px solid var(--border);
@@ -1752,10 +1761,6 @@ button.dash-risk:hover {
 }
 .dash-url {
   max-width: 45%;
-}
-.dash-facts {
-  grid-template-columns: 100px 1fr;
-  user-select: text;
 }
 
 .sc-scope {
@@ -2116,4 +2121,21 @@ button.chip {
   border-radius: 6px;
   white-space: pre-wrap;
   font-size: 11px;
+}
+
+/* ---------- record a login (Settings › Auth profiles) ---------- */
+
+.record-login {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 760px;
+}
+.record-login p {
+  margin: 0;
+}
+.record-howto {
+  margin: 0;
+  padding-left: 20px;
+  line-height: 1.8;
 }

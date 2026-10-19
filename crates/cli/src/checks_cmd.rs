@@ -45,6 +45,10 @@ pub struct ListArgs {
     tags: Vec<String>,
     #[arg(long, value_delimiter = ',')]
     exclude_tags: Vec<String>,
+    /// Also list checks with these tags (or in a folder of that name), whatever the other
+    /// filters say, as `scan active --check-include-tags` selects them.
+    #[arg(long, value_delimiter = ',')]
+    include_tags: Vec<String>,
     #[arg(long, value_enum)]
     severity: Option<RiskArg>,
     /// List templates that were not loaded instead.
@@ -174,6 +178,7 @@ fn list(project: &Path, home: &Path, a: ListArgs, out: &Out) -> Result<(), Error
         tags: a.tags.clone(),
         exclude_tags: a.exclude_tags.clone(),
         min_risk: a.severity.map(RiskArg::get),
+        include_tags: a.include_tags.clone(),
     };
     let text = a.filter.as_deref().map(str::to_ascii_lowercase);
     let matching: Vec<&checks::Check> = loaded

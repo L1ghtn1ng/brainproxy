@@ -48,6 +48,12 @@ brainproxy checks status
 `~/.local/share/brainproxy`. Checks only run when `scan active --checks` names them.
 `--check-tags` (any of), `--check-exclude-tags` (default `dos,fuzz,intrusive`),
 `--check-ids`, and `--check-severity` narrow the set; `--no-rules` skips the ZAP rules.
+`--check-include-tags` adds checks with those tags, or in a folder of that name, whatever
+the other filters say (Nuclei's `-itags`). The desktop app's scans use
+`--check-include-tags eol` for the end-of-life checks in nuclei-templates'
+`technologies/eol` (outdated PHP, nginx, Apache httpd, WordPress, Drupal, Exchange, ...),
+which are rated info; new ones arrive with `checks update`. `checks list --include-tags`
+shows the same selection.
 Loading is parallel and cheap (about 1 s for the ~9,100 stored Nuclei templates);
 regexes compile on first use.
 
@@ -62,7 +68,8 @@ http(3))`; later blocks only run when needed, JavaScript flows are unsupported).
 Request blocks:
 
 - `method` + `path` list, or `raw` requests (line endings normalized, Content-Length fixed
-  unless `unsafe: true`); `headers`, `body`.
+  unless `unsafe: true`); `headers`, `body`. A raw request's `@timeout: 20s` line sets its
+  timeout; otherwise `scan active --check-timeout` applies (default 10 s).
 - `payloads` with `attack` batteringram | pitchfork | clusterbomb, at most 1000
   combinations per block. A payload is an inline list or a file (one value per non-empty
   line, at most 4 MiB), e.g. `helpers/wordlists/wp-users.txt`. File names are relative
@@ -158,7 +165,7 @@ Not supported (the template is skipped with this reason): `self-contained`, inte
 without an OOB listener, payload files that can't be found inside the root, template inputs without a `--check-var`, JavaScript `flow`, `xpath`
 extractors, regexes with lookaround or backreferences, DSL functions outside the list
 (`date_time`, `wait_for`, `generate_jwt`, `hmac`, ...), `race`, `iterate-all`, digest
-auth, `fuzzing`, and the non-HTTP protocols. On the nuclei-templates commit used during
+auth, the raw annotations `@Host` and `@tls-sni`, `fuzzing`, and the non-HTTP protocols. On the nuclei-templates commit used during
 development (17f5725, Oct 2026), 9,139 of 11,690 HTTP templates load (5,856 before the
 DSL subset) and 9,392 with payload files; the top remaining reasons are
 `self-contained` (938), interactsh (535), and template inputs (534). With an OOB listener

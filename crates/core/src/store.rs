@@ -752,6 +752,11 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// The newest history id (0 when empty).
+    pub fn last_history_id(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT coalesce(max(id), 0) FROM history", [], |r| r.get(0))?)
+    }
+
     pub fn get(&self, id: i64) -> Result<HistoryItem> {
         self.conn
             .query_row(

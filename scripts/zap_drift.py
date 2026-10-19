@@ -29,6 +29,7 @@ ADDON_JAVA = {
     "ascanrulesBeta": "addOns/ascanrulesBeta/src/main/java/org/zaproxy/zap/extension/ascanrulesBeta/{}.java",
     "pscanrulesBeta": "addOns/pscanrulesBeta/src/main/java/org/zaproxy/zap/extension/pscanrulesBeta/{}.java",
     "commonlib": "addOns/commonlib/src/main/java/org/zaproxy/addon/commonlib/{}.java",
+    "retire": "addOns/retire/src/main/java/org/zaproxy/addon/retire/{}.java",
 }
 
 

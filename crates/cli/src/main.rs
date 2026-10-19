@@ -19,6 +19,7 @@ mod proxy_cmd;
 mod report_cmd;
 mod request_args;
 mod scan_cmd;
+mod update_cmd;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -143,6 +144,10 @@ enum Cmd {
         the subset are listed as not loaded, never half-run. Put your own checks in <home>/checks/local."
     )]
     Checks(checks_cmd::ChecksCmd),
+
+    /// Newer brainproxy releases: check GitHub, download the installer or binary (verified).
+    #[command(subcommand)]
+    Update(update_cmd::UpdateCmd),
 
     /// Background jobs (crawl/scan/import --background): list, status, wait, stop.
     #[command(subcommand)]
@@ -385,6 +390,8 @@ fn command_name(cmd: &Cmd) -> String {
             auth_cmd::AuthCmd::List => "auth list",
             auth_cmd::AuthCmd::Show { .. } => "auth show",
             auth_cmd::AuthCmd::Remove { .. } => "auth remove",
+            auth_cmd::AuthCmd::Record(auth_cmd::RecordCmd::Start { .. }) => "auth record start",
+            auth_cmd::AuthCmd::Record(auth_cmd::RecordCmd::Finish { .. }) => "auth record finish",
         },
         Cmd::Job(_) => "job",
         Cmd::Oob(c) => match c {
@@ -400,6 +407,10 @@ fn command_name(cmd: &Cmd) -> String {
             checks_cmd::ChecksCmd::Validate { .. } => "checks validate",
             checks_cmd::ChecksCmd::Update(_) => "checks update",
             checks_cmd::ChecksCmd::Status => "checks status",
+        },
+        Cmd::Update(c) => match c {
+            update_cmd::UpdateCmd::Check { .. } => "update check",
+            update_cmd::UpdateCmd::Download { .. } => "update download",
         },
         Cmd::Findings(_) => "findings",
         Cmd::Report(_) => "report",
@@ -457,8 +468,9 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Job(cmd) => jobs_cmd::job(&cli.project, cmd, out)?,
         Cmd::Checks(cmd) => checks_cmd::checks_cmd(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Oob(cmd) => oob_cmd::oob(&cli.project, cmd, out)?,
+        Cmd::Update(cmd) => update_cmd::update(cmd, out)?,
         Cmd::Engagement(cmd) => engagement_cmd::engagement(&cli.project, cmd, out)?,
-        Cmd::Auth(cmd) => auth_cmd::auth(&cli.project, cmd, out)?,
+        Cmd::Auth(cmd) => auth_cmd::auth(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Findings(cmd) => scan_cmd::findings(&cli.project, cmd, out)?,
         Cmd::Report(args) => report_cmd::report(&cli.project, args, out)?,
         Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,

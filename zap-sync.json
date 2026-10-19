@@ -18,6 +18,10 @@
     {
       "upstream": "addOns/ascanrules/src/main/zapHomeFiles/json/hidden_files.json",
       "ours": "crates/core/src/scan/active/rules/probes/data/hidden_files.json"
+    },
+    {
+      "upstream": "addOns/retire/src/main/resources/org/zaproxy/addon/retire/resources/jsrepository.json",
+      "ours": "crates/core/src/scan/passive/data/jsrepository.json"
     }
   ],
   "skipped": {

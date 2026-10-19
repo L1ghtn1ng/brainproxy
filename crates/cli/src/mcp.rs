@@ -74,6 +74,9 @@ const HINTS: &[(&str, Hints)] = &[
     ("auth list", READ),
     ("auth show", READ),
     ("auth remove", REPLACE),
+    // Starts a browser on the machine running the server.
+    ("auth record start", ADD),
+    ("auth record finish", REPLACE),
     ("project init", SET),
     ("project info", READ),
     ("send", NET),
@@ -123,6 +126,9 @@ const HINTS: &[(&str, Hints)] = &[
     ("checks validate", READ),
     ("checks update", FETCH),
     ("checks status", READ),
+    ("update check", READ_NET),
+    // Saves an installer or binary to the Downloads folder (replacing one of that name).
+    ("update download", FETCH),
     ("job list", READ),
     ("job status", READ),
     ("job wait", READ),

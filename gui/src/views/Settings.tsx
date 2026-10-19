@@ -1,5 +1,5 @@
-// Project and tool settings: auth profiles, match & replace, intercept options, the CA,
-// rule data, project info, and open-source licenses. Each sub-tab loads its data when first shown.
+// Project and tool settings: auth profiles, match & replace, intercept options, proxy setup,
+// the CA, rule data, project info, and open-source licenses. Each sub-tab loads its data when first shown.
 
 import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { run, type CliInput } from "../api";
@@ -7,14 +7,18 @@ import { AUTO_PROXY, autoProxy, useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
 import { interceptEnableArgs, type InterceptSettings } from "./Proxy";
+import { usePoll } from "../ui/usePoll";
+import { RecordLogin } from "./RecordLogin";
+import { AppUpdateSettings } from "./AppUpdate";
 import NOTICE from "../../../NOTICE?raw";
 
-type Sub = "auth" | "rules" | "intercept" | "ca" | "data" | "project" | "licenses";
+type Sub = "auth" | "rules" | "intercept" | "proxy" | "ca" | "data" | "project" | "licenses";
 
 const SUBS: { id: Sub; label: string }[] = [
   { id: "auth", label: "Auth profiles" },
   { id: "rules", label: "Match & replace" },
   { id: "intercept", label: "Intercept options" },
+  { id: "proxy", label: "Proxy" },
   { id: "ca", label: "TLS / CA" },
   { id: "data", label: "Rules & data" },
   { id: "project", label: "Project" },
@@ -36,6 +40,7 @@ export function SettingsView() {
       {sub === "auth" && <Auth />}
       {sub === "rules" && <Rules />}
       {sub === "intercept" && <Intercept />}
+      {sub === "proxy" && <ProxySetup />}
       {sub === "ca" && <Ca />}
       {sub === "data" && <RuleData />}
       {sub === "project" && <Project />}
@@ -255,6 +260,7 @@ function Auth() {
   const [check, setCheck] = useState<{ url: string; status: number | null; logged_in: boolean } | null>(null);
   const [form, setForm] = useState<Form | null>(null);
   const [editing, setEditing] = useState(false);
+  const [recording, setRecording] = useState(false);
   const [busy, setBusy] = useState("");
 
   const load = async () => {
@@ -314,7 +320,18 @@ function Auth() {
         <div className="toolbar">
           <button
             className="btn primary"
+            title="Log in once in a browser; brainproxy works out the profile"
             onClick={() => {
+              setForm(null);
+              setRecording(true);
+            }}
+          >
+            Record a login
+          </button>
+          <button
+            className="btn"
+            onClick={() => {
+              setRecording(false);
               setEditing(false);
               setForm({ ...EMPTY_FORM });
             }}
@@ -325,13 +342,16 @@ function Auth() {
           <span className="muted">{list.length} profiles</span>
         </div>
         <div className="tree">
-          {list.length === 0 && <div className="empty">No auth profiles. Add one to log in automatically with --auth NAME.</div>}
+          {list.length === 0 && (
+            <div className="empty">No auth profiles. Record a login to scan as a logged-in user (--auth NAME).</div>
+          )}
           {list.map((p) => (
             <button
               key={p.name}
               className={`tree-item ${selected === p.name && !form ? "on" : ""}`}
               onClick={() => {
                 setForm(null);
+                setRecording(false);
                 setSelected(p.name);
               }}
             >
@@ -344,7 +364,17 @@ function Auth() {
           ))}
         </div>
       </div>
-      {form ? (
+      {recording ? (
+        <RecordLogin
+          onCancel={() => setRecording(false)}
+          onDone={(name) => {
+            setRecording(false);
+            setSelected(name);
+            show(name);
+            load();
+          }}
+        />
+      ) : form ? (
         <div className="detail">
           <div className="detail-head">
             <h2>{editing ? `Edit ${form.name}` : "New auth profile"}</h2>
@@ -915,6 +945,71 @@ function RuleData() {
         />
         <ConfirmButton label="Reset to embedded" disabled={!!busy} question="Delete the downloaded copies?" onConfirm={() => job("Data reset", ["scan", "data", "reset"])} />
       </div>
+      <AppUpdateSettings />
+    </div>
+  );
+}
+
+// ---------------- Proxy ----------------
+
+interface ProxyStatus {
+  running: boolean;
+  proxy: {
+    listen: string;
+    ca_cert?: string;
+    usage?: { proxy_url: string; curl: string; env: string; trust_ca_for_tools: string; chromium: string; note?: string };
+  } | null;
+  proxy_captures: number;
+  pending_intercepts: number;
+  intercept_enabled: boolean;
+}
+
+/** Whether the proxy runs, and how to point a browser, curl, or a shell at it. */
+function ProxySetup() {
+  const exec = useRunner();
+  const [proxy, refresh] = usePoll<ProxyStatus>(() => run(["proxy", "status"]), 3000);
+  const start = async () => {
+    await exec(["proxy", "start"]);
+    refresh();
+  };
+  const usage = proxy?.proxy?.usage;
+  return (
+    <div className="detail">
+      <div className="detail-head">
+        <h2>Proxy</h2>
+        <span className={proxy?.running ? "s2" : "muted"}>{proxy?.running ? `listening on ${proxy.proxy?.listen}` : "off"}</span>
+        {!proxy?.running && proxy && (
+          <button className="btn small primary" onClick={start}>
+            Start proxy
+          </button>
+        )}
+      </div>
+      {usage ? (
+        <dl className="facts">
+          <dt>Proxy URL</dt>
+          <dd className="mono">{usage.proxy_url}</dd>
+          {proxy?.proxy?.ca_cert && (
+            <>
+              <dt>CA certificate</dt>
+              <dd className="mono">{proxy.proxy.ca_cert}</dd>
+            </>
+          )}
+          <dt>Browser</dt>
+          <dd>Set the HTTP and HTTPS proxy to {usage.proxy_url} and trust the CA certificate above (or import it into the browser; see TLS / CA).</dd>
+          <dt>Chromium</dt>
+          <dd className="mono">{usage.chromium}</dd>
+          <dt>curl</dt>
+          <dd className="mono">{usage.curl}</dd>
+          <dt>Shell</dt>
+          <dd className="mono">{usage.env}</dd>
+          <dt>Captured</dt>
+          <dd>
+            {proxy?.proxy_captures ?? 0} requests{proxy?.intercept_enabled ? ` · intercept on (${proxy.pending_intercepts} held)` : ""}
+          </dd>
+        </dl>
+      ) : (
+        <p className="muted">Start the proxy, then point a browser at it to record traffic into this project.</p>
+      )}
     </div>
   );
 }
@@ -992,6 +1087,7 @@ function Project() {
 /** The projects brainproxy's rules, checks and payloads come from (full terms in NOTICE). */
 const CREDITS: { name: string; what: string; license: string; url: string }[] = [
   { name: "OWASP ZAP", what: "Passive and active scan rules, their alert texts, payloads and data files are ported from ZAP and its add-ons. Copyright the ZAP development team.", license: "Apache-2.0", url: "https://github.com/zaproxy/zaproxy" },
+  { name: "Retire.js", what: "The database of vulnerable JavaScript library versions behind the Vulnerable JS Library rule, as ZAP's retire add-on ships it. Copyright the Retire.js authors.", license: "Apache-2.0", url: "https://github.com/RetireJS/retire.js" },
   { name: "Nuclei and nuclei-templates", what: "Declarative checks run Nuclei HTTP templates (downloaded on request, not bundled); the template format, DSL and interactsh matchers follow Nuclei and interactsh. Copyright ProjectDiscovery, Inc.", license: "MIT", url: "https://github.com/projectdiscovery/nuclei-templates" },
   { name: "SecLists", what: "Fuzzer wordlists (sqli, xss, ssti, usernames, passwords, ...). Copyright Daniel Miessler.", license: "MIT", url: "https://github.com/danielmiessler/SecLists" },
   { name: "PayloadsAllTheThings", what: "Fuzzer wordlists (sqli, xss, path traversal, command injection, nosqli). Copyright Swissky.", license: "MIT", url: "https://github.com/swisskyrepo/PayloadsAllTheThings" },

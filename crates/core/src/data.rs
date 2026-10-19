@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::fetch::{sha256_hex, GitHub};
 use crate::scan::active::rules::probes::hidden_files;
-use crate::scan::passive::rules::content::{application_error, debug_errors};
+use crate::scan::passive::rules::content::{application_error, debug_errors, vulnerable_js};
 use crate::scan::passive::rules::params::common as params_common;
 
 pub const ZAP_REPO: &str = "zaproxy/zap-extensions";
-/// Data files are small; anything bigger is not what we expect.
+/// Data files are small (the Retire.js database is the largest, ~0.6 MiB); anything
+/// bigger is not what we expect.
 const MAX_FILE: usize = 4 << 20;
 
 pub struct DataFile {
@@ -34,7 +35,7 @@ pub struct DataFile {
     pub rules: &'static [u32],
 }
 
-pub static FILES: [DataFile; 4] = [
+pub static FILES: [DataFile; 5] = [
     DataFile {
         name: "application_errors.xml",
         upstream: "addOns/pscanrules/src/main/zapHomeFiles/xml/application_errors.xml",
@@ -62,6 +63,13 @@ pub static FILES: [DataFile; 4] = [
         embedded: hidden_files::EMBEDDED,
         validate: hidden_files::validate,
         rules: &[40035],
+    },
+    DataFile {
+        name: "jsrepository.json",
+        upstream: "addOns/retire/src/main/resources/org/zaproxy/addon/retire/resources/jsrepository.json",
+        embedded: vulnerable_js::EMBEDDED,
+        validate: vulnerable_js::validate,
+        rules: &[10003],
     },
 ];
 
@@ -341,7 +349,7 @@ mod tests {
             .unwrap();
         std::fs::write(src.join("hidden_files.json"), "{\"files\": []}").unwrap();
         let r = update(&home, Source::Dir(src.clone())).await.unwrap();
-        assert_eq!(r.updated.len(), 3, "{r:?}");
+        assert_eq!(r.updated.len(), FILES.len() - 1, "{r:?}");
         assert!(r.rejected["hidden_files.json"].contains("only 0 entries"), "{r:?}");
 
         let s = status(&home);

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brainproxy_core::auth::{AuthProfile, AuthSession, Secret, SessionState};
+use brainproxy_core::auth_record::{Mode, Recorded};
 use brainproxy_core::http::{Client, SendOptions};
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
@@ -58,6 +59,39 @@ pub enum AuthCmd {
     Show { name: String },
     /// Delete a profile and its session.
     Remove { name: String },
+    /// Build a profile by logging in once in a browser: `record start URL`, log in and
+    /// open a page only a logged-in user sees, then `record finish NAME --save`.
+    #[command(subcommand)]
+    Record(RecordCmd),
+}
+
+#[derive(Subcommand)]
+pub enum RecordCmd {
+    /// Open a fresh browser profile at URL through the running proxy and start recording.
+    Start {
+        /// Login page (or the site's start page).
+        url: String,
+        /// Browser id from `browser list` (default: the first one found).
+        #[arg(long)]
+        browser: Option<String>,
+    },
+    /// Turn what the proxy recorded since `start` into a profile: the login request with
+    /// placeholders, its CSRF token and where it comes from, a bearer token, and logged-in
+    /// and logged-out checks. Single sign-on and one-time codes give a session profile.
+    Finish {
+        /// Profile name.
+        name: String,
+        /// Save the profile (else only show what was found).
+        #[arg(long)]
+        save: bool,
+        /// Read the password from this environment variable at login instead of storing
+        /// the recorded one in the project.
+        #[arg(long)]
+        password_env: Option<String>,
+        /// Analyze history after this id instead of since `record start`.
+        #[arg(long)]
+        since: Option<i64>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -174,8 +208,9 @@ fn state_json(state: &SessionState) -> serde_json::Value {
     })
 }
 
-pub fn auth(project: &Path, cmd: AuthCmd, out: &Out) -> Result<(), Error> {
+pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), Error> {
     match cmd {
+        AuthCmd::Record(cmd) => record(project, home, cmd, out)?,
         AuthCmd::Add(a) => {
             let parse = |list: &[String]| {
                 list.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()
@@ -314,6 +349,89 @@ pub fn auth(project: &Path, cmd: AuthCmd, out: &Out) -> Result<(), Error> {
         AuthCmd::Remove { name } => {
             Store::open(project)?.auth_remove(&name)?;
             out.ok(json!({"name": name, "removed": true}), || format!("profile {name:?} removed"));
+        }
+    }
+    Ok(())
+}
+
+const RECORD_KEY: &str = "auth.record";
+
+fn record(project: &Path, home: &Path, cmd: RecordCmd, out: &Out) -> Result<(), Error> {
+    let store = Store::open(project)?;
+    match cmd {
+        RecordCmd::Start { url, browser } => {
+            let guard = crate::project_guard(project)?;
+            crate::require_in_scope(&guard, &brainproxy_core::http::Target::from_url(&url)?)?;
+            let since = store.last_history_id()?;
+            let found = crate::browser_cmd::find();
+            let (browser, _) = crate::browser_cmd::open(project, home, &found, browser, url.clone(), Some("login"))?;
+            store.meta_set(RECORD_KEY, Some(&json!({"since": since, "url": url}).to_string()))?;
+            let data = json!({"since": since, "url": url, "browser": browser});
+            out.ok(data, || {
+                format!(
+                    "Recording from history #{since}. Log in in the browser, open a page only a logged-in user sees, then: \
+                     brainproxy auth record finish NAME --save"
+                )
+            });
+        }
+        RecordCmd::Finish { name, save, password_env, since } => {
+            let started: serde_json::Value =
+                store.meta_get(RECORD_KEY)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+            let since = since.or_else(|| started["since"].as_i64()).ok_or_else(|| {
+                Error::InvalidInput(
+                    "no recording started; run `auth record start URL` first (or pass --since ID)".into(),
+                )
+            })?;
+            let entries = store.list(&brainproxy_core::store::HistoryFilter {
+                after_id: Some(since),
+                source: Some("proxy".into()),
+                limit: Some(5000),
+                ..Default::default()
+            })?;
+            if entries.is_empty() {
+                return Err(Error::NotFound(format!(
+                    "no proxied requests after history #{since}; was the browser opened with `auth record start`?"
+                )));
+            }
+            let recorded: Vec<Recorded> = entries
+                .iter()
+                .filter_map(|e| store.get(e.id).ok())
+                .map(|h| Recorded { id: h.entry.id, target: h.target, request: h.request, response: h.response })
+                .collect();
+            let mut p = brainproxy_core::auth_record::analyze(&recorded, &name, started["url"].as_str());
+            if let Some(var) = &password_env {
+                if p.profile.password.is_some() {
+                    p.profile.password = Some(Secret::Env(var.clone()));
+                }
+            }
+            if save {
+                p.profile.validate()?;
+                store.auth_save_profile(&p.profile)?;
+                store.meta_set(RECORD_KEY, None)?;
+            }
+            let data = json!({
+                "saved": save,
+                "recorded": recorded.len(),
+                "mode": p.mode,
+                "profile": p.profile.redacted(),
+                "evidence": p.evidence,
+                "found": p.found,
+                "warnings": p.warnings,
+            });
+            out.ok(data, || {
+                let mut lines = vec![format!(
+                    "{} profile {name} from {} recorded requests{}",
+                    match p.mode {
+                        Mode::Replay => "Login",
+                        Mode::Session => "Session-only",
+                    },
+                    recorded.len(),
+                    if save { " (saved)" } else { " (not saved; add --save)" }
+                )];
+                lines.extend(p.found.iter().map(|f| format!("  found: {f}")));
+                lines.extend(p.warnings.iter().map(|w| format!("  note:  {w}")));
+                lines.join("\n")
+            });
         }
     }
     Ok(())

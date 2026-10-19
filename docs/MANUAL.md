@@ -42,6 +42,15 @@ Downloads are on the GitHub release page. Each file has a `.sha256` next to it.
 
 The desktop app includes the command-line tool, so you don't need both.
 
+**Updating.** The desktop app checks GitHub for a new version once a day and shows it on the
+Overview, with a button that downloads the installer to your Downloads folder (checked
+against its published sha256) and one that opens it. Close brainproxy before installing.
+Settings › Rules & data turns the check off, or makes the download automatic. On the
+command line, `brainproxy update check` says whether a newer release exists and
+`brainproxy update download` saves the binary for this machine (`--kind gui` for the app
+installer, `--dir` for another folder). Neither installs anything. The AppImage is larger
+than the download limit; get it from the release page.
+
 ---
 
 ## Concepts
@@ -86,7 +95,8 @@ permissions of the folder it is saved in: keep it in your own folders on a share
    application; requests appear in **Proxy › Traffic** and the **Site map**.
 4. **Scan.**
    - **Guided:** the Overview's *Guided scan* asks for the website, whether to log in, and
-     how thorough to be (Quick, Standard, Thorough), then runs and explains the results.
+     how thorough to be (Quick, Standard, Thorough) and how hard it may push the site
+     (Gentle, Normal, Fast), then runs and explains the results.
    - **Yourself:** in **Scans › New scan**, *Crawl and audit* is the default. It crawls the
      site, then attacks every request it found, with the Nuclei templates included at high
      severity and above.
@@ -104,9 +114,10 @@ The sidebar groups the tools by what you are doing.
 
 ### Overview
 - **Guided scan:** shown until a project has a scan.
+- **Update:** shown when a newer brainproxy is out, with Download, Open installer, and
+  What's new.
 - **Rules and checks:** status of the ZAP rule data and Nuclei templates, with downloads.
 - **Issue counts by risk, recent findings, running tasks, traffic statistics.**
-- **Proxy status:** how to point other tools at the proxy.
 
 ### Site map
 - **Map:** a tree of hosts and paths built from recorded traffic. Dots show the highest
@@ -222,7 +233,18 @@ Compare two requests or responses (sent from other tools or pasted) by line, wor
 byte, side by side or unified.
 
 ### Settings
-- **Auth profiles:** how to log in. Give a login URL with method and body (or a raw login
+- **Auth profiles:** how to log in. **Record a login** is the quick way: give the site, log
+  in in the browser that opens (an empty profile, through the proxy), open one page only a
+  logged-in user sees, and click *I'm logged in*. brainproxy finds the login request and
+  turns the username, password, and CSRF token into placeholders, notes where a fresh CSRF
+  token comes from and whether a bearer token from the login response is sent on, and picks
+  a page and pattern that tell logged-in from logged-out; every pattern is checked against
+  the recording. It shows what it found, then saves the profile and tests a real login.
+  Single sign-on on another site or a one-time code can't be replayed: the profile then
+  carries the recorded session until it expires. (CLI: `auth record start URL`,
+  `auth record finish NAME --save`.) The password is kept in the project, as the proxy
+  history already holds the recorded login; give an environment variable name instead to
+  keep it out of the profile. Or set it up by hand: give a login URL with method and body (or a raw login
   request), the username, and the password, preferably as an environment variable name.
   Optionally add a CSRF token to fetch first, a token to extract for an Authorization
   header, and logged-in/logged-out patterns and a check URL. Scans, crawls, the fuzzer, and
@@ -239,8 +261,11 @@ byte, side by side or unified.
     plaintext values in their older requests.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
+- **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
+  Chromium, curl, or a shell at it.
 - **TLS / CA:** the certificate to trust in other tools, with per-OS instructions.
-- **Rules & data:** update the ZAP rule data and Nuclei templates.
+- **Rules & data:** update the ZAP rule data and Nuclei templates; check for a new
+  brainproxy daily, download it automatically, or check now.
 - **Project:** project information, the engagement, and *Start the proxy when a project
   opens*.
 - **Open source licenses:** credits for the projects the rules, checks and wordlists come
@@ -274,7 +299,8 @@ brainproxy browser open --browser chrome https://app.acme.test/
 
 brainproxy send --url https://app.acme.test/search?q=test
 brainproxy crawl https://app.acme.test/ --background
-brainproxy scan active https://app.acme.test/ --crawl --checks nuclei --check-severity high --background
+brainproxy scan active https://app.acme.test/ --crawl --checks nuclei --check-severity high \
+    --check-include-tags eol --background     # plus the end-of-life checks (rated info)
 brainproxy job wait 1
 
 brainproxy fuzz run --url 'https://app.acme.test/search?q=§x§' -p wordlist:sqli --grep 'SQL syntax'
@@ -294,6 +320,14 @@ Crawl and active-scan scope and safety flags:
   other services on the same host.
 - `crawl --rate N` and `scan active --rate N`: at most N requests per second in total,
   whatever `-c` is.
+- `-c N` (default 10): requests in flight at once. More only helps when the target keeps
+  up; it doesn't depend on how many CPUs you have, and the scan uses a few percent of one.
+- A 429 response, or a 503 with `Retry-After`, pauses every request to that site for the
+  time asked (5 s without one, at most 60 s), and the request is sent once more.
+- `scan active --check-timeout S` (default 10): per-request timeout for the Nuclei
+  templates, at most `--timeout`. A template's own `@timeout` line overrides it, so the
+  time-based ones get the wait they need. When several templates send the same GET or HEAD
+  request, it's sent once and they share the response.
 - The crawler submits at most 200 forms per page.
 - `scan active --include-methods DELETE,PUT,PATCH` (or `all`): also attack requests with
   these methods. Requests picked with `--history-id` are attacked whatever their method.
@@ -319,9 +353,16 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 
 ## Rules, checks, and wordlists
 
-- **ZAP rules.** The passive (52) and active (48) scan rules are ported from OWASP ZAP,
+- **ZAP rules.** The passive (53) and active (48) scan rules are ported from OWASP ZAP,
   whose code is Apache-2.0. Their pattern files (error messages, hidden files, and similar)
   are built in, and *Rules and checks › ZAP rule data* fetches the latest ones.
+- **Outdated software.** *Vulnerable JS Library* (10003, from ZAP's retire add-on) checks
+  every script it sees against Retire.js's database of vulnerable jQuery, Angular,
+  Bootstrap, lodash, ... versions and lists the CVEs; the database comes with the ZAP rule
+  data, so the same update refreshes it. The scans in the desktop app also run the Nuclei
+  end-of-life checks (outdated PHP, nginx, Apache httpd, WordPress, Drupal, Exchange, ...),
+  which `checks update` keeps current. Version headers (`Server`, `X-Powered-By`) are
+  reported by their own rules, and many Nuclei CVE templates check versions too.
 - **Nuclei templates.** brainproxy runs Nuclei's HTTP templates itself. Most templates load
   (10,434 of 11,690 at the pinned version); the rest use features it doesn't support yet,
   and `checks list --skipped` says why. Templates needing a username, password, or other

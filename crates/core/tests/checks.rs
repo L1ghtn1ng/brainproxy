@@ -100,7 +100,7 @@ fn run_opts(port: u16, path: &str, templates: &[(&str, &str)], opts: &checks::Lo
         rules: None,
         exclude_rules: vec![],
         no_rules: true,
-        checks: checks::into_rules(loaded.checks),
+        checks: checks::into_rules(loaded.checks, Duration::from_secs(10)),
         max_duration: None,
         auth: None,
         oob: None,
@@ -418,4 +418,43 @@ http:
     // The input overrides the template's own `username` variable.
     let reqs = seen.lock().unwrap();
     assert!(reqs.iter().any(|r| r.ends_with("u=admin")), "{reqs:?}");
+}
+
+#[test]
+fn identical_requests_are_sent_once() {
+    let check = |id: &str, word: &str| {
+        format!(
+            "id: {id}\ninfo: {{name: {id}, severity: medium}}\nhttp:\n  - method: GET\n    path: [\"{{{{BaseURL}}}}/panel\"]\n    matchers:\n      - type: word\n        words: [\"{word}\"]\n"
+        )
+    };
+    let (a, b, c) = (check("a", "Admin"), check("b", "v1.2"), check("c", "nope"));
+    // `@timeout` blocks keep their own request.
+    let timed = "id: d\ninfo: {name: d, severity: medium}\nhttp:\n  - raw:\n      - |\n        @timeout: 3s\n        GET /panel HTTP/1.1\n        Host: {{Hostname}}\n    matchers:\n      - type: word\n        words: [\"Admin\"]\n";
+    let (port, seen) = spawn(|_| resp("200 OK", "", "Admin panel v1.2"));
+    let s = run(port, "/", &[("a.yaml", &a), ("b.yaml", &b), ("c.yaml", &c), ("d.yaml", timed)]);
+    assert_eq!(s.raised.get("check:a"), Some(&1), "{s:?}");
+    assert_eq!(s.raised.get("check:b"), Some(&1), "{s:?}");
+    assert_eq!(s.raised.get("check:d"), Some(&1), "{s:?}");
+    assert!(!s.raised.contains_key("check:c"), "{s:?}");
+    let reqs = seen.lock().unwrap();
+    assert_eq!(reqs.iter().filter(|r| r.starts_with("GET /panel ")).count(), 2, "{reqs:?}");
+    assert_eq!(s.requests, 2);
+}
+
+#[test]
+fn too_many_requests_pauses_and_retries() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    let (port, _) = spawn(move |_| {
+        if h.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            resp("429 Too Many Requests", "Retry-After: 1\r\n", "slow down")
+        } else {
+            resp("200 OK", "", "[core]")
+        }
+    });
+    let started = std::time::Instant::now();
+    let s = run(port, "/", &[("git.yaml", GIT)]);
+    assert_eq!(s.raised.get("check:git-config"), Some(&1), "{s:?}");
+    assert_eq!(s.requests, 2);
+    assert!(started.elapsed() >= Duration::from_secs(1));
 }

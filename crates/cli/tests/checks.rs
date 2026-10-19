@@ -235,7 +235,7 @@ fn scan_data_update_status_reset() {
 
     let (code, v) = run(&["scan", "data", "update", "--from", src.to_str().unwrap()], &project, &home);
     assert_eq!(code, 0, "{v}");
-    assert_eq!(v["data"]["updated"].as_array().unwrap().len(), 4, "{v}");
+    assert_eq!(v["data"]["updated"].as_array().unwrap().len(), sync["data_files"].as_array().unwrap().len(), "{v}");
     let (_, v) = run(&["scan", "data", "status"], &project, &home);
     let dbg = v["data"]["files"].as_array().unwrap().iter().find(|f| f["name"] == "debug-error-messages.txt").unwrap();
     assert_eq!(dbg["active"], "downloaded");

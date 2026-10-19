@@ -5,6 +5,7 @@ import { useState } from "react";
 import { duration, isLive, progress, stateClass, type Job } from "./Scanner";
 import { ScanWizard } from "./Wizard";
 import { UpdatesCard } from "./Updates";
+import { AppUpdateCard } from "./AppUpdate";
 
 const RISKS: Risk[] = ["high", "medium", "low", "info"];
 
@@ -14,18 +15,6 @@ const STATS_SQL = `SELECT count(*) AS requests, count(DISTINCT host) AS hosts, c
 const RISK_SQL = `SELECT risk, count(*) AS n FROM findings WHERE state <> 'false_positive' GROUP BY risk`;
 
 const RECENT_SQL = `SELECT id, name, risk, url, param, time FROM findings WHERE state <> 'false_positive' ORDER BY id DESC LIMIT 8`;
-
-interface ProxyStatus {
-  running: boolean;
-  proxy: {
-    listen: string;
-    ca_cert?: string;
-    usage?: { proxy_url: string; curl: string; env: string; trust_ca_for_tools: string; chromium: string; note?: string };
-  } | null;
-  proxy_captures: number;
-  pending_intercepts: number;
-  intercept_enabled: boolean;
-}
 
 export function DashboardView({ active }: { active: boolean }) {
   const app = useApp();
@@ -41,17 +30,6 @@ export function DashboardView({ active }: { active: boolean }) {
     5000,
     active,
   );
-  const [proxy, refreshProxy] = usePoll<ProxyStatus>(() => run(["proxy", "status"]), 3000, active);
-
-  const startProxy = async () => {
-    try {
-      await run(["proxy", "start"]);
-      refreshProxy();
-    } catch (e: any) {
-      app.toast(e.message, "error");
-    }
-  };
-
   // The guided scan shows until the project has a scan; it remembers its own scan and a
   // "do it myself" choice per project.
   const key = (k: string) => `wizard-${k}:${app.project}`;
@@ -78,7 +56,6 @@ export function DashboardView({ active }: { active: boolean }) {
 
   const s = stats?.rows[0];
   const live = jobs?.jobs.filter(isLive).length ?? 0;
-  const usage = proxy?.proxy?.usage;
   return (
     <div className="dash">
       {showWizard && (
@@ -96,6 +73,7 @@ export function DashboardView({ active }: { active: boolean }) {
           }}
         />
       )}
+      <AppUpdateCard />
       <UpdatesCard />
       <section className="dash-card">
         <header>
@@ -157,7 +135,7 @@ export function DashboardView({ active }: { active: boolean }) {
         )}
       </section>
 
-      <section className="dash-card">
+      <section className="dash-card dash-wide">
         <header>
           <span className="label">History</span>
           <button className="btn small" onClick={() => app.setTab("target")}>
@@ -182,44 +160,6 @@ export function DashboardView({ active }: { active: boolean }) {
           <p className="muted small">
             {new Date(s.first!).toLocaleString()} → {new Date(s.last).toLocaleString()}
           </p>
-        )}
-      </section>
-
-      <section className="dash-card">
-        <header>
-          <span className="label">Proxy</span>
-          <span className={proxy?.running ? "s2" : "muted"}>{proxy?.running ? `listening on ${proxy.proxy?.listen}` : "off"}</span>
-          {!proxy?.running && proxy && (
-            <button className="btn small primary" onClick={startProxy}>
-              Start proxy
-            </button>
-          )}
-        </header>
-        {usage ? (
-          <dl className="facts dash-facts">
-            <dt>Proxy URL</dt>
-            <dd className="mono">{usage.proxy_url}</dd>
-            {proxy?.proxy?.ca_cert && (
-              <>
-                <dt>CA certificate</dt>
-                <dd className="mono">{proxy.proxy.ca_cert}</dd>
-              </>
-            )}
-            <dt>Browser</dt>
-            <dd>Set the HTTP and HTTPS proxy to {usage.proxy_url} and trust the CA certificate above (or import it into the browser).</dd>
-            <dt>Chromium</dt>
-            <dd className="mono">{usage.chromium}</dd>
-            <dt>curl</dt>
-            <dd className="mono">{usage.curl}</dd>
-            <dt>Shell</dt>
-            <dd className="mono">{usage.env}</dd>
-            <dt>Captured</dt>
-            <dd>
-              {proxy?.proxy_captures ?? 0} requests{proxy?.intercept_enabled ? ` · intercept on (${proxy.pending_intercepts} held)` : ""}
-            </dd>
-          </dl>
-        ) : (
-          <p className="muted">Start the proxy, then point a browser at it to record traffic into this project.</p>
         )}
       </section>
     </div>
