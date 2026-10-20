@@ -383,11 +383,20 @@ fn passive_scan_and_findings() {
     let env = Env::new("passive");
     let port = spawn_fixed(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: session=abc; Path=/\r\n\
+         Server: Werkzeug/3.0.3 Python/3.11.17\r\nServer: Werkzeug/3.0.3 Python/3.11\r\n\
          Content-Length: 13\r\nConnection: close\r\n\r\n<html></html>",
     );
     for path in ["/a", "/b", "/a"] {
         env.ok(&["send", "--url", &format!("http://127.0.0.1:{port}{path}")]);
     }
+
+    // Two versioned Server headers (different evidence) are one finding per page.
+    let server = env.ok(&["findings", "list", "--alert", "10036-2"]);
+    assert_eq!(
+        (server["groups"][0]["instances"].as_i64(), server["groups"][0]["hits"].as_i64()),
+        (Some(2), Some(6)),
+        "{server}"
+    );
 
     // Grouped view: one alert type; /a twice counts as one instance with 2 hits.
     let list = env.ok(&["findings", "list", "--alert", "10010"]);

@@ -10,6 +10,9 @@ import { textBytes } from "../api";
 
 type Mode = "raw" | "pretty" | "hex" | "render";
 
+/** Most body characters a read-only view shows before "Show all". */
+const VIEW_CAP = 100_000;
+
 export function normalize(raw: string): string {
   return raw.replace(/\r\n/g, "\n");
 }
@@ -136,9 +139,21 @@ export function HttpView(p: {
   const tooBig = text.length > RENDER_CAP && !big;
   const rendered = useMemo(() => (view === "render" && !tooBig ? renderable(text) : null), [view, tooBig, text]);
   const editable = !!p.onChange && view === "raw";
-  const shown = view === "pretty" ? pretty(text) : text;
+  const shown = useMemo(() => (view === "pretty" ? pretty(text) : text), [view, text]);
   const bytes = useMemo(() => textBytes(p.value, p.binary), [p.value, p.binary]);
-  const nodes = useMemo(() => (view === "hex" ? [hexdump(bytes)] : highlight(shown, query)), [view, shown, bytes, query]);
+  // WebKit lays a long <pre> out again after any change elsewhere on the page (about 0.7 s
+  // for 1.7 MB), so a read-only view shows the headers and a slice of the body: from the
+  // start, or around the first search match. Search counts still cover the whole message.
+  const [all, setAll] = useState(false);
+  useEffect(() => setAll(false), [text]);
+  const slice = useMemo(() => {
+    const [head, sep, body] = splitMessage(shown);
+    if (editable || all || body.length <= VIEW_CAP) return { text: shown, hidden: 0 };
+    const at = query ? body.toLowerCase().indexOf(query.toLowerCase()) : -1;
+    const from = at < VIEW_CAP / 2 ? 0 : body.lastIndexOf("\n", at - VIEW_CAP / 2) + 1;
+    return { text: head + sep + body.slice(from, from + VIEW_CAP), hidden: body.length - VIEW_CAP };
+  }, [shown, editable, all, query]);
+  const nodes = useMemo(() => (view === "hex" ? [hexdump(bytes)] : highlight(slice.text, query)), [view, slice, bytes, query]);
   const hits = useMemo(() => {
     if (!query) return 0;
     const l = shown.toLowerCase();
@@ -225,6 +240,11 @@ export function HttpView(p: {
       <div className="msg-foot">
         <input className="search" placeholder="Search" value={query} onChange={(e) => setQuery(e.target.value)} />
         <span className="muted">{query ? `${hits} match${hits === 1 ? "" : "es"}` : `${bytes.length} bytes`}</span>
+        {slice.hidden > 0 && view !== "hex" && (
+          <button className="link small" onClick={() => setAll(true)} title="Long messages make the whole window slow">
+            {Math.round(slice.hidden / 1024)} KB not shown · Show all
+          </button>
+        )}
       </div>
     </div>
   );

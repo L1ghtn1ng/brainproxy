@@ -99,5 +99,6 @@ Behaviour follows ZAP's default (MEDIUM) alert threshold. The main differences:
   declaration instead of Jericho's XML detection.
 - **Viewstate (10032)** lists analyzer matches sorted; malformed split viewstates raise
   nothing instead of aborting the scan.
-- **Findings are de-duplicated:** the same alert, host, method, path, parameter, and
-  evidence is one finding with a `hits` count.
+- **Findings are de-duplicated:** the same alert, method, URL (without its query) and
+  parameter is one finding with a `hits` count; the first evidence is kept. ZAP lists each
+  differing evidence separately (for example two `Server` headers in one response).

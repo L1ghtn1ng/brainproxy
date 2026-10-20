@@ -1,6 +1,7 @@
-//! Findings storage. Repeated instances of the same issue (same alert, host,
-//! method, path, parameter, and evidence) are folded into one row with a hit
-//! count, so a missing header on 500 pages is one finding per path, not 500 rows.
+//! Findings storage. Repeated instances of the same issue (same alert, method, URL
+//! without its query, and parameter) are folded into one row with a hit count, so a
+//! missing header seen 500 times on a page is one finding, and a response with two
+//! versioned Server headers is one finding, not two. The first evidence is kept.
 
 use rusqlite::params;
 use serde_json::{json, Value};
@@ -69,10 +70,73 @@ pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("attack", "TEXT", "Payload that triggered an active finding"),
     ("history_id", "INTEGER", "history.id where first seen"),
     ("last_history_id", "INTEGER", "history.id where last seen"),
-    ("hits", "INTEGER", "Times seen (same alert, host, method, path, param, evidence)"),
+    ("hits", "INTEGER", "Times seen (same alert, method, URL without query, param)"),
     ("state", "TEXT", "open, confirmed, false_positive"),
     ("note", "TEXT", "Free-text note"),
 ];
+
+/// What makes two findings the same issue. The URL keeps scheme, host and port (two
+/// services on one host are different findings) and drops the query (parameters are `param`).
+fn dedupe_key(alert_ref: &str, method: &str, url: &str, param: &str) -> String {
+    let base = url.split('?').next().unwrap_or(url);
+    format!("{alert_ref}|{method}|{base}|{param}")
+}
+
+/// Schema v10: re-keys findings stored with the old key (which included the evidence and
+/// left out the port) and merges the rows that are now one finding: hits are summed, the
+/// last sighting kept, and a confirmed or false-positive mark wins over open.
+pub(crate) fn rekey_findings(conn: &rusqlite::Connection) -> Result<()> {
+    struct Kept {
+        id: i64,
+        hits: i64,
+        last: Option<i64>,
+        state: String,
+    }
+    let mut kept: std::collections::HashMap<String, Kept> = std::collections::HashMap::new();
+    let mut drop = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, alert_ref, method, url, param, hits, last_history_id, state FROM findings ORDER BY id",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let key = dedupe_key(
+                &r.get::<_, String>(1)?,
+                &r.get::<_, String>(2)?,
+                &r.get::<_, String>(3)?,
+                &r.get::<_, String>(4)?,
+            );
+            let (id, hits, last, state): (i64, i64, Option<i64>, String) = (r.get(0)?, r.get(5)?, r.get(6)?, r.get(7)?);
+            match kept.get_mut(&key) {
+                Some(k) => {
+                    k.hits += hits;
+                    k.last = k.last.max(last);
+                    if k.state == "open" {
+                        k.state = state;
+                    }
+                    drop.push(id);
+                }
+                None => {
+                    kept.insert(key, Kept { id, hits, last, state });
+                }
+            }
+        }
+    }
+    let tx = conn.unchecked_transaction()?;
+    // Temporary unique keys first, so no update collides with a row that is about to go.
+    tx.execute("UPDATE findings SET dedupe = 'v10-' || id", [])?;
+    for id in drop {
+        tx.execute("DELETE FROM findings WHERE id = ?1", [id])?;
+    }
+    for (key, k) in kept {
+        tx.execute(
+            "UPDATE findings SET dedupe = ?1, hits = ?2, last_history_id = ?3, state = ?4 WHERE id = ?5",
+            params![key, k.hits, k.last, k.state, k.id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
 
 impl Store {
     /// Captures after `after_id` from the given sources, ready for scanning.
@@ -146,8 +210,7 @@ impl Store {
                     serde_json::to_string(d.references).unwrap_or_default(),
                     serde_json::to_string(d.tags).unwrap_or_default(),
                 ])?;
-                let dedupe =
-                    format!("{}|{}|{}|{}|{}|{}", d.alert_ref, msg.host, msg.method, msg.path, f.param, f.evidence);
+                let dedupe = dedupe_key(d.alert_ref, &msg.method, &msg.url, &f.param);
                 let hits: i64 = insert.query_row(
                     params![
                         source,
