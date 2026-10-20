@@ -196,7 +196,7 @@ impl Endpoint {
 /// A fresh random token: `bp` + 18 base32 characters (90 bits).
 pub fn new_token() -> Result<String> {
     let mut bytes = [0u8; TOKEN_RANDOM];
-    getrandom::getrandom(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
+    getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
     let mut t = String::from("bp");
     t.extend(bytes.iter().map(|b| BASE32[(b & 31) as usize] as char));
     Ok(t)

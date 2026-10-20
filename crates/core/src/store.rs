@@ -322,7 +322,7 @@ impl Store {
                 rusqlite::hooks::Authorization::Deny
             }
             _ => rusqlite::hooks::Authorization::Allow,
-        }));
+        }))?;
         Self::init(conn)
     }
 
