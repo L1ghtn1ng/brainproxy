@@ -1898,6 +1898,18 @@ button.chip {
 .wiz-choice span {
   color: var(--muted);
 }
+/* A choice that can harm the target (Fast): red even when not selected. */
+.wiz-choice.danger,
+.wiz-choice.danger:hover {
+  border-color: var(--high);
+}
+.wiz-choice.danger b {
+  color: var(--high);
+}
+.wiz-choice.danger.on {
+  background: color-mix(in oklch, var(--high) 14%, var(--panel-2));
+  box-shadow: 0 0 0 1px var(--high);
+}
 .wiz-time {
   font-size: 11.5px;
   color: var(--accent) !important;
@@ -1909,6 +1921,11 @@ button.chip {
   border-left: 3px solid var(--medium);
   background: var(--panel-2);
   line-height: 1.55;
+}
+.wiz-warn.danger {
+  border-left-color: var(--high);
+  background: color-mix(in oklch, var(--high) 12%, var(--panel-2));
+  margin-bottom: 8px;
 }
 .wiz-bar {
   height: 8px;

@@ -47,10 +47,16 @@ const DEPTHS: { id: Depth; title: string; time: string; text: string; args: stri
 type Speed = "gentle" | "normal" | "fast";
 
 /** Requests in flight at once. More only helps when the site keeps up, and it is louder. */
-const SPEEDS: { id: Speed; title: string; text: string; args: string[] }[] = [
+const SPEEDS: { id: Speed; title: string; text: string; args: string[]; danger?: boolean }[] = [
   { id: "gentle", title: "Gentle", text: "For fragile or shared sites. Slower.", args: ["-c", "3"] },
   { id: "normal", title: "Normal", text: "Suits most sites.", args: [] },
-  { id: "fast", title: "Fast", text: "For robust test servers. Much more load on the site.", args: ["-c", "30"] },
+  {
+    id: "fast",
+    title: "Fast",
+    text: "Not recommended. Can overload the site and disrupt it for real users. Only for test servers you can afford to take down.",
+    args: ["-c", "30"],
+    danger: true,
+  },
 ];
 
 const RISK_TEXT: Record<Risk, string> = {
@@ -214,7 +220,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
           <label className="label">How hard may it push the site?</label>
           <div className="wiz-choices three">
             {SPEEDS.map((s) => (
-              <button key={s.id} className={`wiz-choice ${speed === s.id ? "on" : ""}`} onClick={() => setSpeed(s.id)}>
+              <button key={s.id} className={`wiz-choice ${speed === s.id ? "on" : ""} ${s.danger ? "danger" : ""}`} onClick={() => setSpeed(s.id)}>
                 <b>{s.title}</b>
                 <span>{s.text}</span>
               </button>
@@ -236,7 +242,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
               {DEPTHS.find((d) => d.id === depth)!.title} ({DEPTHS.find((d) => d.id === depth)!.time})
             </dd>
             <dt>Speed</dt>
-            <dd>{SPEEDS.find((s) => s.id === speed)!.title}</dd>
+            <dd className={speed === "fast" ? "s5" : ""}>{SPEEDS.find((s) => s.id === speed)!.title}</dd>
             <dt>Extra checks</dt>
             <dd>
               {!checks?.nuclei
@@ -246,6 +252,12 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
                   : "none (Quick skips the Nuclei templates)"}
             </dd>
           </dl>
+          {speed === "fast" && (
+            <div className="wiz-warn danger">
+              <b>Fast can take the site down.</b> It sends up to 30 requests at once with no pause. Use it only on a test
+              server you can afford to disrupt, never on a production or shared site.
+            </div>
+          )}
           <div className="wiz-warn">
             The scan sends real attack requests, as an attacker would. It can create test data, send emails through
             forms, or slow down a fragile site. Prefer a test environment, and only scan systems you have permission to
