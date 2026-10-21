@@ -106,7 +106,7 @@ pub struct Response {
 }
 
 impl Response {
-    fn parse(request: Vec<u8>, raw: Vec<u8>, duration: Duration) -> Result<Self> {
+    pub(crate) fn parse(request: Vec<u8>, raw: Vec<u8>, duration: Duration) -> Result<Self> {
         let mut start = 0;
         while let Ok(h) = parse_response_head(&raw[start..]) {
             if (100..200).contains(&h.status) && h.status != 101 {

@@ -2,7 +2,7 @@
 
 pub(crate) mod content;
 mod cookie_http_only;
-mod headers;
+pub(crate) mod headers;
 pub(crate) mod params;
 
 use crate::scan::PassiveRule;

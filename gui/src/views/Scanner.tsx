@@ -355,7 +355,7 @@ export async function loadSuggestions(): Promise<Suggestions> {
 
 function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id: number) => void }) {
   const app = useApp();
-  const [kind, setKind] = useState<"scan" | "crawl">("scan");
+  const [kind, setKind] = useState<"scan" | "crawl" | "php2shell">("scan");
   const [f, setF] = useState(SCAN_DEFAULTS);
   const [hints, setHints] = useState<Suggestions | null>(null);
   // Downloaded Nuclei templates join active scans by default (high severity and up).
@@ -385,7 +385,20 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
   }, [picked]);
 
   const args = (): string[] =>
-    kind === "crawl"
+    kind === "php2shell"
+      ? [
+          "scan",
+          "active",
+          ...urls(f.urls),
+          "--rules=100002",
+          ...opt("--auth", f.auth),
+          ...opt("--concurrency", f.concurrency),
+          ...opt("--rate", f.rate),
+          ...opt("--timeout", f.timeout),
+          ...flag("--http2", f.http2),
+          ...flag("--verify-tls", f.verifyTls),
+        ]
+      : kind === "crawl"
       ? [
           "crawl",
           ...urls(f.urls),
@@ -435,11 +448,12 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
         ];
 
   const launch = async () => {
-    if (kind === "crawl" && !list(f.urls).length) return app.toast("Give at least one seed URL", "error");
+    if (kind !== "scan" && !list(f.urls).length)
+      return app.toast(kind === "crawl" ? "Give at least one seed URL" : "Give at least one site", "error");
     if (kind === "scan" && mode !== "recorded" && !list(f.urls).length) return app.toast("Give at least one URL, or audit everything recorded", "error");
     try {
       const d = await run<{ job: number }>([...args(), "--background"]);
-      app.toast(`${kind === "crawl" ? "Crawl" : "Active scan"} started (job ${d.job})`);
+      app.toast(`${kind === "crawl" ? "Crawl" : kind === "php2shell" ? "PHP2Shell check" : "Active scan"} started (job ${d.job})`);
       onLaunched(d.job);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -467,6 +481,9 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           </button>
           <button className={kind === "crawl" ? "on" : ""} onClick={() => setKind("crawl")}>
             Crawl
+          </button>
+          <button className={kind === "php2shell" ? "on" : ""} onClick={() => setKind("php2shell")} title="CVE-2026-109618, CVE-2026-109619">
+            PHP2Shell check
           </button>
         </div>
         <span className="muted small">Runs in the background; every request stays inside the engagement scope.</span>
@@ -525,16 +542,28 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
             </p>
           )
         ))}
-      {kind === "crawl" || mode !== "recorded" ? (
+      {kind === "php2shell" && (
+        <p className="muted small sc-all">
+          Looks for PHP2Shell (CVE-2026-109618, CVE-2026-109619) on each site: a reported PHP version without the fix, or
+          PHP that hides its version. A few requests per site; nothing is sent that triggers the bug. Findings are
+          suspected, so confirm the PHP version on the server.
+        </p>
+      )}
+      {kind !== "scan" || mode !== "recorded" ? (
         <label className="sc-field">
           <span className="label">
-            {kind === "crawl" || mode === "crawl" ? "Sites to crawl (start URLs)" : "URLs to attack (only these requests)"}, one per line
+            {kind === "php2shell"
+              ? "Sites to check"
+              : kind === "crawl" || mode === "crawl"
+                ? "Sites to crawl (start URLs)"
+                : "URLs to attack (only these requests)"}
+            , one per line
           </span>
           <textarea
             className="input code sc-urls"
             value={f.urls}
             onChange={(e) => set({ urls: e.target.value })}
-            placeholder={kind === "crawl" ? "https://app.example.com/" : "https://app.example.com/search?q=x"}
+            placeholder={kind === "scan" ? "https://app.example.com/search?q=x" : "https://app.example.com/"}
           />
           {hints && hints.origins.some((o) => !list(f.urls).includes(o)) && (
             <div className="chips">
@@ -584,14 +613,14 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
             {text("Max minutes", "maxMinutes", "no limit")}
             {text("Max targets", "maxTargets", "200")}
           </>
-        ) : (
+        ) : kind === "crawl" ? (
           <>
             {text("Depth", "depth", "5")}
             {text("Max pages", "maxPages", "500")}
             {text("Path prefix", "pathPrefix", "/app/")}
             {text("Header", "headers", "Cookie: session=…", "Sent with every request; for several, use the CLI")}
           </>
-        )}
+        ) : null}
         <label className="sc-field">
           <span className="label">Auth profile</span>
           <select className="input" value={f.auth} onChange={(e) => set({ auth: e.target.value })}>
@@ -616,18 +645,18 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
             {check("Checks only (no rules)", "noRules")}
             {check("No out-of-band", "noOob")}
           </>
-        ) : (
+        ) : kind === "crawl" ? (
           <>
             {check("Include subdomains", "subdomains")}
             {check("Don't submit forms", "noForms")}
           </>
-        )}
+        ) : null}
         {check("HTTP/2", "http2")}
         {check("Verify TLS", "verifyTls")}
       </div>
       <div className="row gap">
         <button className="btn primary" onClick={launch}>
-          Start {kind === "crawl" ? "crawl" : "scan"}
+          Start {kind === "crawl" ? "crawl" : kind === "php2shell" ? "check" : "scan"}
         </button>
         <button className="btn" onClick={() => setF({ ...SCAN_DEFAULTS, urls: hints?.origins.join("\n") ?? "" })}>
           Reset

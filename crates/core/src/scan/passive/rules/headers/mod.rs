@@ -10,7 +10,7 @@ mod cross_domain_misconfiguration;
 mod csp_missing;
 mod heartbleed;
 mod insecure_authentication;
-mod php2shell;
+pub(crate) mod php2shell;
 mod retrieved_from_cache;
 mod server_header;
 mod strict_transport_security;

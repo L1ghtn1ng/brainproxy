@@ -193,6 +193,9 @@ attack type, and pick payloads:
   - **Options:** strength, rules, login profile, speed limits, and *Include Nuclei
     templates* (on when installed, high severity and above by default).
 - **New scan › Crawl:** explore only, no attacks.
+- **New scan › PHP2Shell check:** checks the listed sites for PHP2Shell (CVE-2026-109618,
+  CVE-2026-109619) with active rule 100002 only, a few requests per site. See
+  [ACTIVE_RULES.md](ACTIVE_RULES.md#brainproxys-own-rules).
 - **Tasks:** running and finished scans and crawls with progress; Stop; View findings.
 - **Rules:** turn passive rules on or off, choose which traffic is passively scanned, or
   run the passive scan again.

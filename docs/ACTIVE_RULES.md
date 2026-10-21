@@ -8,6 +8,20 @@ and references are ZAP's.
 Every request a rule sends goes through the engagement scope guard (see the README):
 rules can only reach targets the engagement allows, including when following redirects.
 
+## brainproxy's own rules
+
+These use IDs from 100000, so they never clash with ZAP's.
+
+- **100002 PHP2Shell (Suspected)** (CVE-2026-109618, CVE-2026-109619), once per site. It
+  looks for PHP: an `X-Powered-By` or `Server` header, a `PHPSESSID` cookie, a `.php` page,
+  `/index.php` answering 200, or the PHP-FPM error ("File not found.", "No input file
+  specified.") for a random `.php` path. When PHP reports a fixed version it stays quiet;
+  when the version is affected or hidden it raises a finding (high risk, low confidence).
+  It then sends one small multipart form to the page and notes whether multipart requests
+  get through or look filtered (the suggested stop-gap). Nothing it sends triggers the bug.
+  The passive rule 100001 flags affected versions seen in any traffic. In the app:
+  **Scans › New scan › PHP2Shell check**.
+
 ## Rules
 
 | ID | Rule | Scope | Max risk | Alert refs |
@@ -64,6 +78,7 @@ rules can only reach targets the engagement allows, including when following red
 | 90035 | Server Side Template Injection | param | high | 90035 |
 | 90036 | Server Side Template Injection (Blind) | param | high | 90036 |
 | 90037 | Remote OS Command Injection (Time Based) | param | high | 90037 |
+| 100002 | PHP2Shell PHP Remote Code Execution (Suspected) | host | high | 100002 |
 
 Scopes: `param` runs once per insertion point (query, form, JSON; cookies and headers when
 enabled), `page` once per target request, `host` once per scheme://host:port.

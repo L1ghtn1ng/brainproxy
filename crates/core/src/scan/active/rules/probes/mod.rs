@@ -13,6 +13,7 @@ pub(crate) mod hidden_files;
 mod htaccess;
 mod http_only_site;
 mod https_as_http;
+mod php2shell;
 mod rce_cve_2012_1823;
 mod react2shell;
 mod shellshock;
@@ -38,6 +39,7 @@ pub fn all() -> Vec<Box<dyn ActiveRule>> {
         Box::new(http_only_site::HttpOnlySite),
         Box::new(https_as_http::HttpsAsHttp),
         Box::new(rce_cve_2012_1823::RceCve20121823),
+        Box::new(php2shell::Php2Shell),
         Box::new(react2shell::React2Shell),
         Box::new(shellshock::ShellShock),
         Box::new(source_disclosure_cve_2012_1823::SourceDisclosureCve20121823),

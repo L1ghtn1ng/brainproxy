@@ -6,7 +6,6 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use super::common::headers_block;
 use crate::scan::{AlertDef, Confidence, Finding, Message, PassiveRule, Risk};
 
 static ALERT: AlertDef = AlertDef {
@@ -34,8 +33,7 @@ static ALERT: AlertDef = AlertDef {
 static ALERTS: [&AlertDef; 1] = [&ALERT];
 
 // X-Powered-By: PHP/8.2.20, Server: Apache/2.4.57 (Debian) PHP/8.1.2-1ubuntu2.14
-static PHP: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^(?:X-Powered-By|Server):[^\r\n]*?\b(PHP/(\d+)\.(\d+)\.(\d+)\S*)").unwrap());
+static PHP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(PHP/(\d+)\.(\d+)\.(\d+)\S*)").unwrap());
 
 /// First fixed release per branch (21 Oct 2026). Branches 5.4 to 8.1 have none.
 const FIXED: &[((u32, u32), u32)] = &[((8, 2), 35), ((8, 3), 36), ((8, 4), 27), ((8, 5), 12)];
@@ -48,6 +46,17 @@ fn vulnerable(major: u32, minor: u32, patch: u32) -> bool {
         Some((_, fixed)) => patch < *fixed,
         None => (major, minor) < (8, 2),
     }
+}
+
+/// The first PHP version reported in an `X-Powered-By` or `Server` header, e.g.
+/// "PHP/8.1.2-1ubuntu2.14", and whether that version is affected. Shared with active rule 100002.
+pub(crate) fn reported_php(headers: &[(String, String)]) -> Option<(String, bool)> {
+    let named = |k: &str| k.eq_ignore_ascii_case("X-Powered-By") || k.eq_ignore_ascii_case("Server");
+    headers.iter().filter(|(k, _)| named(k)).find_map(|(_, v)| {
+        let c = PHP.captures(v)?;
+        let n = |i: usize| c[i].parse::<u32>().unwrap_or(0);
+        Some((c[1].to_string(), vulnerable(n(2), n(3), n(4))))
+    })
 }
 
 pub struct Php2Shell;
@@ -66,21 +75,12 @@ impl PassiveRule for Php2Shell {
     }
 
     fn scan(&self, msg: &Message, out: &mut Vec<Finding>) {
-        if !msg.resp_headers.iter().any(|(_, v)| v.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"php/"))) {
-            return;
-        }
-        for line in headers_block(msg).split("\r\n") {
-            let Some(c) = PHP.captures(line) else { continue };
-            let n = |i: usize| c[i].parse::<u32>().unwrap_or(0);
-            if vulnerable(n(2), n(3), n(4)) {
-                let full = &c[1];
-                out.push(ALERT.raise("", full).other_info(format!(
-                    "{full} is in use. The reported version could contain back-ported security fixes (Debian, \
-                     Ubuntu, Red Hat and other distributions keep the upstream number), so check the installed \
-                     package before reporting this as vulnerable."
-                )));
-                return;
-            }
+        if let Some((full, true)) = reported_php(&msg.resp_headers) {
+            out.push(ALERT.raise("", &full).other_info(format!(
+                "{full} is in use. The reported version could contain back-ported security fixes (Debian, Ubuntu, \
+                 Red Hat and other distributions keep the upstream number), so check the installed package before \
+                 reporting this as vulnerable."
+            )));
         }
     }
 }
