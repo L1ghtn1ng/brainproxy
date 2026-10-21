@@ -8,6 +8,12 @@ Rules run automatically on proxy traffic and `send` results (sources are configu
 `brainproxy scan sources`), and before every `findings` command. `brainproxy scan rules`
 lists them; `scan disable ID` / `scan enable ID` switch them.
 
+brainproxy's own rules use IDs from 100000 so they never clash with ZAP's:
+**100001 PHP2Shell** (CVE-2026-109618, CVE-2026-109619) flags a PHP version from
+`X-Powered-By` or `Server` that has no fix (5.4 to 8.1, and 8.2 to 8.5 before 8.2.35,
+8.3.36, 8.4.27, 8.5.12). It only reads the reported version: distributions back-port fixes
+without changing it, and a server that hides its version isn't flagged.
+
 ## Rules
 
 | ID | Rule | Max risk | Alert refs |
@@ -59,13 +65,12 @@ lists them; `scan disable ID` / `scan enable ID` switch them.
 | 10115 | Script Served From Malicious Domain (polyfill) | high | 10115-1, 10115-2 |
 | 10202 | Absence of Anti-CSRF Tokens | medium | 10202 |
 | 90001 | Insecure JSF ViewState | medium | 90001 |
-| 90002 | Java Serialization Object | medium | 90001 | Insecure JSF ViewState | medium | 90001 |
-| 90002 |
+| 90002 | Java Serialization Object | medium | 90002 |
 | 90003 | Sub Resource Integrity Attribute Missing | medium | 90003 |
 | 90011 | Charset Mismatch | info | 90011-1, 90011-2, 90011-4 |
-| 90022 | Application Error Disclosure | medium | 90011 | Charset Mismatch | info | 90011-1, 90011-2, 90011-4 |
-| 90022 |
+| 90022 | Application Error Disclosure | medium | 90022 |
 | 90033 | Loosely Scoped Cookie | info | 90033 |
+| 100001 | PHP2Shell PHP Remote Code Execution (Indicative) | high | 100001 |
 
 Not ported: ZapVersion (ZAP-specific), UsernameIdor (needs configured usernames).
 
