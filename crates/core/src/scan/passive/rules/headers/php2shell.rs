@@ -17,11 +17,14 @@ static ALERT: AlertDef = AlertDef {
     wasc: 20,
     description: "The server reports a PHP version affected by PHP2Shell (CVE-2026-109618, CVE-2026-109619). Two \
         use-after-free bugs in PHP's request handling let an unauthenticated attacker run code on the server with a \
-        crafted multipart/form-data request, which PHP parses before any application code runs. Default \
-        configurations of Apache mod_php and PHP-FPM are affected, from PHP 5.4 on. Exploit tools are public.",
+        crafted multipart/form-data request, which PHP parses before any application code runs. PHP 5.4 \
+        and later are affected. Code execution is confirmed on Apache mod_php with default settings; PHP-FPM, \
+        FrankenPHP and LiteSpeed are likely affected, depending on configuration. Proof-of-concept code circulates.",
     solution: "Update PHP to 8.5.12, 8.4.27, 8.3.36 or 8.2.35 or later. PHP 8.1 and older get no official release: \
-        upgrade, or install your vendor's backported fix. Until then, set session.upload_progress.enabled = 0, and \
-        block multipart/form-data requests where the application doesn't need uploads.",
+        upgrade, or install your vendor's backported fix. Until then, these reduce exposure but \
+        don't make PHP safe: set session.upload_progress.enabled = 0 and memory_limit = -1 (php.ini, php_admin_value \
+        or the FPM pool, not ini_set or .user.ini), lower post_max_size, restart every worker, and block \
+        multipart/form-data requests where the application doesn't need uploads.",
     references: &[
         "https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w",
         "https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp",
@@ -33,17 +36,21 @@ static ALERT: AlertDef = AlertDef {
 static ALERTS: [&AlertDef; 1] = [&ALERT];
 
 // X-Powered-By: PHP/8.2.20, Server: Apache/2.4.57 (Debian) PHP/8.1.2-1ubuntu2.14
-static PHP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(PHP/(\d+)\.(\d+)\.(\d+)\S*)").unwrap());
+static PHP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(PHP/(\d+)\.(\d+)\.(\d+)(\S*))").unwrap());
+
+// "8.5.12-dev", "8.4.27RC1": a pre-release of the fixed version may predate the fix (as nuclei-templates treats it).
+static PRE_RELEASE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^[-+_~.]?(dev|alpha|beta|a\d|b\d|rc\d)").unwrap());
 
 /// First fixed release per branch (21 Oct 2026). Branches 5.4 to 8.1 have none.
 const FIXED: &[((u32, u32), u32)] = &[((8, 2), 35), ((8, 3), 36), ((8, 4), 27), ((8, 5), 12)];
 
-fn vulnerable(major: u32, minor: u32, patch: u32) -> bool {
+fn vulnerable(major: u32, minor: u32, patch: u32, suffix: &str) -> bool {
     if (major, minor) < (5, 4) {
         return false;
     }
     match FIXED.iter().find(|(b, _)| *b == (major, minor)) {
-        Some((_, fixed)) => patch < *fixed,
+        Some((_, fixed)) => patch < *fixed || (patch == *fixed && PRE_RELEASE.is_match(suffix)),
         None => (major, minor) < (8, 2),
     }
 }
@@ -55,7 +62,7 @@ pub(crate) fn reported_php(headers: &[(String, String)]) -> Option<(String, bool
     headers.iter().filter(|(k, _)| named(k)).find_map(|(_, v)| {
         let c = PHP.captures(v)?;
         let n = |i: usize| c[i].parse::<u32>().unwrap_or(0);
-        Some((c[1].to_string(), vulnerable(n(2), n(3), n(4))))
+        Some((c[1].to_string(), vulnerable(n(2), n(3), n(4), &c[5])))
     })
 }
 
@@ -98,7 +105,7 @@ mod tests {
         let f =
             msg("https://a.test/").header("Server", "Apache/2.4.57 (Ubuntu) PHP/8.1.2-1ubuntu2.14").scan(&Php2Shell);
         assert_eq!(f[0].evidence, "PHP/8.1.2-1ubuntu2.14");
-        for v in ["5.4.0", "7.4.33", "8.0.30", "8.3.35", "8.4.26", "8.5.11"] {
+        for v in ["5.4.0", "7.4.33", "8.0.30", "8.3.35", "8.4.26", "8.5.11", "8.5.12-dev", "8.4.27RC1", "8.2.35beta2"] {
             assert_eq!(
                 msg("https://a.test/").header("X-Powered-By", &format!("PHP/{v}")).scan(&Php2Shell).len(),
                 1,
@@ -109,7 +116,18 @@ mod tests {
 
     #[test]
     fn ignores_fixed_unaffected_and_other_headers() {
-        for v in ["5.3.29", "8.2.35", "8.3.36", "8.4.27", "8.5.12", "8.5.13", "8.6.0", "9.0.0"] {
+        for v in [
+            "5.3.29",
+            "8.2.35",
+            "8.3.36",
+            "8.4.27",
+            "8.5.12",
+            "8.5.13",
+            "8.6.0",
+            "9.0.0",
+            "8.2.35-1+deb12u1",
+            "8.5.13-dev",
+        ] {
             assert!(
                 msg("https://a.test/").header("X-Powered-By", &format!("PHP/{v}")).scan(&Php2Shell).is_empty(),
                 "{v}"

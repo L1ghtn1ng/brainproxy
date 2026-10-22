@@ -17,12 +17,14 @@ static ALERT: AlertDef = AlertDef {
     wasc: 20,
     description: "The site runs PHP, and its version is either hidden or affected by PHP2Shell (CVE-2026-109618, \
         CVE-2026-109619). Two use-after-free bugs in PHP's request handling let an unauthenticated attacker run code \
-        on the server with a crafted multipart/form-data request, which PHP parses before any application code runs. \
-        Default configurations of Apache mod_php and PHP-FPM are affected, from PHP 5.4 on. Exploit tools are public.",
+        on the server with a crafted multipart/form-data request, which PHP parses before any application code runs. PHP \
+        5.4 and later are affected. Code execution is confirmed on Apache mod_php with default settings; PHP-FPM, \
+        FrankenPHP and LiteSpeed are likely affected, depending on configuration. Proof-of-concept code circulates.",
     solution: "Check the PHP version on the server. Update to 8.5.12, 8.4.27, 8.3.36 or 8.2.35 or later; PHP 8.1 and \
-        older get no official release, so upgrade or install your vendor's backported fix. Until then, set \
-        session.upload_progress.enabled = 0, and block multipart/form-data requests where the application doesn't \
-        need uploads.",
+        older get no official release, so upgrade or install your vendor's backported fix. Until then, these reduce \
+        exposure but don't make PHP safe: set session.upload_progress.enabled = 0 and memory_limit = -1 (php.ini, \
+        php_admin_value or the FPM pool, not ini_set or .user.ini), lower post_max_size, restart every worker, and \
+        block multipart/form-data requests where the application doesn't need uploads.",
     references: &[
         "https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w",
         "https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp",
