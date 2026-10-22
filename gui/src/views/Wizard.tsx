@@ -1,6 +1,6 @@
 // Guided scan for people who don't live in HTTP: what to test, login, how thorough, then a
 // crawl-and-audit scan with progress and results explained in plain words. Shown on the
-// Overview until the project has a scan.
+// Overview until the project has a scan, and whenever Guided scan opens it.
 
 import { useEffect, useState } from "react";
 import { run, withScheme, type Risk } from "../api";

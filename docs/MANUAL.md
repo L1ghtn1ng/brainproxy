@@ -103,8 +103,13 @@ permissions of the folder it is saved in: keep it in your own folders on a share
 5. **Review.** **Findings** groups issues by type and risk. Each one shows a description,
    evidence, the solution, references, and the request and response. Mark false positives
    and confirmed issues; send a request to **Replay** to verify it by hand.
-6. **Report.** `brainproxy report html -o report.html` (also `markdown`, `json`, `sarif`)
-   creates a report from the findings, leaving out false positives.
+6. **Report.** **Findings › Report…** saves a readable HTML report, leaving out false
+   positives: a summary in plain words, what to fix first, then each issue with what it
+   means, how to fix it, and where it was found, with the technical evidence folded away.
+   Print it from a browser to make a PDF. On the command line: `brainproxy report html -o
+   report.html` (also `markdown`, `json`, `sarif`).
+7. **Retest.** After fixes, scan again and use the Findings comparison: *Not found again
+   by* a scan lists what that scan covered but no longer finds, likely fixed.
 
 ---
 
@@ -113,7 +118,8 @@ permissions of the folder it is saved in: keep it in your own folders on a share
 The sidebar groups the tools by what you are doing.
 
 ### Overview
-- **Guided scan:** shown until a project has a scan.
+- **Guided scan:** shown until a project has a scan; after that, open it with *Guided
+  scan* in the Tasks card or in **Scans › New scan**.
 - **Update:** shown when a newer brainproxy is out, with Download, Open installer, and
   What's new.
 - **Rules and checks:** status of the ZAP rule data and Nuclei templates, with downloads.
@@ -212,6 +218,13 @@ you include them.
 - **Detail:** for each issue, the rule, confidence, CWE/WASC, description, solution,
   references, the evidence highlighted in the response, and the request.
 - **Actions:** mark *open*, *confirmed*, or *false positive*; send the request to Replay.
+- **Compare with a scan:** pick a finished active scan to show only what it found for the
+  first time (*New in*), what it found again (*Still found by*), or what it covered but
+  didn't find again (*Not found again by*: likely fixed). A scan covers a finding when it
+  tested the finding's site (scheme, host and port) and, for active findings, its rule;
+  passive findings (headers, cookies) count only when the scan crawled.
+- **Report…:** saves the HTML report described under [First engagement](#first-engagement-desktop-app)
+  and shows it in Finder or Explorer.
 
 ### Callbacks
 Out-of-band testing for blind vulnerabilities (SSRF, XXE, blind command injection,

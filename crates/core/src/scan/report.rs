@@ -549,7 +549,47 @@ pre{padding:10px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;max-h
 summary{cursor:pointer;color:var(--muted)}
 a{color:var(--info)}
 .note{border-left:3px solid var(--medium);padding:4px 10px}
+.cover{border-bottom:2px solid var(--fg);padding-bottom:8px}.kicker{text-transform:uppercase;letter-spacing:.08em;font-size:.8em;color:var(--muted)}
+.verdict{font-size:1.15em}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;margin:14px 0}
+.card{display:flex;gap:12px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-left-width:5px;border-radius:8px;padding:10px 12px}
+.card .num{font-size:2em;font-weight:700;line-height:1;min-width:1.4em}.card p{margin:4px 0 0;font-size:.9em;color:var(--muted)}
+.high-edge{border-left-color:var(--high)}.medium-edge{border-left-color:var(--medium)}.low-edge{border-left-color:var(--low)}.info-edge{border-left-color:var(--info)}
+.fixfirst li{margin:6px 0}
+.tag{display:inline-block;padding:0 6px;border:1px solid var(--line);border-radius:4px;font-size:.8em}
+.tech{margin:12px 0;border:1px solid var(--line);border-radius:8px;padding:6px 12px}
+@media print{body{font-size:11pt;background:#fff;color:#000}main{max-width:none;padding:0}a{color:inherit;text-decoration:none}
+.card,.inst,tr{break-inside:avoid}h2,h3{break-after:avoid}.tech{display:none}}
 "#;
+
+/// What a risk level means, in plain words, for the report's readers.
+fn risk_meaning(risk: &str) -> &'static str {
+    match risk {
+        "high" => "Serious: could let an attacker steal data or take over accounts. Fix these first.",
+        "medium" => "Important weaknesses that make attacks easier. Plan fixes soon.",
+        "low" => "Minor issues and missing hardening. Fix when convenient.",
+        _ => "Observations, not problems on their own.",
+    }
+}
+
+/// The first sentence of a rule text, for the overview. ZAP texts often put one sentence per
+/// line, and CWE-style ones start with a "Phase: ..." line.
+fn first_sentence(s: &str) -> &str {
+    let line = s.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("Phase:")).unwrap_or("");
+    let end = line
+        .match_indices(". ")
+        .map(|(i, _)| i)
+        .find(|&i| !["etc", "e.g", "i.e"].iter().any(|a| line[..i].ends_with(a)))
+        .map_or(line.len(), |i| i + 1);
+    match line[..end].char_indices().nth(240) {
+        Some((i, _)) => &line[..i],
+        None => &line[..end],
+    }
+}
+
+fn paragraphs(s: &str) -> String {
+    esc(s.trim()).replace("\n\n", "</p><p>").replace('\n', "<br>")
+}
 
 fn html(r: &Report) -> String {
     let mut s = String::new();
@@ -562,51 +602,110 @@ fn html(r: &Report) -> String {
          <title>{}</title><style>{CSS}</style></head><body><main>\n",
         esc(&r.title)
     );
-    let _ = writeln!(s, "<h1>{}</h1>", esc(&r.title));
-    let _ =
-        writeln!(s, "<p class=\"muted\">Generated {} by {} {}.</p>", esc(&r.generated), r.tool.name, r.tool.version);
-    if let Some(scope) = &r.scope {
-        let inc: Vec<String> = scope.include.iter().map(|x| format!("<code>{}</code>", esc(x))).collect();
-        let _ = write!(s, "<p><strong>Scope:</strong> {}", inc.join(", "));
-        if !scope.exclude.is_empty() {
-            let exc: Vec<String> = scope.exclude.iter().map(|x| format!("<code>{}</code>", esc(x))).collect();
-            let _ = write!(s, " (excluding {})", exc.join(", "));
-        }
-        s.push_str("</p>\n");
+    let count = |risk: &str| r.summary.by_risk.iter().find(|c| c.risk == risk).map_or(0, |c| c.count);
+    let instances = || r.alerts.iter().flat_map(|g| &g.instances);
+    let mut hosts: Vec<&str> = instances().map(|i| i.host.as_str()).collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    let first = instances().map(|i| i.time.as_str()).min();
+    let last = instances().map(|i| i.time.as_str()).max();
+
+    let _ = writeln!(
+        s,
+        "<header class=\"cover\"><div class=\"kicker\">Security assessment</div><h1>{}</h1>",
+        esc(&r.title)
+    );
+    let mut facts = vec![format!("Report generated {}", esc(day(&r.generated)))];
+    if let (Some(a), Some(b)) = (first, last) {
+        facts.push(if day(a) == day(b) {
+            format!("issues found on {}", esc(day(a)))
+        } else {
+            format!("issues found {} to {}", esc(day(a)), esc(day(b)))
+        });
     }
-    s.push_str("<h2>Summary</h2>\n<table><thead><tr><th>Risk</th><th class=\"n\">Findings</th></tr></thead><tbody>\n");
-    for rc in &r.summary.by_risk {
-        let _ = writeln!(
+    let _ = writeln!(s, "<p class=\"muted\">{} · {} {}</p></header>", facts.join(" · "), r.tool.name, r.tool.version);
+
+    // ---- At a glance: for readers who stop after the first page.
+    s.push_str("<h2>At a glance</h2>\n");
+    let (high, medium) = (count("high"), count("medium"));
+    let verdict = if r.summary.total == 0 {
+        "The automated tests found no issues that match this report's filters.".to_string()
+    } else if high > 0 {
+        format!(
+            "The tests found <strong>{high} serious issue{}</strong> that should be fixed as soon as possible, \
+             because they could let an attacker steal data or take over accounts.",
+            if high == 1 { "" } else { "s" }
+        )
+    } else if medium > 0 {
+        format!(
+            "No serious issues were found, but <strong>{medium} important weakness{}</strong> make attacks easier \
+             and should be fixed soon.",
+            if medium == 1 { "" } else { "es" }
+        )
+    } else {
+        "No serious or important issues were found; what remains is minor hardening and observations.".to_string()
+    };
+    let _ = writeln!(s, "<p class=\"verdict\">{verdict}</p>");
+    s.push_str("<div class=\"cards\">");
+    for risk in RISKS {
+        let _ = write!(
             s,
-            "<tr><td><span class=\"badge {}\">{}</span></td><td class=\"n\">{}</td></tr>",
-            rc.risk,
-            risk_title(&rc.risk),
-            rc.count
+            "<div class=\"card {risk}-edge\"><div class=\"num\">{}</div><div><span class=\"badge {risk}\">{}</span>\
+             <p>{}</p></div></div>",
+            count(risk),
+            risk_title(risk),
+            risk_meaning(risk)
         );
     }
-    let _ = writeln!(s, "<tr><th>Total</th><th class=\"n\">{}</th></tr></tbody></table>", r.summary.total);
+    s.push_str("</div>\n");
+    let mut tested: Vec<String> =
+        r.scope.iter().flat_map(|sc| &sc.include).map(|x| format!("<code>{}</code>", esc(x))).collect();
+    if tested.is_empty() {
+        tested = hosts.iter().map(|h| format!("<code>{}</code>", esc(h))).collect();
+    }
+    if !tested.is_empty() {
+        let _ = writeln!(s, "<p><strong>What was tested:</strong> {}</p>", tested.join(", "));
+    }
     if r.summary.truncated {
         let _ = writeln!(
             s,
-            "<p class=\"note\">Showing {} of {} findings (raise <code>--limit</code> to include more).</p>",
+            "<p class=\"note\">This report shows {} of {} findings (raise <code>--limit</code> to include more).</p>",
             r.summary.included, r.summary.total
         );
     }
-    if r.alerts.is_empty() {
-        s.push_str("<p>No findings match the filters.</p>\n");
-    } else {
-        s.push_str(
-            "<table><thead><tr><th class=\"n\">#</th><th>Risk</th><th>Alert</th><th class=\"n\">Instances</th></tr></thead><tbody>\n",
-        );
+    let urgent: Vec<(usize, &AlertGroup)> =
+        r.alerts.iter().enumerate().filter(|(_, g)| g.risk == "high" || g.risk == "medium").take(10).collect();
+    if !urgent.is_empty() {
+        s.push_str("<h3>Fix these first</h3><ol class=\"fixfirst\">");
+        for (i, g) in urgent {
+            let n = g.instances.len();
+            let _ = write!(
+                s,
+                "<li><a href=\"#a{}\">{}</a> <span class=\"badge {}\">{}</span> \
+                 <span class=\"muted\">· {n} place{}</span><br>{}</li>",
+                i + 1,
+                esc(&g.name),
+                g.risk,
+                risk_title(&g.risk),
+                if n == 1 { "" } else { "s" },
+                esc(first_sentence(&g.solution))
+            );
+        }
+        s.push_str("</ol>\n");
+    }
+
+    // ---- All issues, most serious first.
+    if !r.alerts.is_empty() {
+        s.push_str("<h2>All issues</h2>\n<table><thead><tr><th class=\"n\">#</th><th>Issue</th><th>Risk</th><th class=\"n\">Places</th></tr></thead><tbody>\n");
         for (i, g) in r.alerts.iter().enumerate() {
             let _ = writeln!(
                 s,
-                "<tr><td class=\"n\">{}</td><td><span class=\"badge {}\">{}</span></td><td><a href=\"#a{}\">{}</a></td><td class=\"n\">{}</td></tr>",
+                "<tr><td class=\"n\">{}</td><td><a href=\"#a{}\">{}</a></td><td><span class=\"badge {}\">{}</span></td><td class=\"n\">{}</td></tr>",
                 i + 1,
-                g.risk,
-                risk_title(&g.risk),
                 i + 1,
                 esc(&g.name),
+                g.risk,
+                risk_title(&g.risk),
                 g.instances.len()
             );
         }
@@ -615,14 +714,45 @@ fn html(r: &Report) -> String {
     for (i, g) in r.alerts.iter().enumerate() {
         let _ = writeln!(
             s,
-            "<h2 id=\"a{}\">{}. {} <span class=\"badge {}\">{}</span></h2>",
+            "<section class=\"issue\"><h2 id=\"a{}\">{}. {} <span class=\"badge {}\">{}</span></h2>",
             i + 1,
             i + 1,
             esc(&g.name),
             g.risk,
             risk_title(&g.risk)
         );
-        let mut meta = vec![format!("Alert <code>{}</code>", esc(&g.alert_ref))];
+        for (h, text) in [("What this means", &g.description), ("How to fix it", &g.solution)] {
+            if !text.trim().is_empty() {
+                let _ = writeln!(s, "<h3>{h}</h3><p>{}</p>", paragraphs(text));
+            }
+        }
+        let _ = writeln!(s, "<h3>Where it was found ({})</h3>", g.instances.len());
+        s.push_str(
+            "<table class=\"where\"><thead><tr><th>Address</th><th>Field</th><th>Certainty</th></tr></thead><tbody>",
+        );
+        for inst in &g.instances {
+            let state = match inst.state.as_str() {
+                "confirmed" => " <span class=\"tag\">confirmed</span>",
+                _ => "",
+            };
+            let _ = write!(
+                s,
+                "<tr><td><code>{} {}</code>{state}</td><td>{}</td><td>{}</td></tr>",
+                esc(&inst.method),
+                esc(&inst.url),
+                if inst.param.is_empty() {
+                    "<span class=\"muted\">–</span>".to_string()
+                } else {
+                    format!("<code>{}</code>", esc(&inst.param))
+                },
+                esc(&inst.confidence)
+            );
+        }
+        s.push_str("</tbody></table>\n");
+
+        // Everything a developer needs to reproduce it, folded away.
+        s.push_str("<details class=\"tech\"><summary>Technical details</summary>");
+        let mut meta = vec![format!("Rule <code>{}</code>", esc(&g.alert_ref))];
         if let Some(c) = g.cwe {
             meta.push(format!("CWE {}", link(&cwe_url(c), &c.to_string())));
         }
@@ -630,19 +760,13 @@ fn html(r: &Report) -> String {
             meta.push(format!("WASC {w}"));
         }
         let _ = writeln!(s, "<p class=\"muted\">{}</p>", meta.join(" · "));
-        for (h, text) in [("Description", &g.description), ("Solution", &g.solution)] {
-            if !text.is_empty() {
-                let _ = writeln!(s, "<h3>{h}</h3><p>{}</p>", esc(text.trim()).replace('\n', "<br>"));
-            }
-        }
         if !g.references.is_empty() {
-            s.push_str("<h3>References</h3><ul>");
+            s.push_str("<p><strong>References</strong></p><ul>");
             for u in &g.references {
                 let _ = write!(s, "<li>{}</li>", link(u, u));
             }
             s.push_str("</ul>\n");
         }
-        let _ = writeln!(s, "<h3>Instances ({})</h3>", g.instances.len());
         for inst in &g.instances {
             let _ = write!(
                 s,
@@ -653,9 +777,10 @@ fn html(r: &Report) -> String {
             let mut row = |k: &str, v: String| {
                 let _ = write!(s, "<dt>{k}</dt><dd>{v}</dd>");
             };
-            row("Finding", format!("#{} · {} · {}× seen", inst.id, esc(&inst.source), inst.hits));
-            row("Confidence", esc(&inst.confidence));
-            row("State", esc(&inst.state));
+            row(
+                "Finding",
+                format!("#{} · {} · {}× seen · {}", inst.id, esc(&inst.source), inst.hits, esc(&inst.state)),
+            );
             for (k, v) in [("Parameter", &inst.param), ("Evidence", &inst.evidence), ("Attack", &inst.attack)] {
                 if !v.is_empty() {
                     row(k, format!("<code>{}</code>", esc(v)));
@@ -666,8 +791,7 @@ fn html(r: &Report) -> String {
             }
             s.push_str("</dl>");
             if !inst.other_info.is_empty() {
-                let _ =
-                    write!(s, "<details><summary>Other info</summary><pre>{}</pre></details>", esc(&inst.other_info));
+                let _ = write!(s, "<pre>{}</pre>", esc(&inst.other_info));
             }
             if let Some(req) = &inst.request {
                 let _ = write!(
@@ -679,9 +803,25 @@ fn html(r: &Report) -> String {
             }
             s.push_str("</div>\n");
         }
+        s.push_str("</details></section>\n");
     }
+
+    // ---- How to read it.
+    s.push_str(
+        "<h2>About this report</h2>\
+         <p>The findings come from automated tests that look at the site's traffic and send attack requests, as an \
+         attacker would. <strong>Certainty</strong> says how sure a test is: low-certainty findings need a person to \
+         confirm them, and some may turn out not to be real. A finding marked <span class=\"tag\">confirmed</span> was \
+         checked by the tester. Automated tests can't find every problem (for example flaws in business logic), so \
+         a short or empty report doesn't prove a site is secure.</p>\n",
+    );
     s.push_str("</main></body></html>\n");
     s
+}
+
+/// "2026-10-22" from an RFC 3339 time.
+fn day(t: &str) -> &str {
+    t.get(..10).unwrap_or(t)
 }
 
 // ---------- SARIF 2.1.0 ----------
@@ -953,6 +1093,19 @@ mod tests {
         assert!(h.contains("&lt;script&gt;"));
         assert!(!h.contains("http://cdn") && !h.contains("<link"), "no external assets");
         assert_eq!(link("javascript:alert(1)", "x"), "x");
+        // Plain-language parts first, technical details folded away.
+        let glance = h.find("<h2>At a glance</h2>").unwrap();
+        assert!(glance < h.find("What this means").unwrap() && h.contains("<details class=\"tech\">"));
+        assert!(h.contains("class=\"verdict\"") && h.contains("About this report"));
+        assert_eq!(first_sentence("Update PHP. Then restart."), "Update PHP.");
+        assert_eq!(first_sentence("No full stop"), "No full stop");
+        assert_eq!(first_sentence(&"é".repeat(300)).chars().count(), 240);
+        assert_eq!(first_sentence("Use X.\nThen Y."), "Use X.");
+        assert_eq!(first_sentence("Phase: Design\nUse a library. More."), "Use a library.");
+        assert_eq!(
+            first_sentence("Set it on the server, proxy, etc. so it applies."),
+            "Set it on the server, proxy, etc. so it applies."
+        );
     }
 
     #[test]

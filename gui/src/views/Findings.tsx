@@ -4,9 +4,22 @@ import { originOf, useApp } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { compareSql, scanScope, type ScanJob, type Seen } from "./compare";
 
 const RISKS: Risk[] = ["high", "medium", "low", "info"];
 const RANK: Record<Risk, number> = { high: 0, medium: 1, low: 2, info: 3 };
+
+type Compare = "all" | Exclude<Seen, "other">;
+const COMPARE: { id: Compare; label: string; title: string }[] = [
+  { id: "all", label: "All findings", title: "Every finding in the project" },
+  { id: "new", label: "New in", title: "First found by this scan" },
+  { id: "still", label: "Still found by", title: "Found before and found again by this scan" },
+  {
+    id: "gone",
+    label: "Not found again by",
+    title: "Found before, but this scan covered the site and rule and didn't find it again: likely fixed. Passive findings count only when the scan crawled.",
+  },
+];
 
 export function RiskBadge({ risk }: { risk: Risk }) {
   return <span className={`risk risk-${risk}`}>{risk}</span>;
@@ -28,17 +41,32 @@ export function FindingsView({ active }: { active: boolean }) {
   const [selected, setSelected] = useState<number | null>(null);
   const [finding, setFinding] = useState<Finding | null>(null);
   const [entry, setEntry] = useState<HistoryEntry | null>(null);
+  // Compare with a scan: what's new, still there, or no longer found (likely fixed).
+  const [compare, setCompare] = useState<Compare>("all");
+  const [scanId, setScanId] = useState<number | null>(null);
+  const [jobs] = usePoll<{ jobs: (ScanJob & { kind: string; state: string })[] }>(() => run(["job", "list", "--limit", "100"]), 10000, active);
+  const scans = useMemo(() => (jobs?.jobs ?? []).filter((j) => j.kind === "active-scan" && (j.state === "completed" || j.state === "stopped")), [jobs]);
+  const scan = scans.find((j) => j.id === scanId) ?? scans[0];
+  const [seenRows, refreshSeen] = usePoll<{ rows: [number, Seen][] }>(
+    () => (scan && compare !== "all" ? run(["query", compareSql(scanScope(scan))]) : Promise.resolve({ rows: [] })),
+    5000,
+    active && compare !== "all",
+  );
+  useEffect(refreshSeen, [scan?.id, compare, refreshSeen]);
+  const seen = useMemo(() => new Map(seenRows?.rows ?? []), [seenRows]);
+  const comparing = compare !== "all" && scan != null;
 
   const groups = useMemo(() => {
     const by = new Map<string, Group>();
     for (const f of data?.items ?? []) {
       if (!risks.has(f.risk) || (hideFp && f.state === "false_positive")) continue;
+      if (comparing && seen.get(f.id) !== compare) continue;
       const g = by.get(f.alert_ref) ?? { ref: f.alert_ref, name: f.name, risk: f.risk, items: [] };
       g.items.push(f);
       by.set(f.alert_ref, g);
     }
     return [...by.values()].sort((a, b) => RANK[a.risk] - RANK[b.risk] || a.name.localeCompare(b.name));
-  }, [data, risks, hideFp]);
+  }, [data, risks, hideFp, comparing, seen, compare]);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
@@ -73,6 +101,26 @@ export function FindingsView({ active }: { active: boolean }) {
     }
   };
 
+  // A readable HTML report (summary, how to fix, evidence folded away) saved where the user picks.
+  const [reporting, setReporting] = useState(false);
+  const saveReport = async () => {
+    const name = app.project.split(/[\\/]/).pop()!.replace(/\.bpdb$/, "");
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    const path = await dialog.save({ defaultPath: `${name}-report.html`, filters: [{ name: "HTML report", extensions: ["html"] }] });
+    if (typeof path !== "string") return;
+    setReporting(true);
+    try {
+      const file = /\.html?$/i.test(path) ? path : `${path}.html`;
+      const r = await run<{ total: number }>(["report", "html", "--output", file, "--force", `--title=${name} security report`]);
+      app.toast(`Report saved with ${r.total} finding${r.total === 1 ? "" : "s"}. Open it in a browser; print it to make a PDF.`);
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(file).catch(() => {});
+    } catch (e: any) {
+      app.toast(e.message, "error");
+    }
+    setReporting(false);
+  };
+
   const toggle = <T,>(set: Set<T>, v: T) => {
     const s = new Set(set);
     s.has(v) ? s.delete(v) : s.add(v);
@@ -92,12 +140,40 @@ export function FindingsView({ active }: { active: boolean }) {
         <label className="check">
           <input type="checkbox" checked={hideFp} onChange={(e) => setHideFp(e.target.checked)} /> Hide false positives
         </label>
+        <select className="input" value={compare} onChange={(e) => setCompare(e.target.value as Compare)} title={COMPARE.find((c) => c.id === compare)!.title}>
+          {COMPARE.map((c) => (
+            <option key={c.id} value={c.id} disabled={c.id !== "all" && !scans.length} title={c.title}>
+              {c.label}
+              {c.id === "all" ? "" : " scan…"}
+            </option>
+          ))}
+        </select>
+        {compare !== "all" && (
+          <select className="input" value={scan?.id ?? ""} onChange={(e) => setScanId(Number(e.target.value))} title="The scan to compare with">
+            {scans.map((j) => (
+              <option key={j.id} value={j.id}>
+                #{j.id} {new Date(j.time).toLocaleString()} · {j.args.filter((a) => /^https?:\/\//i.test(a)).join(" ") || "recorded traffic"}
+              </option>
+            ))}
+          </select>
+        )}
         <span className="grow" />
         <span className="muted">{groups.length} issue types</span>
+        <button className="btn small" disabled={reporting} onClick={saveReport} title="Save a readable HTML report of all findings except false positives">
+          {reporting ? "Saving…" : "Report…"}
+        </button>
       </div>
       <Split id="findings" dir="row" initial={0.34}>
         <div className="tree">
-          {groups.length === 0 && <div className="empty">No findings. Passive rules run on recorded traffic; active scans add more.</div>}
+          {groups.length === 0 && (
+            <div className="empty">
+              {comparing
+                ? compare === "gone"
+                  ? "Nothing that this scan covered is missing: no fixes to show yet."
+                  : "No findings match this comparison."
+                : "No findings. Passive rules run on recorded traffic; active scans add more."}
+            </div>
+          )}
           {groups.map((g) => (
             <div key={g.ref}>
               <button className="tree-group" onClick={() => setOpen(toggle(open, g.ref))}>

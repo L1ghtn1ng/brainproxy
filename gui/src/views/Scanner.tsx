@@ -486,7 +486,10 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
             PHP2Shell check
           </button>
         </div>
-        <span className="muted small">Runs in the background; every request stays inside the engagement scope.</span>
+        <span className="muted small grow">Runs in the background; every request stays inside the engagement scope.</span>
+        <button className="btn small" onClick={() => app.openWizard(true)} title="Opens the step-by-step scan on the Overview">
+          Guided scan
+        </button>
       </div>
       {hints && hints.scope.length > 0 && (
         <div className="row gap sc-scope">

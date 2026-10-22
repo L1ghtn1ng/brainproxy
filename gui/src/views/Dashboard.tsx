@@ -30,8 +30,9 @@ export function DashboardView({ active }: { active: boolean }) {
     5000,
     active,
   );
-  // The guided scan shows until the project has a scan; it remembers its own scan and a
-  // "do it myself" choice per project.
+  // The guided scan shows by itself until the project has a scan, and again whenever it is opened
+  // (Overview > Guided scan, Scans > New scan). It remembers its own scan and a "do it myself"
+  // choice per project.
   const key = (k: string) => `wizard-${k}:${app.project}`;
   const stored = (k: string) => {
     try {
@@ -52,7 +53,7 @@ export function DashboardView({ active }: { active: boolean }) {
   // Scans run from the CLI in the foreground leave findings but no job.
   const [activeFindings] = usePoll<{ rows: [number][] }>(() => run(["query", "SELECT count(*) FROM findings WHERE source = 'active'"]), 10000, active);
   const hasScan = jobs?.jobs.some((j) => j.kind === "active-scan" && j.state !== "failed") || (activeFindings?.rows[0]?.[0] ?? 0) > 0;
-  const showWizard = wizardJob != null || (jobs != null && activeFindings != null && !hasScan && !wizardOff);
+  const showWizard = wizardJob != null || app.wizardOpen || (jobs != null && activeFindings != null && !hasScan && !wizardOff);
 
   const s = stats?.rows[0];
   const live = jobs?.jobs.filter(isLive).length ?? 0;
@@ -64,10 +65,12 @@ export function DashboardView({ active }: { active: boolean }) {
           onStarted={(id) => {
             setWizardJob(id);
             store("job", String(id));
+            app.openWizard(false);
           }}
           onDismiss={() => {
             setWizardOff(true);
             setWizardJob(null);
+            app.openWizard(false);
             store("off", "1");
             store("job", "");
           }}
@@ -113,6 +116,11 @@ export function DashboardView({ active }: { active: boolean }) {
         <header>
           <span className="label">Tasks</span>
           {live > 0 && <span className="count">{live} running</span>}
+          {!showWizard && (
+            <button className="btn small" onClick={() => app.openWizard(true)} title="Check a website step by step">
+              Guided scan
+            </button>
+          )}
           <button className="btn small" onClick={() => app.setTab("scanner")}>
             Open Scans
           </button>

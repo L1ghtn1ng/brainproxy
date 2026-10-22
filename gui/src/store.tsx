@@ -52,6 +52,9 @@ interface State {
   setComparer: (items: string[]) => void;
   toasts: Toast[];
   toast: (text: string, kind?: Toast["kind"]) => void;
+  /** The guided scan on the Overview, opened on request (it also shows by itself until a project has a scan). */
+  wizardOpen: boolean;
+  openWizard: (open: boolean) => void;
 }
 
 const Ctx = createContext<State | null>(null);
@@ -69,6 +72,7 @@ export function AppProvider({ project, children }: { project: string; children: 
   const [fuzzerInput, setFuzzerInput] = useState<Handoff | null>(null);
   const [comparer, setComparer] = useState<string[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [wizardOpen, setWizardOpen] = useState(false);
   const nextKey = useRef(1);
 
   const toast = useCallback((text: string, kind: Toast["kind"] = "info") => {
@@ -91,6 +95,11 @@ export function AppProvider({ project, children }: { project: string; children: 
   const sendToFuzzer = useCallback((h: Handoff) => {
     setFuzzerInput({ ...h });
     setTab("fuzzer");
+  }, []);
+
+  const openWizard = useCallback((open: boolean) => {
+    setWizardOpen(open);
+    if (open) setTab("dashboard");
   }, []);
 
   const sendToComparer = useCallback(
@@ -118,8 +127,10 @@ export function AppProvider({ project, children }: { project: string; children: 
       setComparer,
       toasts,
       toast,
+      wizardOpen,
+      openWizard,
     }),
-    [project, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast],
+    [project, tab, repeater, setRepeater, repeaterActive, sendToRepeater, fuzzerInput, sendToFuzzer, comparer, sendToComparer, toasts, toast, wizardOpen, openWizard],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
