@@ -19,6 +19,11 @@ pub fn nuclei_dir(home: &Path) -> PathBuf {
     home.join("checks").join("nuclei")
 }
 
+/// brainproxy's own checks, from the signed feed (`checks update --source brainproxy`).
+pub fn brainproxy_dir(home: &Path) -> PathBuf {
+    home.join("checks").join("brainproxy")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Manifest {
     pub repository: String,
@@ -38,6 +43,9 @@ pub struct Manifest {
     pub helpers: usize,
     /// Skip reasons with counts, most common first (top 30).
     pub skipped: Vec<(String, usize)>,
+    /// The brainproxy feed: id of the key that signed it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signed_by: String,
 }
 
 pub enum Source {
@@ -135,41 +143,52 @@ pub async fn update(home: &Path, source: Source) -> Result<UpdateResult> {
         std::fs::remove_dir_all(&staging)?;
         return Err(Error::NotFound("no HTTP templates (http/*.yaml) in the source".into()));
     }
-    // Keep only templates that load, so the store is exactly what can run
-    // (payload files resolve against the staging root, later the store).
-    // Templates needing inputs or an OOB listener stay: `--check-var` and
-    // `oob start` enable them at scan time.
-    let opts = super::LoadOptions { any_inputs: true, oob: true, ..Default::default() };
-    let loaded = super::load(std::slice::from_ref(&staging), &opts)?;
-    for s in &loaded.skipped {
-        let _ = std::fs::remove_file(&s.file);
-    }
-    m.stored = loaded.checks.len();
-    m.skipped = loaded.reasons().into_iter().take(30).collect();
+    let (stored, skipped) = keep_loadable(&staging)?;
+    m.stored = stored;
+    m.skipped = skipped;
     m.repository = repository;
     m.reference = reference;
     m.commit = commit;
     m.sha256 = sha256;
     m.source = source_name;
+    install(&staging, &nuclei_dir(home), &mut m)?;
+    Ok(m)
+}
+
+/// Removes the templates in `staging` that don't load, so the store is exactly what
+/// can run (payload files resolve against the staging root, later the store).
+/// Templates needing inputs or an OOB listener stay: `--check-var` and `oob start`
+/// enable them at scan time. Returns the count kept and the skip reasons.
+pub(super) fn keep_loadable(staging: &Path) -> Result<(usize, Vec<(String, usize)>)> {
+    let opts = super::LoadOptions { any_inputs: true, oob: true, ..Default::default() };
+    let loaded = super::load(&[staging.to_path_buf()], &opts)?;
+    for s in &loaded.skipped {
+        let _ = std::fs::remove_file(&s.file);
+    }
+    Ok((loaded.checks.len(), loaded.reasons().into_iter().take(30).collect()))
+}
+
+/// Writes the manifest into `staging` and swaps it in for `dest`.
+pub(super) fn install(staging: &Path, dest: &Path, m: &mut Manifest) -> Result<()> {
     m.updated_unix =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     std::fs::write(
         staging.join("manifest.json"),
         serde_json::to_vec_pretty(&m).map_err(|e| Error::Protocol(e.to_string()))?,
     )?;
-    let dest = nuclei_dir(home);
-    let old = root.join(".nuclei.old");
+    let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let old = dest.with_file_name(format!(".{name}.old"));
     if old.exists() {
         std::fs::remove_dir_all(&old)?;
     }
     if dest.exists() {
-        std::fs::rename(&dest, &old)?;
+        std::fs::rename(dest, &old)?;
     }
-    std::fs::rename(&staging, &dest)?;
+    std::fs::rename(staging, dest)?;
     if old.exists() {
         std::fs::remove_dir_all(&old)?;
     }
-    Ok(m)
+    Ok(())
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -193,16 +212,26 @@ pub struct StoreStatus {
     pub nuclei_dir: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nuclei: Option<Manifest>,
+    pub brainproxy_dir: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brainproxy: Option<Manifest>,
     pub local_dir: PathBuf,
     pub local_files: usize,
 }
 
 pub fn nuclei_status(home: &Path) -> StoreStatus {
-    let nuclei =
-        std::fs::read(nuclei_dir(home).join("manifest.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    let manifest =
+        |dir: &Path| std::fs::read(dir.join("manifest.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
     let mut files = Vec::new();
     let _ = super::walk(&local_dir(home), &mut files);
-    StoreStatus { nuclei_dir: nuclei_dir(home), nuclei, local_dir: local_dir(home), local_files: files.len() }
+    StoreStatus {
+        nuclei: manifest(&nuclei_dir(home)),
+        nuclei_dir: nuclei_dir(home),
+        brainproxy: manifest(&brainproxy_dir(home)),
+        brainproxy_dir: brainproxy_dir(home),
+        local_dir: local_dir(home),
+        local_files: files.len(),
+    }
 }
 
 #[cfg(test)]

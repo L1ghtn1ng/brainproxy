@@ -46,6 +46,45 @@ fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
+/// The check's alert definition, leaked to be `'static` like the ported rules' ones.
+fn alert_def(c: &Check) -> &'static AlertDef {
+    let description = if c.description.is_empty() { c.name.clone() } else { c.description.clone() };
+    Box::leak(Box::new(AlertDef {
+        alert_ref: leak(format!("check:{}", c.id)),
+        name: leak(c.name.clone()),
+        risk: c.risk,
+        confidence: c.confidence,
+        cwe: c.cwe,
+        wasc: 0,
+        description: leak(description),
+        solution: leak(c.remediation.clone()),
+        references: Box::leak(c.references.iter().map(|r| leak(r.clone())).collect::<Vec<_>>().into_boxed_slice()),
+        tags: Box::leak(c.tags.iter().map(|t| leak(t.clone())).collect::<Vec<_>>().into_boxed_slice()),
+    }))
+}
+
+/// A `scope: passive` check: matchers over recorded responses, nothing is sent.
+pub struct PassiveCheck {
+    check: Check,
+    def: &'static AlertDef,
+}
+
+impl PassiveCheck {
+    pub fn def(&self) -> &'static AlertDef {
+        self.def
+    }
+
+    /// `request` is the recorded request's line and headers.
+    pub fn scan(&self, host: &str, request: &str, resp: &Response, out: &mut Vec<crate::scan::Finding>) {
+        out.extend(passive_findings(&self.check, self.def, host, request, resp));
+    }
+}
+
+/// The passive checks among `checks` (their definitions are leaked: load once per process).
+pub fn into_passive(checks: Vec<Check>) -> Vec<PassiveCheck> {
+    checks.into_iter().filter(|c| c.scope == "passive").map(|c| PassiveCheck { def: alert_def(&c), check: c }).collect()
+}
+
 /// Turns loaded checks into active rules. Their alert definitions must be
 /// `'static` like the ported rules' ones, so they are leaked: load once per process.
 /// `timeout` is the per-request timeout (Nuclei's default is 10 s), capped by the
@@ -65,25 +104,9 @@ pub fn into_rules(checks: Vec<Check>, timeout: Duration) -> Vec<&'static dyn Act
     let shared: Arc<HashSet<String>> = Arc::new(seen.into_iter().filter(|(_, n)| *n > 1).map(|(k, _)| k).collect());
     checks
         .into_iter()
+        .filter(|c| c.scope != "passive")
         .map(|c| {
-            let mut description = c.description.clone();
-            if description.is_empty() {
-                description = c.name.clone();
-            }
-            let def: &'static AlertDef = Box::leak(Box::new(AlertDef {
-                alert_ref: leak(format!("check:{}", c.id)),
-                name: leak(c.name.clone()),
-                risk: c.risk,
-                confidence: c.confidence,
-                cwe: c.cwe,
-                wasc: 0,
-                description: leak(description),
-                solution: leak(c.remediation.clone()),
-                references: Box::leak(
-                    c.references.iter().map(|r| leak(r.clone())).collect::<Vec<_>>().into_boxed_slice(),
-                ),
-                tags: Box::leak(c.tags.iter().map(|t| leak(t.clone())).collect::<Vec<_>>().into_boxed_slice()),
-            }));
+            let def = alert_def(&c);
             let rule = CheckRule {
                 name: def.name,
                 alerts: Box::leak(Box::new([def])),
@@ -358,7 +381,9 @@ async fn run_block(rule: &CheckRule, cx: &Cx, block: &Block, vars: &mut HashMap<
                 // for the whole sequence (a missing response means no match).
                 history.push(resp);
                 for e in block.extractors.iter().filter(|e| e.internal) {
-                    if let (Some(name), Some(first)) = (&e.name, extract(cx, &history, e, &v).into_iter().next()) {
+                    if let (Some(name), Some(first)) =
+                        (&e.name, extract(&Env::of(cx), &history, e, &v).into_iter().next())
+                    {
                         v.insert(name.clone(), first);
                     }
                 }
@@ -429,7 +454,7 @@ fn defer_oob(
         }
     }
     for n in names.into_iter().filter(|n| !n.starts_with("interactsh")) {
-        if let Some(v) = dsl_value(cx, seen, vars, n) {
+        if let Some(v) = dsl_value(&Env::of(cx), seen, vars, n) {
             snapshot.insert(n.to_string(), dsl_to_json(v));
         }
     }
@@ -614,18 +639,19 @@ fn build_raw(cx: &Cx, block: &Block, template: &str, vars: &HashMap<String, Stri
 
 /// The text of a part. `seen` holds the responses of the block so far (just
 /// the current one unless req-condition); the last one is the current one.
-fn part_text(cx: &Cx, seen: &[Response], part: &Part) -> String {
+fn part_text(env: &Env, seen: &[Response], part: &Part) -> String {
     let Some(resp) = seen.last() else { return String::new() };
     match part {
         Part::Nth(n, p) => match seen.get(n - 1) {
-            Some(r) => part_text(cx, std::slice::from_ref(r), p),
+            Some(r) => part_text(env, std::slice::from_ref(r), p),
             None => String::new(),
         },
         Part::Body => resp.body_str().to_string(),
         Part::Header => resp.head_text(),
         Part::All => format!("{}{}", resp.head_text(), resp.body_str()),
         Part::Named(h) => resp.headers_named(h).collect::<Vec<_>>().join("\n"),
-        Part::BaselineBody => cx.base_response().body_str().to_string(),
+        Part::BaselineBody => env.baseline.map(|b| b.body_str().to_string()).unwrap_or_default(),
+        Part::RequestHeader => env.request.unwrap_or_default().to_string(),
         // Interactions are matched at correlation (`interaction_matches`).
         Part::Oob(_) => String::new(),
     }
@@ -633,13 +659,13 @@ fn part_text(cx: &Cx, seen: &[Response], part: &Part) -> String {
 
 /// A DSL variable: template values (variables, payloads, extractors) first,
 /// then the response's parts, then a response header (`set_cookie` is `Set-Cookie`).
-fn dsl_value(cx: &Cx, seen: &[Response], vars: &HashMap<String, String>, name: &str) -> Option<Value> {
+fn dsl_value(env: &Env, seen: &[Response], vars: &HashMap<String, String>, name: &str) -> Option<Value> {
     if let Some(v) = vars.get(name) {
         return Some(Value::Str(v.clone()));
     }
     if let Some((base, n)) = super::numbered(name) {
         if let Some(r) = seen.get(n - 1) {
-            return dsl_value(cx, std::slice::from_ref(r), vars, base);
+            return dsl_value(env, std::slice::from_ref(r), vars, base);
         }
     }
     let resp = seen.last()?;
@@ -652,7 +678,8 @@ fn dsl_value(cx: &Cx, seen: &[Response], vars: &HashMap<String, String>, name: &
             resp.header("content-length").and_then(|v| v.trim().parse().ok()).unwrap_or(resp.body.len() as f64),
         ),
         "duration" => Value::Num(resp.duration.as_secs_f64()),
-        "host" => Value::Str(cx.target().host.clone()),
+        "host" => Value::Str(env.host.to_string()),
+        "request_header" if env.request.is_some() => Value::Str(env.request.unwrap_or_default().to_string()),
         _ => {
             let h = name.replace('_', "-");
             let values: Vec<&str> = resp.headers_named(&h).collect();
@@ -665,18 +692,18 @@ fn dsl_value(cx: &Cx, seen: &[Response], vars: &HashMap<String, String>, name: &
 }
 
 /// Whether the matcher matches, with evidence when it does.
-fn matches(cx: &Cx, seen: &[Response], m: &Matcher, vars: &HashMap<String, String>) -> (bool, Option<String>) {
+fn matches(env: &Env, seen: &[Response], m: &Matcher, vars: &HashMap<String, String>) -> (bool, Option<String>) {
     let Some(resp) = seen.last() else { return (false, None) };
     let (hit, evidence) = match &m.kind {
         MatchKind::Dsl(exprs) => {
-            let env = |name: &str| dsl_value(cx, seen, vars, name);
-            let hit = |e: &super::dsl::Expr| e.matches(&env);
+            let lookup = |name: &str| dsl_value(env, seen, vars, name);
+            let hit = |e: &super::dsl::Expr| e.matches(&lookup);
             (if m.and { exprs.iter().all(hit) } else { exprs.iter().any(hit) }, None)
         }
         MatchKind::Status(codes) => (codes.contains(&resp.status), Some(resp.status_line.clone())),
         MatchKind::Size(sizes) => (sizes.contains(&resp.body.len()), None),
         MatchKind::Binary(_) if m.part == Part::Body => text_match_bytes(m, &resp.body),
-        _ => text_match(m, &part_text(cx, seen, &m.part), vars),
+        _ => text_match(m, &part_text(env, seen, &m.part), vars),
     };
     if m.negative {
         (!hit, None)
@@ -719,23 +746,23 @@ fn text_match_bytes(m: &Matcher, bytes: &[u8]) -> (bool, Option<String>) {
     (if m.and { bins.iter().all(has) } else { bins.iter().any(has) }, None)
 }
 
-fn extract(cx: &Cx, seen: &[Response], e: &Extractor, vars: &HashMap<String, String>) -> Vec<String> {
+fn extract(env: &Env, seen: &[Response], e: &Extractor, vars: &HashMap<String, String>) -> Vec<String> {
     let mut out = Vec::new();
     let Some(resp) = seen.last() else { return out };
     match &e.kind {
         ExtractKind::Dsl(exprs) => {
-            let env = |name: &str| dsl_value(cx, seen, vars, name);
-            out.extend(exprs.iter().filter_map(|x| x.eval(&env)).map(Value::into_string).filter(|v| !v.is_empty()));
+            let lookup = |name: &str| dsl_value(env, seen, vars, name);
+            out.extend(exprs.iter().filter_map(|x| x.eval(&lookup)).map(Value::into_string).filter(|v| !v.is_empty()));
         }
         ExtractKind::Json(paths) => {
-            if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&part_text(cx, seen, &e.part)) {
+            if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&part_text(env, seen, &e.part)) {
                 for p in paths {
                     out.extend(super::json_path(&doc, p).into_iter().take(20));
                 }
             }
         }
         ExtractKind::Regex(res, group) => {
-            let text = part_text(cx, seen, &e.part);
+            let text = part_text(env, seen, &e.part);
             for r in res.get() {
                 for c in r.captures_iter(&text).take(20) {
                     if let Some(g) = c.get(*group) {
@@ -754,6 +781,113 @@ fn extract(cx: &Cx, seen: &[Response], e: &Extractor, vars: &HashMap<String, Str
     out
 }
 
+/// What matchers see besides the responses: the target's host and, for an attack,
+/// the baseline response of the attacked request (passive checks have none).
+struct Env<'a> {
+    host: &'a str,
+    baseline: Option<&'a Response>,
+    /// Passive checks: the recorded request's line and headers (`request_header`).
+    request: Option<&'a str>,
+}
+
+impl<'a> Env<'a> {
+    fn of(cx: &'a Cx) -> Self {
+        Env { host: &cx.target().host, baseline: Some(cx.base_response()), request: None }
+    }
+}
+
+/// A block's matcher results and extracted values for one response.
+struct Assessed {
+    results: Vec<(bool, Option<String>)>,
+    extracted: Vec<String>,
+    /// The variables the matchers saw: `vars` plus this response's named extractor values.
+    mvars: HashMap<String, String>,
+}
+
+/// Runs the block's extractors and matchers over a response. Internal extractor
+/// values are stored in `vars`; named ones are visible to this response's DSL matchers.
+fn assess(block: &Block, env: &Env, seen: &[Response], vars: &mut HashMap<String, String>) -> Assessed {
+    let mut extracted = Vec::new();
+    let mut named = HashMap::new();
+    for e in &block.extractors {
+        let values = extract(env, seen, e, vars);
+        if e.internal {
+            if let (Some(name), Some(first)) = (&e.name, values.first()) {
+                vars.insert(name.clone(), first.clone());
+            }
+        } else {
+            if let (Some(name), Some(first)) = (&e.name, values.first()) {
+                named.insert(name.clone(), first.clone());
+            }
+            extracted.extend(values);
+        }
+    }
+    let mut mvars = vars.clone();
+    mvars.extend(named);
+    let results = block.matchers.iter().map(|m| matches(env, seen, m, &mvars)).collect();
+    Assessed { results, extracted, mvars }
+}
+
+/// Whether the block matched: None if not, Some(None) if only internal matchers
+/// held (a flow precondition, nothing to report), else the finding's evidence and
+/// other info.
+fn verdict(check: &Check, block: &Block, a: Assessed) -> Option<Option<(String, String)>> {
+    let matched = if a.results.is_empty() {
+        !a.extracted.is_empty()
+    } else if block.matchers_and {
+        a.results.iter().all(|r| r.0)
+    } else {
+        a.results.iter().any(|r| r.0)
+    };
+    if !matched {
+        return None;
+    }
+    if !block.matchers.is_empty() && block.matchers.iter().all(|m| m.internal) {
+        return Some(None);
+    }
+    let names: Vec<&str> = a
+        .results
+        .iter()
+        .zip(&block.matchers)
+        .filter(|((hit, _), m)| *hit && !m.internal)
+        .filter_map(|(_, m)| m.name.as_deref())
+        .collect();
+    let names = names.join(", ");
+    let evidence =
+        a.results.into_iter().zip(&block.matchers).find_map(|((hit, ev), m)| ev.filter(|_| hit && !m.internal));
+    let evidence = evidence.or_else(|| a.extracted.first().cloned()).unwrap_or_default();
+    let mut info = format!("Check {} ({})", check.id, check.file.display());
+    if !names.is_empty() {
+        info.push_str(&format!("\nMatched: {names}"));
+    }
+    if !a.extracted.is_empty() {
+        let shown: Vec<&str> = a.extracted.iter().take(10).map(String::as_str).collect();
+        info.push_str(&format!("\nExtracted: {}", shown.join(", ")));
+    }
+    Some(Some((evidence, info)))
+}
+
+/// A passive check's findings on one recorded response: one per block that matches.
+fn passive_findings(
+    check: &Check,
+    def: &'static AlertDef,
+    host: &str,
+    request: &str,
+    resp: &Response,
+) -> Vec<crate::scan::Finding> {
+    let env = Env { host, baseline: None, request: Some(request) };
+    let seen = std::slice::from_ref(resp);
+    let mut vars: HashMap<String, String> = check.variables.iter().chain(&check.inputs).cloned().collect();
+    let mut out = Vec::new();
+    for block in &check.blocks {
+        let a = assess(block, &env, seen, &mut vars);
+        if let Some(Some((evidence, info))) = verdict(check, block, a) {
+            out.push(def.raise("", evidence).other_info(info));
+        }
+    }
+    out
+}
+
 /// Applies the block's matchers and extractors to a response and reports a
 /// finding when they match. Internal extractor values are stored in `vars`.
 fn evaluate(
@@ -766,75 +900,24 @@ fn evaluate(
     oob: Option<(&Payload, &[u8])>,
 ) -> bool {
     let Some(resp) = seen.last() else { return false };
-    let mut extracted = Vec::new();
-    // Named extractor values are visible to this response's DSL matchers.
-    let mut named = HashMap::new();
-    for e in &block.extractors {
-        let values = extract(cx, seen, e, vars);
-        if e.internal {
-            if let (Some(name), Some(first)) = (&e.name, values.first()) {
-                vars.insert(name.clone(), first.clone());
-            }
-        } else {
-            if let (Some(name), Some(first)) = (&e.name, values.first()) {
-                named.insert(name.clone(), first.clone());
-            }
-            extracted.extend(values);
-        }
-    }
-    let mvars;
-    let mvars = if named.is_empty() {
-        &*vars
-    } else {
-        mvars = vars.iter().map(|(k, v)| (k.clone(), v.clone())).chain(named).collect::<HashMap<_, _>>();
-        &mvars
-    };
-    let results: Vec<(bool, Option<String>)> = block.matchers.iter().map(|m| matches(cx, seen, m, mvars)).collect();
+    let a = assess(block, &Env::of(cx), seen, vars);
     if block.oob {
         // Interactsh matchers decide later, unless (or) another matcher already holds.
         let immediate: Vec<bool> =
-            results.iter().zip(&block.matchers).filter(|(_, m)| !m.oob).map(|(r, _)| r.0).collect();
+            a.results.iter().zip(&block.matchers).filter(|(_, m)| !m.oob).map(|(r, _)| r.0).collect();
         if block.matchers_and || !immediate.iter().any(|x| *x) {
             if let Some(sent) = oob {
-                defer_oob(rule, cx, block, seen, mvars, attack, sent, &immediate);
+                defer_oob(rule, cx, block, seen, &a.mvars, attack, sent, &immediate);
             }
             return false;
         }
     }
-    let matched = if results.is_empty() {
-        !extracted.is_empty()
-    } else if block.matchers_and {
-        results.iter().all(|r| r.0)
-    } else {
-        results.iter().any(|r| r.0)
-    };
-    let names: Vec<&str> = results
-        .iter()
-        .zip(&block.matchers)
-        .filter(|((hit, _), m)| *hit && !m.internal)
-        .filter_map(|(_, m)| m.name.as_deref())
-        .collect();
-    let names = names.join(", ");
-    let evidence =
-        results.into_iter().zip(&block.matchers).find_map(|((hit, ev), m)| ev.filter(|_| hit && !m.internal));
-    if !matched {
-        return false;
-    }
-    // Internal matchers (flow preconditions) count, but don't report alone.
-    if !block.matchers.is_empty() && block.matchers.iter().all(|m| m.internal) {
-        return true;
-    }
     let check = &rule.check;
-    let evidence = evidence.or_else(|| extracted.first().cloned()).unwrap_or_default();
-    let mut info = format!("Check {} ({})", check.id, check.file.display());
-    if !names.is_empty() {
-        info.push_str(&format!("\nMatched: {names}"));
+    let Some(report) = verdict(check, block, a) else { return false };
+    // Internal matchers (flow preconditions) count, but don't report alone.
+    if let Some((evidence, info)) = report {
+        let param = if check.rule_scope == RuleScope::Param { cx.point().name.clone() } else { String::new() };
+        cx.report(rule.alerts[0].raise(param, evidence).attack(attack).other_info(info), resp);
     }
-    if !extracted.is_empty() {
-        let shown: Vec<&str> = extracted.iter().take(10).map(String::as_str).collect();
-        info.push_str(&format!("\nExtracted: {}", shown.join(", ")));
-    }
-    let param = if check.rule_scope == RuleScope::Param { cx.point().name.clone() } else { String::new() };
-    cx.report(rule.alerts[0].raise(param, evidence).attack(attack).other_info(info), resp);
     true
 }

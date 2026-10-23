@@ -407,6 +407,7 @@ fn command_name(cmd: &Cmd) -> String {
             checks_cmd::ChecksCmd::Validate { .. } => "checks validate",
             checks_cmd::ChecksCmd::Update(_) => "checks update",
             checks_cmd::ChecksCmd::Status => "checks status",
+            checks_cmd::ChecksCmd::Feed(_) => "checks feed",
         },
         Cmd::Update(c) => match c {
             update_cmd::UpdateCmd::Check { .. } => "update check",
@@ -428,6 +429,8 @@ fn command_name(cmd: &Cmd) -> String {
 }
 
 fn run(cli: Cli, out: &Out) -> Result<(), Error> {
+    // Passive scanning, wherever it runs, includes the feed's and your passive checks.
+    brainproxy_core::scan::passive::use_checks_from(&proxy_cmd::resolve_home(cli.home.clone()));
     brainproxy_core::data::set_home(&proxy_cmd::resolve_home(cli.home.clone()));
     match cli.command {
         Cmd::Capabilities { command } => {

@@ -94,5 +94,5 @@ layer 1; fast-moving CVE and exposure checks come in as data through layer 3.
 |---|---|
 | ZAP rule logic changes | Weekly drift issue, then a port (optionally an automated PR) |
 | ZAP pattern list changes | `scan data update` at runtime (layer 2) |
-| New CVE/exposure checks | `checks update` (Nuclei templates) and your own checks (layer 3) |
+| New CVE/exposure checks | `checks update` (Nuclei templates), `checks update --source brainproxy` (brainproxy's signed feed, also daily from the app), and your own checks (layer 3) |
 | New ZAP rules | Listed under "not ported yet" in the drift report |

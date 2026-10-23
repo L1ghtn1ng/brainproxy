@@ -427,7 +427,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ...flag("--no-rules", f.noRules),
           ...opt("--checks", f.checks),
           // End-of-life checks (outdated PHP, nginx, WordPress, ...) whatever the severity chosen.
-          ...(nucleiOn ? ["--checks", "nuclei", "--check-include-tags", "eol"] : []),
+          ...(nucleiOn ? ["--checks", "nuclei,brainproxy", "--check-include-tags", "eol"] : []),
           ...opt("--check-tags", f.checkTags),
           ...opt("--check-severity", f.checkSeverity || (nucleiOn ? nucleiSeverity : "")),
           ...opt("--auth", f.auth),

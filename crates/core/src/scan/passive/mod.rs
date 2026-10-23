@@ -5,6 +5,7 @@
 pub mod rules;
 pub mod util;
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -42,12 +43,50 @@ pub fn all_rules() -> &'static [Box<dyn PassiveRule>] {
     RULES.get_or_init(rules::all)
 }
 
-/// Runs enabled rules over one message.
+static CHECK_HOME: OnceLock<PathBuf> = OnceLock::new();
+
+/// Also run the passive checks (`scope: passive`) of the brainproxy feed and the
+/// local checks under `home`. Call once at startup; without it only the built-in
+/// rules run.
+pub fn use_checks_from(home: &Path) {
+    let _ = CHECK_HOME.set(home.to_path_buf());
+}
+
+/// The passive checks, loaded on first use (templates that don't load are left out,
+/// as `checks list` reports them).
+pub fn checks() -> &'static [crate::checks::PassiveCheck] {
+    static CHECKS: OnceLock<Vec<crate::checks::PassiveCheck>> = OnceLock::new();
+    CHECKS.get_or_init(|| {
+        let Some(home) = CHECK_HOME.get() else { return Vec::new() };
+        let dirs: Vec<PathBuf> = [crate::checks::brainproxy_dir(home), crate::checks::local_dir(home)]
+            .into_iter()
+            .filter(|d| d.is_dir())
+            .collect();
+        match crate::checks::load(&dirs, &Default::default()) {
+            Ok(loaded) => crate::checks::into_passive(loaded.checks),
+            Err(_) => Vec::new(),
+        }
+    })
+}
+
+/// Runs enabled rules, then the passive checks, over one message.
 pub fn scan_message(msg: &Message, disabled: &[u32]) -> Vec<Finding> {
     let mut out = Vec::new();
     for rule in all_rules() {
         if !disabled.contains(&rule.id()) {
             rule.scan(msg, &mut out);
+        }
+    }
+    let checks = checks();
+    if !checks.is_empty() && msg.status != 0 {
+        let resp = crate::scan::active::Response::recorded(msg.status, msg.resp_headers.clone(), msg.resp_body.clone());
+        let query = msg.query.as_deref().map(|q| format!("?{q}")).unwrap_or_default();
+        let mut request = format!("{} {}{query} HTTP/1.1\r\n", msg.method, msg.path);
+        for (k, v) in &msg.req_headers {
+            request.push_str(&format!("{k}: {v}\r\n"));
+        }
+        for c in checks {
+            c.scan(&msg.host, &request, &resp, &mut out);
         }
     }
     out

@@ -132,6 +132,20 @@ impl Response {
         })
     }
 
+    /// A recorded response (passive checks), from its parts; the body is decoded.
+    pub(crate) fn recorded(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            status_line: format!("HTTP/1.1 {status}"),
+            headers,
+            body,
+            duration: Duration::ZERO,
+            request: Vec::new(),
+            raw: Vec::new(),
+            text: OnceLock::new(),
+        }
+    }
+
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }

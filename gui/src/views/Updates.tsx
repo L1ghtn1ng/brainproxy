@@ -1,11 +1,13 @@
-// Overview card: the ZAP rule data and Nuclei templates, whether they're downloaded, and a
-// one-click download. Both live in the user's data folder (not the project), so one download
-// serves every project.
+// Overview card: the ZAP rule data, brainproxy's signed checks, and the Nuclei templates, whether
+// they're downloaded, and a one-click download. They live in the user's data folder (not the
+// project), so one download serves every project. brainproxy's checks also update once a day
+// with the daily version check (Settings › Rules & data).
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { run } from "../api";
 import { useApp } from "../store";
 import { usePoll } from "../ui/usePoll";
+import { autoCheck } from "./AppUpdate";
 import type { Job } from "./Scanner";
 
 interface DataStatus {
@@ -15,7 +17,10 @@ interface DataStatus {
 
 export interface ChecksStatus {
   nuclei: { commit: string; updated_unix: number; stored: number; templates: number } | null;
+  brainproxy?: { commit: string; updated_unix: number; stored: number; signed_by: string } | null;
 }
+
+const DAY = 24 * 3600;
 
 const date = (unix: number) => new Date(unix * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 
@@ -23,7 +28,7 @@ export function UpdatesCard() {
   const app = useApp();
   const [data, refreshData] = usePoll<DataStatus>(() => run(["scan", "data", "status"]), 60000);
   const [checks, refreshChecks] = usePoll<ChecksStatus>(() => run(["checks", "status"]), 60000);
-  const [busy, setBusy] = useState<"" | "data" | "nuclei">("");
+  const [busy, setBusy] = useState<"" | "data" | "nuclei" | "feed">("");
   const [nucleiJob, setNucleiJob] = useState<number | null>(null);
 
   // The Nuclei download runs as a job; follow it until it ends.
@@ -49,6 +54,27 @@ export function UpdatesCard() {
     setBusy("");
   };
 
+  const updateFeed = async (quiet = false) => {
+    setBusy("feed");
+    try {
+      const m = await run<{ stored: number }>(["checks", "update", "--source", "brainproxy"]);
+      refreshChecks();
+      if (!quiet) app.toast(`brainproxy checks updated: ${m.stored} checks, signature verified.`);
+    } catch (e: any) {
+      if (!quiet) app.toast(e.message, "error");
+    }
+    setBusy("");
+  };
+
+  // Once a day with the version check: new CVE checks arrive without a new app version.
+  const autoFed = useRef(false);
+  useEffect(() => {
+    if (!checks || autoFed.current || !autoCheck()) return;
+    autoFed.current = true;
+    const f = checks.brainproxy;
+    if (!f || Date.now() / 1000 - f.updated_unix > DAY) updateFeed(true);
+  }, [checks]);
+
   const updateNuclei = async () => {
     setBusy("nuclei");
     try {
@@ -61,7 +87,8 @@ export function UpdatesCard() {
   };
 
   if (!data || !checks) return null;
-  const missing = !data.manifest || !checks.nuclei;
+  const missing = !data.manifest || !checks.nuclei || !checks.brainproxy;
+  const feed = checks.brainproxy;
   return (
     <section className={`dash-card updates ${missing ? "attention" : ""}`}>
       <header>
@@ -90,6 +117,23 @@ export function UpdatesCard() {
         </div>
         <div className="upd-row">
           <div className="upd-text">
+            <b>brainproxy checks</b>
+            <span className="muted">
+              Checks for new CVEs from the brainproxy project, published between releases and signed. Passive ones look
+              at the traffic you record; the others run in scans.
+            </span>
+            <span className={feed ? "upd-ok" : "upd-warn"}>
+              {feed
+                ? `${feed.stored} checks, signature verified, updated ${date(feed.updated_unix)}${feed.commit ? ` (${feed.commit.slice(0, 7)})` : ""}`
+                : "Not installed"}
+            </span>
+          </div>
+          <button className={`btn ${feed ? "" : "primary"}`} disabled={busy !== ""} onClick={() => updateFeed()}>
+            {busy === "feed" ? "Updating…" : feed ? "Update" : "Download"}
+          </button>
+        </div>
+        <div className="upd-row">
+          <div className="upd-text">
             <b>Nuclei templates</b>
             <span className="muted">
               About 10,000 community checks for known CVEs, exposed admin panels, default logins, and misconfigurations,
@@ -107,7 +151,8 @@ export function UpdatesCard() {
         </div>
       </div>
       <p className="muted small">
-        Downloads come from GitHub (zaproxy/zap-extensions, projectdiscovery/nuclei-templates) and are checked before use.
+        Downloads come from GitHub (zaproxy/zap-extensions, r4nd0mth1ngs/brainproxy, projectdiscovery/nuclei-templates) and
+        are checked before use.
         They're stored once for your user and shared by all projects.
       </p>
     </section>

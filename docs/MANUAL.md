@@ -122,7 +122,7 @@ The sidebar groups the tools by what you are doing.
   scan* in the Tasks card or in **Scans › New scan**.
 - **Update:** shown when a newer brainproxy is out, with Download, Open installer, and
   What's new.
-- **Rules and checks:** status of the ZAP rule data and Nuclei templates, with downloads.
+- **Rules and checks:** status of the ZAP rule data, brainproxy checks (signed checks for new CVEs, updated daily when the version check is on) and Nuclei templates, with downloads.
 - **Issue counts by risk, recent findings, running tasks, traffic statistics.**
 
 ### Site map

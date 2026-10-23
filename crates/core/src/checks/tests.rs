@@ -1,4 +1,5 @@
 use super::*;
+use base64::Engine;
 
 fn unsupported_reason(yaml: &str) -> String {
     match parse(yaml, Path::new("t.yaml"), None, &LoadOptions::default()) {
@@ -458,4 +459,177 @@ fn raw_annotations() {
     assert_eq!(parse_str(&raw("GET / HTTP/1.1")).unwrap().blocks[0].timeout, None);
     assert!(unsupported_reason(&raw("@Host: https://other:443\nGET / HTTP/1.1")).contains("@Host"));
     assert!(invalid_reason(&raw("@timeout: soon\nGET / HTTP/1.1")).contains("@timeout"));
+}
+
+fn passive_check(yaml: &str) -> PassiveCheck {
+    let c = parse(yaml, Path::new("t.yaml"), None, &LoadOptions::default()).unwrap_or_else(|_| panic!("loads"));
+    into_passive(vec![c]).pop().expect("a passive check")
+}
+
+fn passive_hits(c: &PassiveCheck, request: &str, status: u16, headers: &[(&str, &str)]) -> usize {
+    let headers = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let resp = crate::scan::active::Response::recorded(status, headers, Vec::new());
+    let mut out = Vec::new();
+    c.scan("a.test", request, &resp, &mut out);
+    out.len()
+}
+
+#[test]
+fn passive_scope() {
+    let ok = "id: p\ninfo: {severity: low}\nscope: passive\nhttp:\n  - matchers:\n      - type: word\n        part: header\n        words: [X-Debug]\n";
+    let c = parse(ok, Path::new("t.yaml"), None, &LoadOptions::default()).unwrap_or_else(|_| panic!("loads"));
+    assert_eq!((c.scope, c.requests), ("passive", 0));
+    // Passive checks aren't active rules, and active ones aren't passive.
+    assert!(into_rules(vec![c.clone()], std::time::Duration::from_secs(1)).is_empty());
+    assert!(into_passive(vec![parse_str(GIT_CONFIG).unwrap()]).is_empty());
+    let p = passive_check(ok);
+    assert_eq!(passive_hits(&p, "GET / HTTP/1.1\r\n", 200, &[("X-Debug", "1")]), 1);
+    assert_eq!(passive_hits(&p, "GET / HTTP/1.1\r\n", 200, &[("X-Other", "1")]), 0);
+    // Nothing that sends, and nothing that needs more than one recorded response.
+    for (block, why) in [
+        ("  - path: ['{{BaseURL}}/x']\n    matchers: [{type: status, status: [200]}]", "only have matchers"),
+        ("  - matchers: [{type: word, part: body_2, words: [x]}]", "one recorded response"),
+        ("  - matchers: [{type: word, part: baseline_body, words: [x]}]", "one recorded response"),
+    ] {
+        let y = format!("id: p\ninfo: {{severity: low}}\nscope: passive\nhttp:\n{block}\n");
+        assert!(invalid_reason(&y).contains(why), "{block}: {}", invalid_reason(&y));
+    }
+    let active = "id: a\ninfo: {severity: low}\nhttp:\n  - path: ['{{BaseURL}}/']\n    matchers: [{type: word, part: request_header, words: [x]}]\n";
+    assert!(invalid_reason(active).contains("needs scope: passive"));
+}
+
+/// PHP2Shell rule 100001's version test re-expressed as a passive check: the format
+/// carries it (named extractor values feed DSL matchers), so built-in version rules
+/// can move to the feed.
+#[test]
+fn passive_check_expresses_php2shell_version_rule() {
+    let c = passive_check(
+        r#"
+id: php2shell-version
+info: {severity: high}
+scope: passive
+http:
+  - extractors:
+      - type: regex
+        name: v
+        part: header
+        group: 1
+        regex: ['(?i)\bPHP/(\d+\.\d+\.\d+)']
+    matchers:
+      - type: dsl
+        dsl:
+          - "compare_versions(v, '>= 5.4.0, < 8.2.0') || compare_versions(v, '>= 8.2.0, < 8.2.35') || compare_versions(v, '>= 8.3.0, < 8.3.36') || compare_versions(v, '>= 8.4.0, < 8.4.27') || compare_versions(v, '>= 8.5.0, < 8.5.12')"
+"#,
+    );
+    let hit = |h: &str| passive_hits(&c, "GET / HTTP/1.1\r\n", 200, &[("X-Powered-By", h)]) > 0;
+    assert!(hit("PHP/8.2.34") && hit("PHP/7.4.33") && hit("PHP/8.5.11"));
+    assert!(!hit("PHP/8.2.35") && !hit("PHP/8.5.12") && !hit("PHP/5.3.29") && !hit("Express"));
+}
+
+#[test]
+fn feed_brotli_check_flags_accepted_br_bodies() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../feed/passive/brotli/brotli-request-body-accepted.yaml");
+    let c = passive_check(&std::fs::read_to_string(path).unwrap());
+    let br = "POST /api HTTP/1.1\r\nContent-Type: application/json\r\nContent-Encoding: br\r\n";
+    assert_eq!(passive_hits(&c, br, 200, &[]), 1);
+    assert_eq!(passive_hits(&c, &br.replace("br\r", "gzip, BR\r"), 201, &[]), 1);
+    // Refused (Express 4 answers 415), not compressed, or only accepting br responses.
+    assert_eq!(passive_hits(&c, br, 415, &[]), 0);
+    assert_eq!(passive_hits(&c, &br.replace("br\r", "gzip\r"), 200, &[]), 0);
+    assert_eq!(passive_hits(&c, "GET / HTTP/1.1\r\nAccept-Encoding: gzip, br\r\n", 200, &[]), 0);
+}
+
+/// A key for tests only (never trusted by a build).
+const TEST_KEY: &str =
+    "MFECAQEwBQYDK2VwBCIEIBpRIkmizhbv7dGtJc9/G+zkXw6t7WRZcrnkbDkqkEv8gSEAGpYIJV1dKseRAbg2qOXP+7CX7vxHR9P+Gap3jDwYgCo=";
+const TEST_PUBLIC: &str = "GpYIJV1dKseRAbg2qOXP+7CX7vxHR9P+Gap3jDwYgCo=";
+
+#[tokio::test]
+async fn feed_is_signed_and_verified() {
+    let base = std::env::temp_dir().join(format!("bp-feed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = base.join("repo/feed");
+    std::fs::create_dir_all(src.join("http")).unwrap();
+    std::fs::write(src.join("http/git.yaml"), GIT_CONFIG).unwrap();
+    let (id, n) = feed::sign(&src, TEST_KEY).unwrap();
+    assert_eq!((id.len(), n), (16, 1));
+    let home = base.join("home");
+    let keys = &[TEST_PUBLIC];
+    // A file added after signing isn't installed: only what feed.json lists is.
+    std::fs::write(src.join("http/unsigned.yaml"), GIT_CONFIG.replace("id: git-config", "id: unsigned")).unwrap();
+    let m = feed::update_with(&home, Source::Dir(base.join("repo")), keys).await.unwrap();
+    assert_eq!((m.templates, m.stored, m.signed_by.as_str()), (1, 1, id.as_str()));
+    assert!(brainproxy_dir(&home).join("http/git.yaml").is_file());
+    assert!(!brainproxy_dir(&home).join("http/unsigned.yaml").exists());
+    assert_eq!(nuclei_status(&home).brainproxy.unwrap().signed_by, id);
+    assert_eq!(load(&resolve_selectors(&home, &["all".into()]), &Default::default()).unwrap().checks.len(), 1);
+
+    // Tampering anywhere fails the update and keeps the installed store.
+    let fails = |what: &str| {
+        let (home, src, base) = (home.clone(), src.clone(), base.clone());
+        let what = what.to_string();
+        async move {
+            let e = feed::update_with(&home, Source::Dir(src.clone()), keys).await.unwrap_err().to_string();
+            assert!(brainproxy_dir(&home).join("http/git.yaml").is_file(), "{what}: store kept");
+            assert!(!base.join("home/checks/.brainproxy.new").exists(), "{what}: staging removed");
+            e
+        }
+    };
+    std::fs::write(src.join("http/git.yaml"), GIT_CONFIG.replace("[core]", "[c0re]")).unwrap();
+    assert!(fails("file").await.contains("sha256"));
+    feed::sign(&src, TEST_KEY).unwrap();
+    let list = std::fs::read_to_string(src.join("feed.json")).unwrap();
+    std::fs::write(src.join("feed.json"), list.replace("\"version\": 1", "\"version\":1")).unwrap();
+    assert!(fails("list").await.contains("doesn't match"));
+    std::fs::write(src.join("feed.json"), list).unwrap();
+    let sig = std::fs::read_to_string(src.join("feed.sig")).unwrap();
+    std::fs::write(src.join("feed.sig"), sig.replacen(&id, "0000000000000000", 1)).unwrap();
+    assert!(fails("key").await.contains("not trusted"));
+    // The real build trusts other keys, and refuses to run with none.
+    std::fs::write(src.join("feed.sig"), sig).unwrap();
+    assert!(feed::update(&home, Source::Dir(src.clone())).await.unwrap_err().to_string().contains("not trusted"));
+    assert!(feed::update_with(&home, Source::Dir(src), &[]).await.is_err());
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn feed_lists_only_plain_template_paths() {
+    let (_, pair_public, _) = feed::keygen().unwrap();
+    assert_eq!(pair_public.len(), 44);
+    let base = std::env::temp_dir().join(format!("bp-feed-paths-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(base.join("notes.txt"), "x").unwrap();
+    assert!(feed::sign(&base, TEST_KEY).unwrap_err().to_string().contains("not a feed file"));
+    // A list naming a path outside the store is refused even when validly signed.
+    std::fs::remove_file(base.join("notes.txt")).unwrap();
+    feed::sign(&base, TEST_KEY).unwrap();
+    let list = br#"{"version":1,"files":{"../x.yaml":"00"}}"#;
+    let doc = base64::engine::general_purpose::STANDARD.decode(TEST_KEY).unwrap();
+    let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&doc).unwrap();
+    let sig = format!(
+        "{} {}",
+        feed::key_id(base64::engine::general_purpose::STANDARD.decode(TEST_PUBLIC).unwrap().as_slice()),
+        base64::engine::general_purpose::STANDARD.encode(pair.sign(list).as_ref())
+    );
+    assert!(feed::verify(list, sig.as_bytes(), &[TEST_PUBLIC]).unwrap_err().to_string().contains("bad path"));
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// The repository's feed/ is signed with a key this build trusts, and every file matches.
+#[test]
+fn repository_feed_verifies() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../feed");
+    let read = |n: &str| std::fs::read(dir.join(n)).unwrap();
+    let (_, list) = feed::verify(&read("feed.json"), &read("feed.sig"), feed::TRUSTED_KEYS)
+        .expect("feed/ signature: run `brainproxy checks feed sign feed --key <key>`");
+    let mut on_disk = Vec::new();
+    walk(&dir, &mut on_disk).unwrap();
+    assert_eq!(on_disk.len(), list.files.len(), "feed/ has templates feed.json doesn't list: sign it again");
+    for (rel, want) in &list.files {
+        assert_eq!(&crate::fetch::sha256_hex(&read(rel)), want, "{rel} changed since signing: sign the feed again");
+        let loaded = load(&[dir.join(rel)], &LoadOptions::default()).unwrap();
+        assert!(loaded.skipped.is_empty(), "{rel}: {:?}", loaded.skipped);
+    }
 }

@@ -32,6 +32,36 @@ pub enum ChecksCmd {
     Update(UpdateArgs),
     /// Show the template stores: source commit, counts, and skip reasons.
     Status,
+    /// Maintain the brainproxy feed: make a signing key, sign a feed folder, verify one.
+    #[command(subcommand)]
+    Feed(FeedCmd),
+}
+
+#[derive(Subcommand)]
+pub enum FeedCmd {
+    /// Make an Ed25519 signing key; prints the public key for TRUSTED_KEYS (crates/core/src/checks/feed.rs).
+    Keygen {
+        /// Where to write the private key (owner-only; keep it out of the repository).
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write feed.json (every file with its sha256) and feed.sig for a feed folder.
+    Sign {
+        dir: PathBuf,
+        /// The private key from `checks feed keygen`.
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Check a feed folder's signature and file hashes against the keys this build trusts.
+    Verify { dir: PathBuf },
+}
+
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum FeedSource {
+    /// projectdiscovery/nuclei-templates, into <home>/checks/nuclei.
+    Nuclei,
+    /// brainproxy's own signed checks, into <home>/checks/brainproxy.
+    Brainproxy,
 }
 
 #[derive(clap::Args)]
@@ -78,15 +108,19 @@ fn oob_running(project: &Path) -> bool {
 
 #[derive(clap::Args)]
 pub struct UpdateArgs {
-    /// Branch, tag, or commit of the templates repository.
+    /// Which checks: Nuclei templates or brainproxy's signed feed.
+    #[arg(long, value_enum, default_value = "nuclei")]
+    source: FeedSource,
+    /// Branch, tag, or commit of the repository.
     #[arg(long = "ref", default_value = "main")]
     reference: String,
-    #[arg(long, default_value = "projectdiscovery/nuclei-templates")]
-    repo: String,
-    /// Expected sha256 of the tarball; the update fails on a mismatch.
+    /// Default: projectdiscovery/nuclei-templates, or r4nd0mth1ngs/brainproxy for the feed.
+    #[arg(long)]
+    repo: Option<String>,
+    /// Expected sha256 of the tarball (the feed: of feed.json); the update fails on a mismatch.
     #[arg(long)]
     sha256: Option<String>,
-    /// Import from a local nuclei-templates checkout instead of downloading.
+    /// Import from a local checkout instead of downloading (the feed's signature is still checked).
     #[arg(long, value_name = "DIR")]
     from: Option<PathBuf>,
     /// Run detached; returns a job id for `job wait|status|stop`.
@@ -135,20 +169,31 @@ pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Res
             if a.background {
                 return crate::jobs_cmd::spawn_background("checks-update", project, home, out);
             }
+            let feed = a.source == FeedSource::Brainproxy;
+            let default_repo = if feed { checks::feed::FEED_REPO } else { "projectdiscovery/nuclei-templates" };
             let source = match a.from {
                 Some(d) => Source::Dir(d),
-                None => Source::GitHub { repo: a.repo, reference: a.reference, sha256: a.sha256 },
+                None => Source::GitHub {
+                    repo: a.repo.unwrap_or_else(|| default_repo.into()),
+                    reference: a.reference,
+                    sha256: a.sha256,
+                },
             };
             let run = || -> Result<serde_json::Value, Error> {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-                Ok(json!(rt.block_on(checks::update(home, source))?))
+                Ok(if feed {
+                    json!(rt.block_on(checks::feed::update(home, source))?)
+                } else {
+                    json!(rt.block_on(checks::update(home, source))?)
+                })
             };
             let v = if a.job_id.is_some() { crate::jobs_cmd::run_job(project, a.job_id, |_| run())? } else { run()? };
             out.ok(v.clone(), || {
                 format!(
-                    "stored {} of {} HTTP templates (commit {})",
+                    "stored {} of {} {} (commit {})",
                     v["stored"],
                     v["templates"],
+                    if feed { "feed checks" } else { "HTTP templates" },
                     v["commit"].as_str().filter(|c| !c.is_empty()).unwrap_or("-")
                 )
             });
@@ -162,10 +207,22 @@ pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Res
                     Some(m) => format!("{} templates from {} {} ({})", m.stored, m.repository, m.commit, m.source),
                     None => "none (brainproxy checks update)".into(),
                 };
-                format!("nuclei: {nuclei}\nlocal: {} files in {}", s.local_files, s.local_dir.display())
+                let feed = match &s.brainproxy {
+                    Some(m) => format!(
+                        "{} checks, {} {} ({}), signed by {}",
+                        m.stored, m.repository, m.commit, m.source, m.signed_by
+                    ),
+                    None => "none (brainproxy checks update --source brainproxy)".into(),
+                };
+                format!(
+                    "nuclei: {nuclei}\nbrainproxy: {feed}\nlocal: {} files in {}",
+                    s.local_files,
+                    s.local_dir.display()
+                )
             });
             Ok(())
         }
+        ChecksCmd::Feed(cmd) => feed(cmd, out),
     }
 }
 
@@ -221,5 +278,53 @@ fn list(project: &Path, home: &Path, a: ListArgs, out: &Out) -> Result<(), Error
         }
         lines.join("\n")
     });
+    Ok(())
+}
+
+fn feed(cmd: FeedCmd, out: &Out) -> Result<(), Error> {
+    use checks::feed;
+    match cmd {
+        FeedCmd::Keygen { out: path } => {
+            if path.exists() {
+                return Err(Error::InvalidInput(format!("{} exists; not overwriting a key", path.display())));
+            }
+            let (private, public, id) = feed::keygen()?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+            std::io::Write::write_all(&mut opts.open(&path)?, format!("{private}\n").as_bytes())?;
+            let v = json!({"key": path, "public_key": public, "key_id": id});
+            out.ok(v, || {
+                format!(
+                    "private key: {} (keep it secret, back it up)\npublic key {id}: {public}\nadd the public key to TRUSTED_KEYS in crates/core/src/checks/feed.rs",
+                    path.display()
+                )
+            });
+        }
+        FeedCmd::Sign { dir, key } => {
+            let (id, files) = feed::sign(&dir, &std::fs::read_to_string(&key)?)?;
+            out.ok(json!({"dir": dir, "key_id": id, "files": files}), || {
+                format!("signed {files} files in {} with key {id}", dir.display())
+            });
+        }
+        FeedCmd::Verify { dir } => {
+            let read = |n: &str| {
+                std::fs::read(dir.join(n)).map_err(|e| Error::NotFound(format!("{}: {e}", dir.join(n).display())))
+            };
+            let (id, list) = feed::verify(&read("feed.json")?, &read("feed.sig")?, feed::TRUSTED_KEYS)?;
+            for (rel, want) in &list.files {
+                let got = brainproxy_core::fetch::sha256_hex(&read(rel)?);
+                if &got != want {
+                    return Err(Error::InvalidInput(format!(
+                        "{rel}: sha256 {got}, feed.json says {want}; sign the feed again"
+                    )));
+                }
+            }
+            out.ok(json!({"dir": dir, "key_id": id, "files": list.files.len()}), || {
+                format!("{} files verified, signed by {id}", list.files.len())
+            });
+        }
+    }
     Ok(())
 }

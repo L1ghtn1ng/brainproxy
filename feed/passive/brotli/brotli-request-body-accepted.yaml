@@ -1,0 +1,40 @@
+id: bp-brotli-request-body-accepted
+info:
+  name: Brotli-compressed request body accepted (CVE-2026-111497 exposure)
+  severity: info
+  confidence: medium
+  description: |
+    The server answered a request whose body was sent Brotli-compressed
+    (Content-Encoding: br) with a success status, so it most likely decodes Brotli
+    request bodies. CVE-2026-111497 (GHSA-9v8h-qqgm-4m35) is an out-of-bounds write in
+    Google's Brotli decoder, versions 1.0.3 to 1.2.0: a crafted compressed body can crash
+    the process, leak its memory, or run code. Node.js 22, 24 and 26 bundle that decoder,
+    and Express 5 (body-parser 2), Koa's body parsers and Fastify with @fastify/compress
+    decode Brotli bodies by default. This finding shows the decoder is reachable, not that
+    it is unpatched: there is no safe way to test that remotely.
+  remediation: |
+    Update the runtime and libraries that decode Brotli: Node.js 22.23.4, 24.22.1 or
+    26.12.1 (Node.js 20 and older get no fix), Bun 1.4.4, Brotli 1.0.10, 1.1.1 or 1.2.1
+    (also the system libbrotli that distribution builds of Node.js link against), Python
+    Brotli 1.2.1 or brotlicffi 1.2.1.0. Rebuild container images and apps that bundle a
+    runtime. If the application doesn't need compressed request bodies, reject them before
+    they reach it: answer 415 for any Content-Encoding containing br at the proxy or in a
+    middleware that runs before the body parsers.
+  reference:
+    - https://github.com/advisories/GHSA-9v8h-qqgm-4m35
+    - https://github.com/google/brotli/releases/tag/v1.2.1
+    - https://vercel.com/kb/bulletin/node-js-security-advisory
+  classification:
+    cwe-id: CWE-787
+  tags: cve,cve2026,brotli,nodejs,exposure
+scope: passive
+http:
+  - matchers-condition: and
+    matchers:
+      - type: regex
+        part: request_header
+        regex:
+          - '(?im)^content-encoding:[^\r\n]*\bbr\b'
+      - type: dsl
+        dsl:
+          - status_code >= 200 && status_code < 300

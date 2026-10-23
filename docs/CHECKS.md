@@ -7,6 +7,7 @@ write load through the same parser and engine.
 
 ```sh
 brainproxy checks update                         # Nuclei HTTP templates, pinned to a commit
+brainproxy checks update --source brainproxy     # brainproxy's own signed checks (below)
 brainproxy checks list nuclei --tags exposure --severity medium
 brainproxy checks validate my-checks/            # per file: loads, or why not
 brainproxy scan active https://app.test/ --checks nuclei --check-tags exposure,misconfig
@@ -40,8 +41,9 @@ brainproxy checks status
 | Selector | Location |
 |---|---|
 | `nuclei` | `<home>/checks/nuclei/`, replaced as a whole by `checks update` (only templates that load are stored, plus the repository's `helpers/` payload files) |
+| `brainproxy` | `<home>/checks/brainproxy/`, the signed brainproxy feed, replaced as a whole by `checks update --source brainproxy` |
 | `local` | `<home>/checks/local/`, your own checks (any layout, `*.yaml`/`*.yml`) |
-| `all` | both |
+| `all` | all three |
 | a path | a template file or a directory (recursive) |
 
 `<home>` is `--home`/`BRAINPROXY_HOME`, else `$XDG_DATA_HOME/brainproxy`, else
@@ -204,6 +206,65 @@ http:
 - `path` requests reuse the attacked request's headers (cookies, auth) with the
   template's method, path, headers, and body.
 - `info.confidence` sets the finding confidence (Nuclei has none; default medium).
+
+### Passive checks
+
+```yaml
+id: bp-brotli-request-body-accepted
+info: {name: Brotli-compressed request body accepted, severity: info}
+scope: passive
+http:
+  - matchers-condition: and
+    matchers:
+      - type: regex
+        part: request_header          # the recorded request's line and headers
+        regex: ['(?im)^content-encoding:[^\r\n]*\bbr\b']
+      - type: dsl
+        dsl: ["status_code >= 200 && status_code < 300"]
+```
+
+`scope: passive` checks send nothing. The passive scanner runs them with the built-in
+passive rules on every recorded exchange (proxy, send, and crawl traffic, as configured
+under Settings › Passive), and findings are recorded with source `passive`. A block has
+only matchers and extractors: no `path`, `raw`, `body`, `headers`, `payloads`, or
+`inject`, and nothing that needs more than one response (`flow`, numbered parts,
+`baseline_body`, interactsh). Matchers and extractors see the recorded response as an
+active check sees its response, plus the part (and DSL variable) `request_header`.
+Passive checks come from the `brainproxy` and `local` stores; `scan active` ignores them.
+
+## The brainproxy feed
+
+brainproxy's own checks for new CVEs ship as data, between releases: `checks update
+--source brainproxy`, the Overview's **brainproxy checks** row, and, with the daily version
+check on (Settings › Rules & data), once a day by itself. Guided Standard and Thorough
+scans include its active checks.
+
+- The feed is the repository's `feed/` folder: templates, `feed.json` (every file with its
+  sha256), and `feed.sig`, an Ed25519 signature over `feed.json` by a key listed in
+  `TRUSTED_KEYS` (`crates/core/src/checks/feed.rs`), so compiled into brainproxy.
+- An update resolves the ref to a commit, fetches `feed.json` and `feed.sig` from
+  raw.githubusercontent.com at that commit, and checks the signature over the exact bytes
+  before parsing them. Then it fetches only the files `feed.json` lists and checks each
+  hash. Anything wrong fails the update and keeps the installed store; the manifest
+  records the commit, the sha256 of `feed.json`, and the signing key's id. `--from DIR`
+  (a checkout, or the `feed/` folder itself) applies the same checks offline.
+- A compromised repository or account can't push checks to users without the private
+  key, and even signed checks run through `Cx` like all others: scope guard, rate limits,
+  and auth stay enforced, and the format stays declarative.
+
+Publishing a check (maintainers):
+
+```sh
+brainproxy checks validate feed/                                  # loads?
+brainproxy checks feed sign feed --key ~/.config/brainproxy-feed/signing.key
+brainproxy checks feed verify feed                                # what users will check
+```
+
+`cargo test` fails while `feed/` and its signature disagree (`repository_feed_verifies`),
+so CI catches a check committed without signing. Keys: `checks feed keygen --out FILE`
+writes a private key (owner-only) and prints the public key for `TRUSTED_KEYS`. Keep the
+private key out of the repository and backed up. To rotate, add the new public key,
+release, sign with the new key, then remove the old one in a later release.
 
 ## Ideas
 

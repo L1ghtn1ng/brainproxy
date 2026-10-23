@@ -15,8 +15,8 @@ type Depth = "quick" | "standard" | "thorough";
 const NUCLEI: Record<Depth, string[]> = {
   quick: [],
   // Plus the end-of-life checks (outdated PHP, nginx, WordPress, ...), which are rated info.
-  standard: ["--checks", "nuclei", "--check-severity", "high", "--check-include-tags", "eol"],
-  thorough: ["--checks", "nuclei", "--check-severity", "medium", "--check-include-tags", "eol"],
+  standard: ["--checks", "nuclei,brainproxy", "--check-severity", "high", "--check-include-tags", "eol"],
+  thorough: ["--checks", "nuclei,brainproxy", "--check-severity", "medium", "--check-include-tags", "eol"],
 };
 
 const DEPTHS: { id: Depth; title: string; time: string; text: string; args: string[] }[] = [

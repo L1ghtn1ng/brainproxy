@@ -8,6 +8,7 @@
 //! `Cx`, so through the engagement scope guard, auth session, and rate limit.
 
 mod dsl;
+pub mod feed;
 mod rule;
 mod store;
 
@@ -22,8 +23,8 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::scan::active::RuleScope;
 use crate::scan::{Confidence, Risk};
-pub use rule::{alert_from_json, interaction_matches, into_rules};
-pub use store::{local_dir, nuclei_dir, nuclei_status, update, Source, StoreStatus, UpdateResult};
+pub use rule::{alert_from_json, interaction_matches, into_passive, into_rules, PassiveCheck};
+pub use store::{brainproxy_dir, local_dir, nuclei_dir, nuclei_status, update, Source, StoreStatus, UpdateResult};
 
 /// Templates bigger than this are skipped.
 const MAX_TEMPLATE: u64 = 512 << 10;
@@ -116,6 +117,8 @@ pub(crate) enum Part {
     Named(String),
     /// brainproxy extension: the baseline response body of the attacked request.
     BaselineBody,
+    /// brainproxy extension, passive checks: the recorded request's line and headers.
+    RequestHeader,
     /// A part of the nth (1-based) response of the block (`body_2`).
     Nth(usize, Box<Part>),
     /// An out-of-band interaction's `interactsh_protocol`, `_request`,
@@ -510,8 +513,11 @@ fn compile(doc: &Value, file: &Path, root: Option<&Path>, opts: &LoadOptions) ->
         "host" => (RuleScope::Host, "host"),
         "request" => (RuleScope::Page, "request"),
         "param" => (RuleScope::Param, "param"),
-        other => return invalid(format!("unknown scope {other:?} (host, request, param)")),
+        // brainproxy extension: matchers over recorded traffic, nothing is sent.
+        "passive" => (RuleScope::Host, "passive"),
+        other => return invalid(format!("unknown scope {other:?} (host, request, param, passive)")),
     };
+    let passive = scope == "passive";
 
     let mut variables = Vec::new();
     match obj.get("variables") {
@@ -532,10 +538,22 @@ fn compile(doc: &Value, file: &Path, root: Option<&Path>, opts: &LoadOptions) ->
     };
     let mut blocks = Vec::new();
     for b in blocks_v {
-        blocks.push(compile_block(b, rule_scope, file, root)?);
+        blocks.push(compile_block(b, rule_scope, passive, file, root)?);
     }
     if blocks.is_empty() {
         return invalid("no requests");
+    }
+    let one_response =
+        |b: &Block| !b.req_condition && !b.oob && !b.matchers.iter().any(|m| m.part == Part::BaselineBody);
+    if passive && (obj.contains_key("flow") || !blocks.iter().all(one_response)) {
+        return invalid(
+            "scope: passive checks see one recorded response (no flow, numbered parts, baseline, or interactsh)",
+        );
+    }
+    let parts =
+        || blocks.iter().flat_map(|b| b.matchers.iter().map(|m| &m.part).chain(b.extractors.iter().map(|e| &e.part)));
+    if !passive && parts().any(|p| *p == Part::RequestHeader) {
+        return invalid("part request_header needs scope: passive");
     }
     let (inputs, oob_url) = check_placeholders(&variables, &mut blocks, opts)?;
     let flow = match obj.get("flow") {
@@ -627,7 +645,13 @@ fn compile_flow(flow: &str, blocks: usize) -> std::result::Result<dsl::Expr, Pro
     }
 }
 
-fn compile_block(b: &Value, scope: RuleScope, file: &Path, root: Option<&Path>) -> std::result::Result<Block, Problem> {
+fn compile_block(
+    b: &Value,
+    scope: RuleScope,
+    passive: bool,
+    file: &Path,
+    root: Option<&Path>,
+) -> std::result::Result<Block, Problem> {
     let Some(obj) = b.as_object() else { return invalid("request block is not a mapping") };
     for k in obj.keys() {
         if !BLOCK_KEYS.contains(&k.as_str()) {
@@ -647,7 +671,10 @@ fn compile_block(b: &Value, scope: RuleScope, file: &Path, root: Option<&Path>) 
         raws.push(raw);
     }
     let inject = list(b.get("inject"));
+    let sends = ["path", "raw", "inject", "body", "headers", "payloads"].iter().any(|k| obj.contains_key(*k));
     match scope {
+        _ if passive && sends => return invalid("scope: passive blocks only have matchers and extractors"),
+        _ if passive => {}
         RuleScope::Param if inject.is_empty() || !paths.is_empty() || !raws.is_empty() => {
             return invalid("scope: param blocks take `inject` values (no path/raw)")
         }
@@ -818,6 +845,7 @@ fn part_named(p: &str) -> std::result::Result<Part, Problem> {
         "header" | "headers" | "all_headers" => Part::Header,
         "all" | "response" | "raw" => Part::All,
         "baseline_body" => Part::BaselineBody,
+        "request_header" => Part::RequestHeader,
         "interactsh_protocol" | "interactsh_request" | "interactsh_response" | "interactsh_ip" => Part::Oob(p.into()),
         p if p.starts_with("interactsh") => return unsupported(format!("part `{p}`")),
         p if matches!(p, "request" | "host" | "status_code" | "content_length" | "duration") => {
@@ -1161,20 +1189,21 @@ impl Filter {
     }
 }
 
-/// Resolves `--checks` selectors: `nuclei`, `local`, `all`, or a path.
+/// Resolves `--checks` selectors: `nuclei`, `brainproxy`, `local`, `all`, or a path.
 pub fn resolve_selectors(home: &Path, selectors: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for s in selectors {
         match s.as_str() {
             "nuclei" => out.push(nuclei_dir(home)),
+            "brainproxy" => out.push(brainproxy_dir(home)),
             "local" => out.push(local_dir(home)),
-            "all" => out.extend([nuclei_dir(home), local_dir(home)]),
+            "all" => out.extend([brainproxy_dir(home), nuclei_dir(home), local_dir(home)]),
             p => out.push(PathBuf::from(p)),
         }
     }
     // A store that doesn't exist yet is empty, not an error.
-    let (nuclei, local) = (nuclei_dir(home), local_dir(home));
-    out.retain(|p| p.exists() || (*p != nuclei && *p != local));
+    let stores = [nuclei_dir(home), brainproxy_dir(home), local_dir(home)];
+    out.retain(|p| p.exists() || !stores.contains(p));
     out.dedup();
     out
 }
