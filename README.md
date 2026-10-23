@@ -10,6 +10,28 @@ Linux, and Windows runs on the same engine.
 
 Only use it against systems you are authorized to test.
 
+## Highlights
+
+- **Guided scan.** Pick the sites and a depth (Quick, Standard, Thorough) and the Overview
+  crawls, attacks, and shows the results. Open it again any time from the Overview or
+  Scans › New scan.
+- **Targeted scans.** Search the ZAP scan rules and the Nuclei and brainproxy checks by
+  name, CVE, or tag (Scans › New scan › Targeted), pick a few, and run only those.
+- **Checks for new CVEs between releases.** brainproxy's own checks come from a signed
+  feed (Ed25519, verified before anything is installed) and update once a day, so a new
+  CVE check doesn't wait for a new app version. One-click **CVE quick checks** run one of
+  them on your sites, such as the Brotli decoder bug CVE-2026-111497. PHP2Shell
+  (CVE-2026-109618, CVE-2026-109619) has its own built-in check.
+- **Passive checks.** Feed and local checks with `scope: passive` look at the traffic you
+  record and send nothing, next to the built-in passive rules.
+- **Reports people can read.** Findings › Report… saves an HTML report with a plain-words
+  summary, what to fix first, and the technical evidence folded away. It prints cleanly to
+  PDF.
+- **See what a retest fixed.** Compare findings with a scan: new in it, still found, or
+  not found again (likely fixed), counting only what that scan actually covered.
+- **Scan rules from OWASP ZAP, plus about 10,000 Nuclei templates**, all run inside a
+  write-once engagement scope that every request is checked against.
+
 ## Manual
 
 [docs/MANUAL.md](docs/MANUAL.md): install, concepts, a first engagement step by step, every
@@ -228,9 +250,12 @@ brainproxy oob payload --note 'ssrf in ?url=' --target https://app.example.com  
 brainproxy oob poll --token bp... --wait 30         # interactions; also raises late scan callbacks
 brainproxy oob stop
 
-# Declarative checks: Nuclei HTTP templates (pinned to a commit) and your own YAML checks in
-# <home>/checks/local, run by the active scanner inside the scope (see docs/CHECKS.md)
+# Declarative checks: Nuclei HTTP templates (pinned to a commit), brainproxy's signed feed,
+# and your own YAML checks in <home>/checks/local, run inside the scope (see docs/CHECKS.md)
 brainproxy checks update                             # or --from DIR with a nuclei-templates checkout
+brainproxy checks update --source brainproxy         # signed feed: new CVE checks, passive checks
+brainproxy scan active https://app.example.com/ --no-rules --checks brainproxy \
+    --check-ids bp-brotli-request-body-decoded       # one check only (a CVE quick check)
 brainproxy checks list nuclei --tags exposure --severity medium
 brainproxy scan active https://app.example.com/ --checks nuclei --check-tags exposure,misconfig
 brainproxy checks validate my-check.yaml             # loads, or why not

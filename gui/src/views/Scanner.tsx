@@ -353,9 +353,138 @@ export async function loadSuggestions(): Promise<Suggestions> {
   return { scope, origins, recorded: rows.rows.reduce((n, r) => n + Number(r[1]), 0) };
 }
 
+/** A ZAP rule or a declarative check picked for a targeted scan. */
+export interface Pick {
+  kind: "rule" | "check";
+  id: string;
+  name: string;
+  risk: string;
+  /** For checks: Nuclei, brainproxy, or local. */
+  source?: string;
+  /** Tags that keep the check out of scans unless picked (dos, fuzz, intrusive). */
+  risky?: string[];
+}
+
+const RISKY = ["dos", "fuzz", "intrusive"];
+
+/** `scan active` arguments for the picks: only those rules (or none) and only those checks. */
+export function targetedArgs(picks: Pick[]): string[] {
+  const rules = picks.filter((p) => p.kind === "rule").map((p) => p.id);
+  const checks = picks.filter((p) => p.kind === "check");
+  return [
+    ...(rules.length ? [`--rules=${rules.join(",")}`] : ["--no-rules"]),
+    ...(checks.length ? ["--checks=all", `--check-ids=${checks.map((c) => c.id).join(",")}`] : []),
+    // Picked by hand: run it even if tagged dos/fuzz/intrusive (the picker warns).
+    ...(checks.some((c) => c.risky) ? ["--check-exclude-tags="] : []),
+  ];
+}
+
+interface ListedCheck {
+  id: string;
+  name: string;
+  severity: string;
+  tags: string[];
+  file: string;
+}
+
+const store = (file: string) =>
+  /[\\/]checks[\\/]nuclei[\\/]/.test(file) ? "Nuclei" : /[\\/]checks[\\/]brainproxy[\\/]/.test(file) ? "brainproxy" : "local";
+
+/** Search the ZAP rules and the installed checks (Nuclei, brainproxy, local) by name, id, CVE, or tag. */
+function TargetedPicker({ picks, setPicks }: { picks: Pick[]; setPicks: (p: Pick[]) => void }) {
+  const [q, setQ] = useState("");
+  const [rules, setRules] = useState<Rule[] | null>(null);
+  const [checks, setChecks] = useState<ListedCheck[] | null>(null);
+  // Loaded once: listing every template takes a second or two, filtering them is instant.
+  useEffect(() => {
+    run<{ rules: Rule[] }>(["scan", "rules", "--active"]).then((d) => setRules(d.rules)).catch(() => setRules([]));
+    run<{ checks: ListedCheck[] }>(["checks", "list", "all", "--limit", "100000"])
+      .then((d) => setChecks(d.checks.filter((c) => (c as any).scope !== "passive")))
+      .catch(() => setChecks([]));
+  }, []);
+  const t = q.trim().toLowerCase();
+  const hit = (...xs: string[]) => xs.some((x) => x.toLowerCase().includes(t));
+  const ruleHits = t.length < 2 ? [] : (rules ?? []).filter((r) => hit(String(r.id), r.name, ...r.alerts.map((a) => a.name))).slice(0, 50);
+  const checkHits = t.length < 2 ? [] : (checks ?? []).filter((c) => hit(c.id, c.name, ...c.tags)).slice(0, 100);
+  const has = (kind: Pick["kind"], id: string) => picks.some((p) => p.kind === kind && p.id === id);
+  const toggle = (p: Pick) => setPicks(has(p.kind, p.id) ? picks.filter((x) => !(x.kind === p.kind && x.id === p.id)) : [...picks, p]);
+  const asRule = (r: Rule): Pick => ({ kind: "rule", id: String(r.id), name: r.name, risk: r.max_risk });
+  const asCheck = (c: ListedCheck): Pick => {
+    const risky = c.tags.filter((x) => RISKY.includes(x.toLowerCase()));
+    return { kind: "check", id: c.id, name: c.name, risk: c.severity, source: store(c.file), risky: risky.length ? risky : undefined };
+  };
+  const row = (p: Pick, key: string) => (
+    <label key={key} className="tp-row">
+      <input type="checkbox" checked={has(p.kind, p.id)} onChange={() => toggle(p)} />
+      <span className={`dot-risk risk-${p.risk === "critical" ? "high" : p.risk}`} />
+      <span className="tp-name">{p.name}</span>
+      <span className="muted small mono">{p.id}</span>
+      <span className="tag">{p.kind === "rule" ? "ZAP rule" : p.source}</span>
+      {p.risky && (
+        <span className="tag tp-risky" title="Left out of other scans; it may disrupt the target">
+          {p.risky.join(", ")}
+        </span>
+      )}
+    </label>
+  );
+  return (
+    <div className="tp">
+      <input
+        className="input"
+        autoFocus
+        placeholder="Search ZAP rules and Nuclei/brainproxy checks: name, id, CVE, or tag (wordpress, CVE-2024-, sql injection)"
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+      />
+      {picks.length > 0 && (
+        <div className="chips">
+          <span className="muted small">Selected:</span>
+          {picks.map((p) => (
+            <button key={p.kind + p.id} className="chip in" title="Remove" onClick={() => toggle(p)}>
+              {p.name} ×
+            </button>
+          ))}
+          <button className="link small" onClick={() => setPicks([])}>
+            clear
+          </button>
+        </div>
+      )}
+      {t.length >= 2 && (
+        <div className="tp-results">
+          {rules == null || checks == null ? (
+            <p className="muted small">Loading rules and checks…</p>
+          ) : ruleHits.length + checkHits.length === 0 ? (
+            <p className="muted small">Nothing matches “{q}”.{checks.length === 0 && " No checks are installed (Overview › Rules and checks)."}</p>
+          ) : (
+            <>
+              {ruleHits.length > 0 && <div className="label">ZAP scan rules ({ruleHits.length})</div>}
+              {ruleHits.map((r) => row(asRule(r), `r${r.id}`))}
+              {checkHits.length > 0 && <div className="label">Checks ({checkHits.length === 100 ? "first 100" : checkHits.length})</div>}
+              {checkHits.map((c) => row(asCheck(c), `c${c.id}`))}
+            </>
+          )}
+        </div>
+      )}
+      <p className="muted small tp-warn-none">
+        Templates that need a callback (interactsh) appear while the Callbacks listener runs; ones that need a username or
+        other input are run from the command line with --check-var.
+      </p>
+      {picks.some((p) => p.risky) && (
+        <p className="small tp-warn">
+          A selected check is tagged {[...new Set(picks.flatMap((p) => p.risky ?? []))].join(", ")}: it can slow down or
+          disrupt the target, which is why other scans leave it out.
+        </p>
+      )}
+    </div>
+  );
+}
+
 function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id: number) => void }) {
   const app = useApp();
-  const [kind, setKind] = useState<"scan" | "crawl" | "php2shell" | "quick">("scan");
+  const [kind, setKind] = useState<"scan" | "targeted" | "crawl" | "php2shell" | "quick">("scan");
+  // Targeted scan: only the rules and checks picked in the search.
+  const [picks, setPicks] = useState<Pick[]>([]);
+  const audit = kind === "scan" || kind === "targeted";
   // One-click checks for new CVEs from the brainproxy feed (tagged quick-check).
   const [quick] = usePoll<{ checks: { id: string; name: string; severity: string }[] }>(
     () => run(["checks", "list", "brainproxy", "--tags", "quick-check", "--limit", "200"]),
@@ -429,14 +558,18 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ...(mode === "crawl" ? ["--crawl"] : []),
           ...opt("--where", f.where),
           `--strength=${f.strength}`,
-          ...opt("--rules", f.rules),
-          ...opt("--exclude-rules", f.excludeRules),
-          ...flag("--no-rules", f.noRules),
-          ...opt("--checks", f.checks),
-          // End-of-life checks (outdated PHP, nginx, WordPress, ...) whatever the severity chosen.
-          ...(nucleiOn ? ["--checks", "nuclei,brainproxy", "--check-include-tags", "eol"] : []),
-          ...opt("--check-tags", f.checkTags),
-          ...opt("--check-severity", f.checkSeverity || (nucleiOn ? nucleiSeverity : "")),
+          ...(kind === "targeted"
+            ? targetedArgs(picks)
+            : [
+                ...opt("--rules", f.rules),
+                ...opt("--exclude-rules", f.excludeRules),
+                ...flag("--no-rules", f.noRules),
+                ...opt("--checks", f.checks),
+                // End-of-life checks (outdated PHP, nginx, WordPress, ...) whatever the severity chosen.
+                ...(nucleiOn ? ["--checks", "nuclei,brainproxy", "--check-include-tags", "eol"] : []),
+                ...opt("--check-tags", f.checkTags),
+                ...opt("--check-severity", f.checkSeverity || (nucleiOn ? nucleiSeverity : "")),
+              ]),
           ...opt("--auth", f.auth),
           ...opt("--concurrency", f.concurrency),
           ...opt("--rate", f.rate),
@@ -456,12 +589,22 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
 
   const launch = async () => {
     if (kind === "quick" && !quickCheck) return app.toast("No quick checks installed (Overview › brainproxy checks)", "error");
-    if (kind !== "scan" && !list(f.urls).length)
+    if (kind === "targeted" && !picks.length) return app.toast("Search and select at least one rule or check", "error");
+    if (!audit && !list(f.urls).length)
       return app.toast(kind === "crawl" ? "Give at least one seed URL" : "Give at least one site", "error");
-    if (kind === "scan" && mode !== "recorded" && !list(f.urls).length) return app.toast("Give at least one URL, or audit everything recorded", "error");
+    if (audit && mode !== "recorded" && !list(f.urls).length) return app.toast("Give at least one URL, or audit everything recorded", "error");
     try {
       const d = await run<{ job: number }>([...args(), "--background"]);
-      const what = kind === "crawl" ? "Crawl" : kind === "php2shell" ? "PHP2Shell check" : kind === "quick" ? quickCheck?.name : "Active scan";
+      const what =
+        kind === "crawl"
+          ? "Crawl"
+          : kind === "php2shell"
+            ? "PHP2Shell check"
+            : kind === "quick"
+              ? quickCheck?.name
+              : kind === "targeted"
+                ? `Targeted scan (${picks.length} selected)`
+                : "Active scan";
       app.toast(`${what} started (job ${d.job})`);
       onLaunched(d.job);
     } catch (e: any) {
@@ -487,6 +630,9 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
         <div className="seg">
           <button className={kind === "scan" ? "on" : ""} onClick={() => setKind("scan")}>
             Active scan
+          </button>
+          <button className={kind === "targeted" ? "on" : ""} onClick={() => setKind("targeted")} title="Search ZAP rules and Nuclei templates and run only those">
+            Targeted
           </button>
           <button className={kind === "crawl" ? "on" : ""} onClick={() => setKind("crawl")}>
             Crawl
@@ -515,7 +661,8 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ))}
         </div>
       )}
-      {kind === "scan" && (
+      {kind === "targeted" && <TargetedPicker picks={picks} setPicks={setPicks} />}
+      {audit && (
         <div className="seg sc-mode">
           <button className={mode === "crawl" ? "on" : ""} onClick={() => setMode("crawl")} title="Crawl from the site URLs, then attack every request recorded on those sites">
             Crawl and audit
@@ -581,7 +728,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           suspected, so confirm the PHP version on the server.
         </p>
       )}
-      {kind !== "scan" || mode !== "recorded" ? (
+      {!audit || mode !== "recorded" ? (
         <label className="sc-field">
           <span className="label">
             {kind === "php2shell" || kind === "quick"
@@ -595,7 +742,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
             className="input code sc-urls"
             value={f.urls}
             onChange={(e) => set({ urls: e.target.value })}
-            placeholder={kind === "scan" ? "https://app.example.com/search?q=x" : "https://app.example.com/"}
+            placeholder={audit && mode === "urls" ? "https://app.example.com/search?q=x" : "https://app.example.com/"}
           />
           {hints && hints.origins.some((o) => !list(f.urls).includes(o)) && (
             <div className="chips">
@@ -645,6 +792,19 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
             {text("Max minutes", "maxMinutes", "no limit")}
             {text("Max targets", "maxTargets", "200")}
           </>
+        ) : kind === "targeted" ? (
+          <>
+            {text("History filter (SQL)", "where", "host = 'app.test' AND path LIKE '/api/%'", "Selects history rows to attack")}
+            <label className="sc-field">
+              <span className="label">Strength</span>
+              <select className="input" value={f.strength} onChange={(e) => set({ strength: e.target.value })}>
+                {["low", "medium", "high", "insane"].map((s) => (
+                  <option key={s}>{s}</option>
+                ))}
+              </select>
+            </label>
+            {text("Max minutes", "maxMinutes", "no limit")}
+          </>
         ) : kind === "crawl" ? (
           <>
             {text("Depth", "depth", "5")}
@@ -665,10 +825,15 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
         {text("Concurrency", "concurrency", "10")}
         {text("Rate (req/s)", "rate", "no limit")}
         {text("Timeout (s)", "timeout", kind === "crawl" ? "15" : "30")}
-        {kind === "scan" && text("Template timeout (s)", "checkTimeout", "10")}
+        {audit && text("Template timeout (s)", "checkTimeout", "10")}
       </div>
       <div className="row gap sc-checks">
-        {kind === "scan" ? (
+        {kind === "targeted" ? (
+          <>
+            {check("Inject into cookies", "cookies")}
+            {check("No out-of-band", "noOob")}
+          </>
+        ) : kind === "scan" ? (
           <>
             {check("Inject into cookies", "cookies")}
             {check("Skip query", "noQuery")}

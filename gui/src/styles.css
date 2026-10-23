@@ -1772,6 +1772,44 @@ button.dash-risk:hover {
 .sc-all {
   margin: 0;
 }
+.tp {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tp-results {
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.tp-results .label {
+  margin: 6px 0 2px;
+}
+.tp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  cursor: pointer;
+  min-width: 0;
+}
+.tp-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tp-risky,
+.tp-warn {
+  color: var(--medium);
+}
+.tp-warn,
+.tp-warn-none {
+  margin: 0;
+}
 button.chip {
   background: none;
   cursor: pointer;

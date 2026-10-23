@@ -198,6 +198,10 @@ attack type, and pick payloads:
   - **Audit specific URLs:** only the requests you list.
   - **Options:** strength, rules, login profile, speed limits, and *Include Nuclei
     templates* (on when installed, high severity and above by default).
+- **New scan › Targeted:** search the ZAP scan rules and the installed checks (Nuclei,
+  brainproxy, local) by name, id, CVE, or tag, pick some, and run only those, on crawled,
+  recorded, or listed requests. Checks tagged dos, fuzz, or intrusive, which other scans
+  leave out, run when picked here (marked in the list).
 - **New scan › Crawl:** explore only, no attacks.
 - **New scan › PHP2Shell check:** checks the listed sites for PHP2Shell (CVE-2026-109618,
   CVE-2026-109619) with active rule 100002 only, a few requests per site. See
