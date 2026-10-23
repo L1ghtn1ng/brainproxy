@@ -288,7 +288,35 @@ pub struct QueryResult {
 }
 
 impl Store {
+    /// Opens the project, first creating its folder (owner-only) if it is missing. For commands
+    /// that create a project; `open` refuses a missing folder so a mistyped path fails instead.
+    pub fn create(path: &Path) -> Result<Self> {
+        let dir = project_dir(path);
+        if !dir.exists() {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+                .create(dir)
+                .map_err(|e| Error::InvalidInput(format!("cannot create folder {}: {e}", dir.display())))?;
+        }
+        Self::open(path)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
+        // SQLite only says "unable to open database file" here; name the folder instead, resolved,
+        // since a relative path depends on the directory the CLI was started from.
+        let dir = project_dir(path);
+        if !dir.is_dir() {
+            let shown = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+            return Err(Error::NotFound(format!(
+                "folder {} for project {} {}; create it or choose another location",
+                shown.display(),
+                path.display(),
+                if dir.exists() { "isn't a folder" } else { "doesn't exist" }
+            )));
+        }
         owner_only(path);
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -847,6 +875,11 @@ impl Store {
     }
 }
 
+/// The folder holding the project file; "." for a bare file name.
+fn project_dir(path: &Path) -> &Path {
+    path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."))
+}
+
 /// Makes the project file, its -wal/-shm sidecars and `<project>.browsers/` (browser
 /// profiles with cookies) owner-only, and sets the process umask to 077 so whatever is
 /// created next (the database, sidecars, browser profiles, output files) starts that way.
@@ -1107,6 +1140,29 @@ mod tests {
         let r = s.query("SELECT ?1 = 0, ?2 > 1, typeof(?3)", &["0".into(), "5".into(), "007".into()], 1, 100).unwrap();
         assert_eq!(r.rows, vec![vec![json!(1), json!(1), json!("text")]]);
         assert!(s.query("SELEC nope", &[], 1, 1).is_err());
+    }
+
+    #[test]
+    fn open_in_missing_folder_names_the_folder() {
+        let dir = std::env::temp_dir().join(format!("bp-store-nodir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("a/p.bpdb");
+        let e = Store::open(&path).err().unwrap();
+        assert_eq!(e.kind(), "not_found");
+        assert!(e.to_string().contains(&format!("folder {} for", dir.join("a").display())), "{e}");
+        assert!(e.to_string().contains("doesn't exist"), "{e}");
+        assert!(!dir.exists(), "open must not create folders");
+
+        Store::create(&path).unwrap();
+        assert!(path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for d in [&dir, &dir.join("a")] {
+                assert_eq!(std::fs::metadata(d).unwrap().permissions().mode() & 0o777, 0o700, "{}", d.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
