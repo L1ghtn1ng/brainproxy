@@ -158,6 +158,8 @@ pub fn create(owner: Option<Owner>) -> Result<PathBuf> {
     getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
     let dir = root.join(hex::encode(bytes));
     let mut builder = std::fs::DirBuilder::new();
+    // Not recursive: the root exists, and the project's folder must be a new one.
+    builder.recursive(false);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(&dir)?;
