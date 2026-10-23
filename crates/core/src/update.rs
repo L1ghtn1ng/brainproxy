@@ -84,31 +84,70 @@ pub fn newer(latest: &str, current: &str) -> bool {
     parts(latest) > parts(current)
 }
 
-/// The release asset for this platform. The desktop app on Windows comes as an MSI
-/// (installed for all users under Program Files) or a per-user setup.exe, and on
-/// Linux as a .deb or an AppImage: the same kind as the running copy is chosen.
-/// macOS has no separate command-line download (the app includes it).
-pub fn asset_name(kind: Kind) -> Option<String> {
-    let arch = match std::env::consts::ARCH {
+/// The release asset for this platform, as `release` names it. The desktop app on
+/// Windows comes as an MSI (installed for all users under Program Files) or a
+/// per-user setup.exe, and on Linux as a .deb or an AppImage: the same kind as the
+/// running copy is chosen. macOS has no separate command-line download (the app
+/// includes it).
+pub fn find_asset(release: &Release, kind: Kind) -> Option<&Asset> {
+    pick(release, &names(this_platform(kind)?, &release.version))
+}
+
+/// The file name this platform's download has in a release of `version`.
+pub fn asset_name(kind: Kind, version: &str) -> Option<String> {
+    let [name, _] = names(this_platform(kind)?, version);
+    Some(name)
+}
+
+fn this_platform(kind: Kind) -> Option<(&'static str, String)> {
+    let exe = std::env::current_exe().unwrap_or_default();
+    platform_asset(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        kind,
+        exe.to_string_lossy().to_ascii_lowercase().contains("program files"),
+        std::env::var_os("APPIMAGE").is_some(),
+    )
+}
+
+/// The download for a platform, split around where the version goes: the product
+/// (`brainproxy` or `brainproxy-gui`) and the rest (`linux-x86_64.deb`).
+fn platform_asset(os: &str, arch: &str, kind: Kind, msi: bool, appimage: bool) -> Option<(&'static str, String)> {
+    let arch = match arch {
         "x86_64" => "x86_64",
         "aarch64" => "arm64",
         _ => return None,
     };
-    let exe = std::env::current_exe().unwrap_or_default();
-    Some(match (std::env::consts::OS, kind) {
-        ("macos", _) => format!("brainproxy-gui-macos-{arch}.dmg"),
-        ("windows", Kind::Gui) if exe.to_string_lossy().to_ascii_lowercase().contains("program files") => {
-            format!("brainproxy-gui-windows-{arch}.msi")
-        }
-        ("windows", Kind::Gui) => format!("brainproxy-gui-windows-{arch}-setup.exe"),
-        ("windows", Kind::Cli) => format!("brainproxy-windows-{arch}.exe"),
-        ("linux", Kind::Gui) if std::env::var_os("APPIMAGE").is_some() => {
-            format!("brainproxy-gui-linux-{arch}.AppImage")
-        }
-        ("linux", Kind::Gui) => format!("brainproxy-gui-linux-{arch}.deb"),
-        ("linux", Kind::Cli) => format!("brainproxy-linux-{arch}"),
+    let (gui, cli) = ("brainproxy-gui", "brainproxy");
+    Some(match (os, kind) {
+        ("macos", _) => (gui, format!("macos-{arch}.dmg")),
+        ("windows", Kind::Gui) if msi => (gui, format!("windows-{arch}.msi")),
+        ("windows", Kind::Gui) => (gui, format!("windows-{arch}-setup.exe")),
+        ("windows", Kind::Cli) => (cli, format!("windows-{arch}.exe")),
+        ("linux", Kind::Gui) if appimage => (gui, format!("linux-{arch}.AppImage")),
+        ("linux", Kind::Gui) => (gui, format!("linux-{arch}.deb")),
+        ("linux", Kind::Cli) => (cli, format!("linux-{arch}")),
         _ => return None,
     })
+}
+
+/// The names a download goes by: with the version since 0.3.9
+/// (`brainproxy-gui-0.3.9-linux-x86_64.deb`), and without it in older releases
+/// (`brainproxy-gui-linux-x86_64.deb`).
+fn names((product, rest): (&str, String), version: &str) -> [String; 2] {
+    [format!("{product}-{version}-{rest}"), format!("{product}-{rest}")]
+}
+
+/// The first of `names` that `release` has.
+fn pick<'a>(release: &'a Release, names: &[String]) -> Option<&'a Asset> {
+    names.iter().find_map(|n| release.assets.iter().find(|a| &a.name == n))
+}
+
+/// Whether a download is a program to run as is: the command line (no extension
+/// after the arch) or the AppImage, rather than an installer that is opened.
+#[cfg(any(unix, test))]
+fn executable(name: &str) -> bool {
+    name.ends_with(".AppImage") || !name.rsplit('-').next().unwrap_or_default().contains('.')
 }
 
 /// The user's Downloads folder, if there is one.
@@ -151,7 +190,7 @@ pub async fn download(release: &Release, asset: &Asset, dir: &Path) -> Result<(P
     let part = dir.join(format!("{}.part", asset.name));
     std::fs::write(&part, &data)?;
     #[cfg(unix)]
-    if !asset.name.contains('.') {
+    if executable(&asset.name) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755))?;
     }
@@ -175,12 +214,87 @@ mod tests {
 
     #[test]
     fn asset_for_this_platform() {
-        let gui = asset_name(Kind::Gui).unwrap();
-        assert!(gui.starts_with("brainproxy-gui-"), "{gui}");
-        let cli = asset_name(Kind::Cli).unwrap();
+        let gui = asset_name(Kind::Gui, "0.3.9").unwrap();
+        assert!(gui.starts_with("brainproxy-gui-0.3.9-"), "{gui}");
+        let cli = asset_name(Kind::Cli, "0.3.9").unwrap();
         assert!(cli.starts_with("brainproxy-"), "{cli}");
         if cfg!(target_os = "macos") {
             assert_eq!(gui, cli);
         }
+    }
+
+    #[test]
+    fn asset_names_per_platform() {
+        let name = |os, arch, kind, msi, appimage| {
+            let [new, old] = names(platform_asset(os, arch, kind, msi, appimage).unwrap(), "0.3.9");
+            assert_eq!(new.replacen("-0.3.9", "", 1), old);
+            new
+        };
+        use Kind::*;
+        assert_eq!(name("linux", "x86_64", Cli, false, false), "brainproxy-0.3.9-linux-x86_64");
+        assert_eq!(name("linux", "aarch64", Cli, false, false), "brainproxy-0.3.9-linux-arm64");
+        assert_eq!(name("linux", "x86_64", Gui, false, false), "brainproxy-gui-0.3.9-linux-x86_64.deb");
+        assert_eq!(name("linux", "x86_64", Gui, false, true), "brainproxy-gui-0.3.9-linux-x86_64.AppImage");
+        assert_eq!(name("windows", "x86_64", Cli, false, false), "brainproxy-0.3.9-windows-x86_64.exe");
+        assert_eq!(name("windows", "x86_64", Gui, false, false), "brainproxy-gui-0.3.9-windows-x86_64-setup.exe");
+        assert_eq!(name("windows", "x86_64", Gui, true, false), "brainproxy-gui-0.3.9-windows-x86_64.msi");
+        assert_eq!(name("macos", "aarch64", Gui, false, false), "brainproxy-gui-0.3.9-macos-arm64.dmg");
+        assert_eq!(name("macos", "aarch64", Cli, false, false), "brainproxy-gui-0.3.9-macos-arm64.dmg");
+        assert!(platform_asset("linux", "riscv64", Cli, false, false).is_none());
+        assert!(platform_asset("freebsd", "x86_64", Cli, false, false).is_none());
+    }
+
+    fn release(version: &str, assets: &[&str]) -> Release {
+        Release {
+            tag: format!("v{version}"),
+            version: version.into(),
+            url: String::new(),
+            published_at: String::new(),
+            notes: String::new(),
+            assets: assets
+                .iter()
+                .map(|n| Asset { name: n.to_string(), size: 1, url: format!("https://x/{n}") })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn picks_versioned_then_old_names() {
+        let deb = |v| names(platform_asset("linux", "x86_64", Kind::Gui, false, false).unwrap(), v);
+        let cli = |v| names(platform_asset("linux", "x86_64", Kind::Cli, false, false).unwrap(), v);
+        let new = release(
+            "0.3.9",
+            &[
+                "brainproxy-0.3.9-linux-x86_64",
+                "brainproxy-0.3.9-linux-x86_64.sha256",
+                "brainproxy-gui-0.3.9-linux-x86_64.deb",
+                "brainproxy-gui-0.3.9-linux-x86_64.deb.sha256",
+                "SHA256SUMS",
+            ],
+        );
+        assert_eq!(pick(&new, &deb("0.3.9")).unwrap().name, "brainproxy-gui-0.3.9-linux-x86_64.deb");
+        assert_eq!(pick(&new, &cli("0.3.9")).unwrap().name, "brainproxy-0.3.9-linux-x86_64");
+        // Releases up to 0.3.8 have no version in their names.
+        let old = release("0.3.8", &["brainproxy-linux-x86_64", "brainproxy-gui-linux-x86_64.deb"]);
+        assert_eq!(pick(&old, &deb("0.3.8")).unwrap().name, "brainproxy-gui-linux-x86_64.deb");
+        assert_eq!(pick(&old, &cli("0.3.8")).unwrap().name, "brainproxy-linux-x86_64");
+        // The versioned name wins when both are there.
+        let both = release("0.4.0", &["brainproxy-linux-x86_64", "brainproxy-0.4.0-linux-x86_64"]);
+        assert_eq!(pick(&both, &cli("0.4.0")).unwrap().name, "brainproxy-0.4.0-linux-x86_64");
+        // A file for another version, or another platform, is not this release's download.
+        let other = release("0.4.0", &["brainproxy-0.3.9-linux-x86_64", "brainproxy-0.4.0-linux-arm64"]);
+        assert!(pick(&other, &cli("0.4.0")).is_none());
+    }
+
+    #[test]
+    fn executable_downloads() {
+        assert!(executable("brainproxy-0.3.9-linux-x86_64"));
+        assert!(executable("brainproxy-linux-arm64"));
+        assert!(executable("brainproxy-gui-0.3.9-linux-x86_64.AppImage"));
+        assert!(!executable("brainproxy-gui-0.3.9-linux-x86_64.deb"));
+        assert!(!executable("brainproxy-gui-0.3.9-macos-arm64.dmg"));
+        assert!(!executable("brainproxy-0.3.9-windows-x86_64.exe"));
+        assert!(!executable("brainproxy-gui-0.3.9-windows-x86_64-setup.exe"));
+        assert!(!executable("brainproxy-0.3.9-linux-x86_64.tar.gz"));
     }
 }
