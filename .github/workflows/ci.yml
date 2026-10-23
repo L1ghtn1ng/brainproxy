@@ -314,6 +314,22 @@ jobs:
           cd assets
           ls | grep -v '\.sha256$' | sort | xargs sha256sum > ../SHA256SUMS
           cat ../SHA256SUMS
+      # 0.3.9 only: installs up to 0.3.8 look for the old unversioned names, so give them
+      # copies (with their own .sha256) to update one last time. Drop this step after 0.3.9.
+      - name: Unversioned copies for old updaters
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir legacy
+          cd assets
+          for f in $(ls | grep -v '\.sha256$'); do
+            old="${f/-$version-/-}"
+            [ "$old" != "$f" ] || { echo "::error::$f has no version in its name"; exit 1; }
+            cp "$f" "../legacy/$old"
+            (cd ../legacy && sha256sum "$old" > "$old.sha256")
+          done
+          ls -la ../legacy
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: SHA256SUMS
+          files: |
+            SHA256SUMS
+            legacy/*
