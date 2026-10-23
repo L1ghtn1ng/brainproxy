@@ -297,9 +297,9 @@ impl Store {
             builder.recursive(true);
             #[cfg(unix)]
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            builder
-                .create(dir)
-                .map_err(|e| Error::InvalidInput(format!("cannot create folder {}: {e}", dir.display())))?;
+            builder.create(dir).map_err(|e| {
+                Error::Io(std::io::Error::new(e.kind(), format!("cannot create folder {}: {e}", dir.display())))
+            })?;
         }
         Self::open(path)
     }

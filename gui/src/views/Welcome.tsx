@@ -38,7 +38,9 @@ function dirOf(path: string): string {
 }
 
 /** The CLI resolves a relative path against wherever it was started (the dev server's folder). */
-const isAbsolute = (path: string) => /^(\/|[a-z]:[\\/]|\\\\)/i.test(path);
+/** On Windows "/foo" is relative to the current drive, so only a drive letter or UNC path counts. */
+const isAbsolute = (path: string) =>
+  (navigator.userAgent.includes("Windows") ? /^([a-z]:[\\/]|\\\\)/i : /^\//).test(path);
 const FULL_PATH = "Use a full path, e.g. /home/you/engagements";
 
 const TARGET = /^(\*\.)?([a-z0-9-]+\.)*[a-z0-9-]+(\/\d{1,3})?(:\d{1,5})?$|^\[[0-9a-f:]+\](:\d{1,5})?$/i;

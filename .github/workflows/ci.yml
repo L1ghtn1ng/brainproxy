@@ -87,7 +87,8 @@ jobs:
           bin="target/$TARGET/release/brainproxy"
           if [ "$TARGET" = "aarch64-unknown-linux-musl" ]; then
             # Newer Ubuntu images ship qemu-user only (static, no -static suffix).
-            sudo apt-get install -y qemu-user
+            # Refresh the index first: the image's cached one can point at removed .debs (404).
+            sudo apt-get update && sudo apt-get install -y qemu-user
             run="qemu-aarch64 $bin"
           else
             run="$bin"

@@ -210,7 +210,7 @@ export function AppUpdateSettings() {
   return (
     <>
       <div className="detail-head set-section">
-        <h2>Brainproxy Updates</h2>
+        <h2>App updates</h2>
       </div>
       <p className="muted small">New versions come from GitHub releases and are checked against their published sha256. Nothing is installed for you.</p>
       <div className="set-checks">
