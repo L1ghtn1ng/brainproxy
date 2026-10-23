@@ -19,6 +19,7 @@ import { Boundary } from "./ui/Boundary";
 import { Menu, useMenu } from "./ui/Menu";
 import { Welcome, remember } from "./views/Welcome";
 import { usePoll } from "./ui/usePoll";
+import { version } from "../package.json";
 
 export function App() {
   const [project, setProj] = useState<string | null>(null);
@@ -289,6 +290,9 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
               <Icon name={collapsed ? "expand" : "collapse"} />
               <span className="nav-label">Collapse</span>
             </button>
+            <div className="nav-version" title={`brainproxy ${version}`}>
+              v{version}
+            </div>
           </div>
         </aside>
       <main className="view">

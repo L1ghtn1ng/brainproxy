@@ -72,6 +72,17 @@ fn nothing_is_sent_without_an_engagement() {
 }
 
 #[test]
+fn engagement_start_creates_missing_folders() {
+    let p = project("nested").parent().unwrap().join("a/b/p.bpdb");
+    let (code, v) = run(&p, &["engagement", "show"]);
+    assert_eq!(code, 4, "only starting an engagement creates folders: {v}");
+    assert!(!p.parent().unwrap().parent().unwrap().exists(), "show left folders behind");
+    let (code, v) = run(&p, &["engagement", "start", "--target", "a.test"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(p.is_file());
+}
+
+#[test]
 fn engagement_is_write_once_and_enforced_everywhere() {
     let (port, hits) = counting_server();
     let p = project("locked");

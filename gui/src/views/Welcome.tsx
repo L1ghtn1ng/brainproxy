@@ -37,6 +37,10 @@ function dirOf(path: string): string {
   return i > 0 ? path.slice(0, i) : "";
 }
 
+/** The CLI resolves a relative path against wherever it was started (the dev server's folder). */
+const isAbsolute = (path: string) => /^(\/|[a-z]:[\\/]|\\\\)/i.test(path);
+const FULL_PATH = "Use a full path, e.g. /home/you/engagements";
+
 const TARGET = /^(\*\.)?([a-z0-9-]+\.)*[a-z0-9-]+(\/\d{1,3})?(:\d{1,5})?$|^\[[0-9a-f:]+\](:\d{1,5})?$/i;
 
 /** One scope entry from a line: pasted URLs become host[:port]; returns null for blanks. */
@@ -59,7 +63,8 @@ export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
   const [mode, setMode] = useState<"home" | "new">("home");
   const [error, setError] = useState("");
   const [path, setPath] = useState("");
-  const tryOpen = (p: string) => open(p).catch((e) => setError(String(e.message ?? e)));
+  const tryOpen = (p: string) =>
+    isAbsolute(p) ? open(p).catch((e) => setError(String(e.message ?? e))) : setError(`${FULL_PATH}/project.bpdb.`);
 
   const browse = async () => {
     const dialog = await import("@tauri-apps/plugin-dialog");
@@ -147,7 +152,8 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
   const bad = [...included, ...excluded].filter((t) => !t.ok);
   const valid = included.filter((t) => t.ok).length;
   const projectPath = file ?? (dir ? `${dir.replace(/\/$/, "")}/${fileName(name)}` : "");
-  const ready = included.length > 0 && bad.length === 0 && !!projectPath && authorized && !busy;
+  const relative = !!projectPath && !isAbsolute(projectPath);
+  const ready = included.length > 0 && bad.length === 0 && !!projectPath && !relative && authorized && !busy;
 
   const chooseLocation = async () => {
     const dialog = await import("@tauri-apps/plugin-dialog");
@@ -206,6 +212,7 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
               {projectPath && <div className="hint mono">{projectPath}</div>}
             </>
           )}
+          {relative && <div className="error">{FULL_PATH} (missing folders are created).</div>}
         </div>
       </div>
 
