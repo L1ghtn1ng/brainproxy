@@ -1,0 +1,2 @@
+# The feed is signed byte for byte: never convert its line endings on checkout.
+feed/** -text
