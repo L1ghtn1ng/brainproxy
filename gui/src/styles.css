@@ -517,6 +517,19 @@ select {
   padding-top: 10px;
   border-top: 1px solid var(--border);
 }
+.nav-version {
+  padding: 4px 10px 0;
+  font-size: 11px;
+  color: var(--faint);
+  user-select: text;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nav-collapsed .nav-version {
+  padding: 4px 0 0;
+  text-align: center;
+}
 .count {
   font-size: 10.5px;
   min-width: 17px;
@@ -1353,6 +1366,21 @@ select {
 }
 .set-section {
   margin-top: 24px;
+}
+.set-checks {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+.set-checks .check {
+  gap: 8px;
+  color: var(--text);
+}
+.set-checks .check.off {
+  opacity: 0.45;
+  cursor: default;
 }
 .tag.set-ok {
   color: var(--ok);

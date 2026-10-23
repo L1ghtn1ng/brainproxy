@@ -36,7 +36,10 @@ pub enum EngagementCmd {
 }
 
 pub fn engagement(project: &Path, cmd: EngagementCmd, out: &Out) -> Result<(), Error> {
-    let store = Store::open(project)?;
+    // Starting an engagement creates the project, so make its folder too. Other commands
+    // don't: a mistyped path there should fail rather than leave new folders behind.
+    let store =
+        if matches!(cmd, EngagementCmd::Start { .. }) { Store::create(project)? } else { Store::open(project)? };
     match cmd {
         EngagementCmd::Start { targets, exclude, name } => {
             let spec = ScopeSpec { name, include: targets, exclude };

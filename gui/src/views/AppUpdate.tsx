@@ -59,16 +59,43 @@ function newer(a: string, b: string) {
   return false;
 }
 
-async function runningVersion(fallback: string) {
-  if (!inTauri) return fallback;
-  const { getVersion } = await import("@tauri-apps/api/app");
-  return getVersion();
+interface LastCheck {
+  at: number;
+  info: UpdateInfo;
 }
+
+/** Fired with the LastCheck after every check, so views that stay mounted follow along. */
+const CHECKED = "update-checked";
 
 export async function checkForUpdate(): Promise<UpdateInfo> {
   const u = await run<UpdateInfo>(["update", "check", "--kind", "gui"]);
-  write(LAST, JSON.stringify({ at: Date.now(), info: u }));
+  const last: LastCheck = { at: Date.now(), info: u };
+  write(LAST, JSON.stringify(last));
+  window.dispatchEvent(new CustomEvent(CHECKED, { detail: last }));
   return u;
+}
+
+function useLastCheck() {
+  const [last, setLast] = useState(() => json<LastCheck>(LAST));
+  useEffect(() => {
+    const on = (e: Event) => setLast((e as CustomEvent<LastCheck>).detail);
+    window.addEventListener(CHECKED, on);
+    return () => window.removeEventListener(CHECKED, on);
+  }, []);
+  return last;
+}
+
+/** The app's own version; in a plain browser, the CLI's from the last check. */
+function useRunningVersion(info: UpdateInfo | null | undefined) {
+  const [app, setApp] = useState("");
+  useEffect(() => {
+    if (!inTauri) return;
+    import("@tauri-apps/api/app")
+      .then((m) => m.getVersion())
+      .then(setApp)
+      .catch(() => {});
+  }, []);
+  return app || info?.current || "";
 }
 
 /** Saves the installer to the Downloads folder; returns its path. */
@@ -92,8 +119,8 @@ async function showInFolder(path: string) {
 /** Overview card, shown only while a newer version exists. */
 export function AppUpdateCard() {
   const app = useApp();
-  const [info, setInfo] = useState<UpdateInfo | null>(() => json<{ info: UpdateInfo }>(LAST)?.info ?? null);
-  const [running, setRunning] = useState("");
+  const info = useLastCheck()?.info ?? null;
+  const running = useRunningVersion(info);
   const [saved, setSaved] = useState(() => json<{ version: string; path: string }>(SAVED));
   const [busy, setBusy] = useState(false);
 
@@ -110,12 +137,10 @@ export function AppUpdateCard() {
   };
 
   useEffect(() => {
-    runningVersion(info?.current ?? "").then(setRunning).catch(() => {});
     const last = json<{ at: number }>(LAST);
     if (!autoCheck() || (last && Date.now() - last.at < DAY)) return;
     checkForUpdate()
       .then((u) => {
-        setInfo(u);
         if (!u.update_available) return;
         app.toast(`brainproxy ${u.latest} is available.`);
         if (autoDownload() && json<{ version: string }>(SAVED)?.version !== u.latest) download();
@@ -168,11 +193,15 @@ export function AppUpdateSettings() {
   const [check, setCheck] = useState(autoCheck);
   const [dl, setDl] = useState(autoDownload);
   const [busy, setBusy] = useState(false);
+  const last = useLastCheck();
+  const running = useRunningVersion(last?.info);
+  const available = !!last?.info && !!running && newer(last.info.latest, running);
   const checkNow = async () => {
     setBusy(true);
     try {
       const u = await checkForUpdate();
-      app.toast(u.update_available ? `brainproxy ${u.latest} is available: see the Overview.` : `brainproxy ${u.current} is the latest version.`);
+      const v = running || u.current;
+      app.toast(newer(u.latest, v) ? `brainproxy ${u.latest} is available: see the Overview.` : `brainproxy ${v} is the latest version.`);
     } catch (e: any) {
       app.toast(`Update check failed: ${e.message}`, "error");
     }
@@ -180,34 +209,45 @@ export function AppUpdateSettings() {
   };
   return (
     <>
-      <h3>brainproxy updates</h3>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={check}
-          onChange={(e) => {
-            setCheck(e.target.checked);
-            setAutoCheck(e.target.checked);
-          }}
-        />{" "}
-        Check GitHub for a new version once a day
-      </label>
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={dl}
-          disabled={!check}
-          onChange={(e) => {
-            setDl(e.target.checked);
-            setAutoDownload(e.target.checked);
-          }}
-        />{" "}
-        Download it automatically (to your Downloads folder; installing is up to you)
-      </label>
-      <div className="row gap">
+      <div className="detail-head set-section">
+        <h2>Brainproxy Updates</h2>
+      </div>
+      <p className="muted small">New versions come from GitHub releases and are checked against their published sha256. Nothing is installed for you.</p>
+      <div className="set-checks">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={check}
+            onChange={(e) => {
+              setCheck(e.target.checked);
+              setAutoCheck(e.target.checked);
+            }}
+          />
+          Check for a new version once a day
+        </label>
+        <label className={`check${check ? "" : " off"}`}>
+          <input
+            type="checkbox"
+            checked={dl}
+            disabled={!check}
+            onChange={(e) => {
+              setDl(e.target.checked);
+              setAutoDownload(e.target.checked);
+            }}
+          />
+          Download it automatically to your Downloads folder
+        </label>
+      </div>
+      <div className="toolbar flat">
         <button className="btn" disabled={busy} onClick={checkNow}>
           {busy ? "Checking…" : "Check now"}
         </button>
+        {last && (
+          <span className="muted small">
+            Last checked {new Date(last.at).toLocaleString()}
+            {available ? ` · ${last.info.latest} available` : " · up to date"}
+          </span>
+        )}
       </div>
     </>
   );
