@@ -202,9 +202,12 @@ attack type, and pick payloads:
 - **New scan › PHP2Shell check:** checks the listed sites for PHP2Shell (CVE-2026-109618,
   CVE-2026-109619) with active rule 100002 only, a few requests per site. See
   [ACTIVE_RULES.md](ACTIVE_RULES.md#brainproxys-own-rules).
+- **New scan › CVE quick checks:** one check for a new CVE from the brainproxy checks
+  feed, run on the listed sites (for example whether a site decodes Brotli request
+  bodies, CVE-2026-111497). New ones arrive with the daily feed update.
 - **Tasks:** running and finished scans and crawls with progress; Stop; View findings.
-- **Rules:** turn passive rules on or off, choose which traffic is passively scanned, or
-  run the passive scan again.
+- **Rules:** turn passive rules and the feed's passive checks on or off, choose which
+  traffic is passively scanned, or run the passive scan again.
 
 Passive rules run automatically on everything recorded. Active scans send real attack
 requests that can change data: prefer a test environment.

@@ -23,6 +23,9 @@ pub struct PassiveSettings {
     /// Rule ids (ZAP plugin ids) that are switched off.
     #[serde(default)]
     pub disabled: Vec<u32>,
+    /// Passive checks (feed or local, by check id) that are switched off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_checks: Vec<String>,
     /// History sources that get scanned.
     #[serde(default = "default_sources")]
     pub sources: Vec<String>,
@@ -34,7 +37,7 @@ fn default_sources() -> Vec<String> {
 
 impl Default for PassiveSettings {
     fn default() -> Self {
-        Self { disabled: Vec::new(), sources: default_sources() }
+        Self { disabled: Vec::new(), disabled_checks: Vec::new(), sources: default_sources() }
     }
 }
 
@@ -69,15 +72,15 @@ pub fn checks() -> &'static [crate::checks::PassiveCheck] {
     })
 }
 
-/// Runs enabled rules, then the passive checks, over one message.
-pub fn scan_message(msg: &Message, disabled: &[u32]) -> Vec<Finding> {
+/// Runs enabled rules, then the enabled passive checks, over one message.
+pub fn scan_message(msg: &Message, settings: &PassiveSettings) -> Vec<Finding> {
     let mut out = Vec::new();
     for rule in all_rules() {
-        if !disabled.contains(&rule.id()) {
+        if !settings.disabled.contains(&rule.id()) {
             rule.scan(msg, &mut out);
         }
     }
-    let checks = checks();
+    let checks: Vec<_> = checks().iter().filter(|c| !settings.disabled_checks.iter().any(|d| d == c.id())).collect();
     if !checks.is_empty() && msg.status != 0 {
         let resp = crate::scan::active::Response::recorded(msg.status, msg.resp_headers.clone(), msg.resp_body.clone());
         let query = msg.query.as_deref().map(|q| format!("?{q}")).unwrap_or_default();
@@ -114,7 +117,7 @@ pub fn scan_pending(store: &mut Store) -> Result<ScanStats> {
         // Rows from unscanned sources are skipped by the query; jump the watermark past them.
         let Some(batch_last) = batch.last().map(|m| m.history_id) else { break };
         for msg in &batch {
-            let findings = scan_message(msg, &settings.disabled);
+            let findings = scan_message(msg, &settings);
             stats.new_findings += store.record_findings("passive", msg, &findings)?;
             stats.scanned += 1;
         }

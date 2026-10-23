@@ -57,9 +57,19 @@ export function UpdatesCard() {
   const updateFeed = async (quiet = false) => {
     setBusy("feed");
     try {
-      const m = await run<{ stored: number }>(["checks", "update", "--source", "brainproxy"]);
+      const m = await run<{ stored: number; changes?: { added: string[]; changed: string[]; removed: string[] } }>([
+        "checks",
+        "update",
+        "--source",
+        "brainproxy",
+      ]);
       refreshChecks();
-      if (!quiet) app.toast(`brainproxy checks updated: ${m.stored} checks, signature verified.`);
+      // Say what arrived, also after the quiet daily update.
+      const c = m.changes;
+      const name = (p: string) => p.split("/").pop()!.replace(/\.ya?ml$/, "");
+      const news = c ? [...c.added.map((p) => `new: ${name(p)}`), ...c.changed.map((p) => `updated: ${name(p)}`)] : [];
+      if (news.length) app.toast(`brainproxy checks (signature verified): ${news.join(", ")}`);
+      else if (!quiet) app.toast(`brainproxy checks are up to date: ${m.stored} checks, signature verified.`);
     } catch (e: any) {
       if (!quiet) app.toast(e.message, "error");
     }

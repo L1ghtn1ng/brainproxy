@@ -206,6 +206,11 @@ http:
 - `path` requests reuse the attacked request's headers (cookies, auth) with the
   template's method, path, headers, and body.
 - `info.confidence` sets the finding confidence (Nuclei has none; default medium).
+- `body-hex: 8f00807b7d03` (instead of `body`, on `path` requests): the body as bytes,
+  sent as is, for data that isn't text, such as a compressed body. No placeholders.
+- The tag `quick-check` on a brainproxy feed check makes it a one-click check under
+  Scans › New scan › CVE quick checks (`scan active --no-rules --checks brainproxy
+  --check-ids <id>`).
 
 ### Passive checks
 
@@ -231,6 +236,8 @@ only matchers and extractors: no `path`, `raw`, `body`, `headers`, `payloads`, o
 `baseline_body`, interactsh). Matchers and extractors see the recorded response as an
 active check sees its response, plus the part (and DSL variable) `request_header`.
 Passive checks come from the `brainproxy` and `local` stores; `scan active` ignores them.
+`scan rules` lists them with the passive rules (by check id), and `scan disable <check
+id>` / `scan enable <check id>` switch one off or on for the project, as for rules.
 
 ## The brainproxy feed
 
@@ -246,8 +253,10 @@ scans include its active checks.
   raw.githubusercontent.com at that commit, and checks the signature over the exact bytes
   before parsing them. Then it fetches only the files `feed.json` lists and checks each
   hash. Anything wrong fails the update and keeps the installed store; the manifest
-  records the commit, the sha256 of `feed.json`, and the signing key's id. `--from DIR`
-  (a checkout, or the `feed/` folder itself) applies the same checks offline.
+  records the commit, the sha256 of `feed.json`, the signing key's id, and which checks
+  the update added, changed, or removed (`checks update` prints them; the app says
+  what arrived). `--from DIR` (a checkout, or the `feed/` folder itself) applies the
+  same checks offline.
 - A compromised repository or account can't push checks to users without the private
   key, and even signed checks run through `Cx` like all others: scope guard, rate limits,
   and auth stay enforced, and the format stays declarative.

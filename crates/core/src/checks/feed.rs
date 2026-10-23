@@ -15,7 +15,7 @@ use base64::Engine;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 
-use super::store::{brainproxy_dir, install, keep_loadable, Manifest, Source};
+use super::store::{brainproxy_dir, install, keep_loadable, Changes, Manifest, Source};
 use crate::error::{Error, Result};
 use crate::fetch::{sha256_hex, GitHub};
 
@@ -198,6 +198,7 @@ pub(crate) async fn update_with(home: &Path, source: Source, keys: &[&str]) -> R
         let (stored, skipped) = keep_loadable(&staging)?;
         m.stored = stored;
         m.skipped = skipped;
+        m.changes = Some(changes(&brainproxy_dir(home), &staging)?);
         install(&staging, &brainproxy_dir(home), &mut m)
     }
     .await;
@@ -205,6 +206,34 @@ pub(crate) async fn update_with(home: &Path, source: Source, keys: &[&str]) -> R
         let _ = std::fs::remove_dir_all(&staging);
     }
     result.map(|_| m)
+}
+
+/// Templates added, changed, or removed between the installed store and `staging`.
+fn changes(old: &Path, new: &Path) -> Result<Changes> {
+    let files = |dir: &Path| -> Result<BTreeMap<String, String>> {
+        let mut found = Vec::new();
+        if dir.is_dir() {
+            super::walk(dir, &mut found)?;
+        }
+        found
+            .into_iter()
+            .map(|f| {
+                let rel = f.strip_prefix(dir).unwrap_or(&f).to_string_lossy().replace('\\', "/");
+                Ok((rel, sha256_hex(&std::fs::read(&f)?)))
+            })
+            .collect()
+    };
+    let (old, new) = (files(old)?, files(new)?);
+    let mut c = Changes::default();
+    for (rel, sha) in &new {
+        match old.get(rel) {
+            None => c.added.push(rel.clone()),
+            Some(o) if o != sha => c.changed.push(rel.clone()),
+            _ => {}
+        }
+    }
+    c.removed = old.keys().filter(|k| !new.contains_key(*k)).cloned().collect();
+    Ok(c)
 }
 
 fn check_sha(data: &[u8], want: Option<&str>) -> Result<()> {

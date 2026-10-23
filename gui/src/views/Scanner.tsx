@@ -355,7 +355,14 @@ export async function loadSuggestions(): Promise<Suggestions> {
 
 function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id: number) => void }) {
   const app = useApp();
-  const [kind, setKind] = useState<"scan" | "crawl" | "php2shell">("scan");
+  const [kind, setKind] = useState<"scan" | "crawl" | "php2shell" | "quick">("scan");
+  // One-click checks for new CVEs from the brainproxy feed (tagged quick-check).
+  const [quick] = usePoll<{ checks: { id: string; name: string; severity: string }[] }>(
+    () => run(["checks", "list", "brainproxy", "--tags", "quick-check", "--limit", "200"]),
+    60000,
+  );
+  const [quickId, setQuickId] = useState("");
+  const quickCheck = quick?.checks.find((c) => c.id === quickId) ?? quick?.checks[0];
   const [f, setF] = useState(SCAN_DEFAULTS);
   const [hints, setHints] = useState<Suggestions | null>(null);
   // Downloaded Nuclei templates join active scans by default (high severity and up).
@@ -385,12 +392,12 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
   }, [picked]);
 
   const args = (): string[] =>
-    kind === "php2shell"
+    kind === "php2shell" || kind === "quick"
       ? [
           "scan",
           "active",
           ...urls(f.urls),
-          "--rules=100002",
+          ...(kind === "quick" ? ["--no-rules", "--checks", "brainproxy", `--check-ids=${quickCheck?.id ?? ""}`] : ["--rules=100002"]),
           ...opt("--auth", f.auth),
           ...opt("--concurrency", f.concurrency),
           ...opt("--rate", f.rate),
@@ -448,12 +455,14 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
         ];
 
   const launch = async () => {
+    if (kind === "quick" && !quickCheck) return app.toast("No quick checks installed (Overview › brainproxy checks)", "error");
     if (kind !== "scan" && !list(f.urls).length)
       return app.toast(kind === "crawl" ? "Give at least one seed URL" : "Give at least one site", "error");
     if (kind === "scan" && mode !== "recorded" && !list(f.urls).length) return app.toast("Give at least one URL, or audit everything recorded", "error");
     try {
       const d = await run<{ job: number }>([...args(), "--background"]);
-      app.toast(`${kind === "crawl" ? "Crawl" : kind === "php2shell" ? "PHP2Shell check" : "Active scan"} started (job ${d.job})`);
+      const what = kind === "crawl" ? "Crawl" : kind === "php2shell" ? "PHP2Shell check" : kind === "quick" ? quickCheck?.name : "Active scan";
+      app.toast(`${what} started (job ${d.job})`);
       onLaunched(d.job);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -485,6 +494,11 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           <button className={kind === "php2shell" ? "on" : ""} onClick={() => setKind("php2shell")} title="CVE-2026-109618, CVE-2026-109619">
             PHP2Shell check
           </button>
+          {!!quick?.checks.length && (
+            <button className={kind === "quick" ? "on" : ""} onClick={() => setKind("quick")} title="Checks for new CVEs from the brainproxy feed">
+              CVE quick checks
+            </button>
+          )}
         </div>
         <span className="muted small grow">Runs in the background; every request stays inside the engagement scope.</span>
         <button className="btn small" onClick={() => app.openWizard(true)} title="Opens the step-by-step scan on the Overview">
@@ -545,6 +559,21 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
             </p>
           )
         ))}
+      {kind === "quick" && quick && (
+        <div className="sc-all">
+          <select className="input" value={quickCheck?.id ?? ""} onChange={(e) => setQuickId(e.target.value)}>
+            {quick.checks.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+          <p className="muted small">
+            Runs only this check from the brainproxy feed on each site: a few requests per site, inside the engagement scope.
+            New quick checks arrive with the daily update, without a new app version.
+          </p>
+        </div>
+      )}
       {kind === "php2shell" && (
         <p className="muted small sc-all">
           Looks for PHP2Shell (CVE-2026-109618, CVE-2026-109619) on each site: a reported PHP version without the fix, or
@@ -555,7 +584,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
       {kind !== "scan" || mode !== "recorded" ? (
         <label className="sc-field">
           <span className="label">
-            {kind === "php2shell"
+            {kind === "php2shell" || kind === "quick"
               ? "Sites to check"
               : kind === "crawl" || mode === "crawl"
                 ? "Sites to crawl (start URLs)"
@@ -659,7 +688,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
       </div>
       <div className="row gap">
         <button className="btn primary" onClick={launch}>
-          Start {kind === "crawl" ? "crawl" : kind === "php2shell" ? "check" : "scan"}
+          Start {kind === "crawl" ? "crawl" : kind === "php2shell" || kind === "quick" ? "check" : "scan"}
         </button>
         <button className="btn" onClick={() => setF({ ...SCAN_DEFAULTS, urls: hints?.origins.join("\n") ?? "" })}>
           Reset
@@ -673,7 +702,8 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
 // ---------------- Rules ----------------
 
 interface Rule {
-  id: number;
+  /** A rule id, or a passive check's id (string). */
+  id: number | string;
   name: string;
   enabled?: boolean;
   scope?: string;
@@ -743,8 +773,8 @@ function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<num
           key: "on",
           label: "Use",
           width: 40,
-          value: (r) => (p.picked.has(r.id) ? 1 : 0),
-          render: (r) => <input type="checkbox" checked={p.picked.has(r.id)} onChange={(e) => pick(r.id, e.target.checked)} />,
+          value: (r) => (p.picked.has(Number(r.id)) ? 1 : 0),
+          render: (r) => <input type="checkbox" checked={p.picked.has(Number(r.id))} onChange={(e) => pick(Number(r.id), e.target.checked)} />,
         },
     { key: "id", label: "ID", width: 64, value: (r) => r.id, align: "right" },
     { key: "name", label: "Name", width: 340, value: (r) => r.name },

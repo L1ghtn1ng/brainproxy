@@ -78,7 +78,8 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   const [speed, setSpeed] = useState<Speed>("normal");
   const [busy, setBusy] = useState(false);
   const [checks] = usePoll<ChecksStatus>(() => run(["checks", "status"]), 30000);
-  const nuclei = checks?.nuclei ? NUCLEI[depth] : [];
+  // brainproxy's feed checks join Standard and Thorough even without the Nuclei templates.
+  const nuclei = checks?.nuclei ? NUCLEI[depth] : depth === "quick" ? [] : ["--checks", "brainproxy", "--check-severity", depth === "standard" ? "high" : "medium"];
   const [profiles] = usePoll<{ profiles: { name: string; session?: { logged_in?: boolean } }[] }>(() => run(["auth", "list"]), 10000);
 
   useEffect(() => {

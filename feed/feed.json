@@ -1,6 +1,7 @@
 {
   "version": 1,
   "files": {
+    "http/brotli/brotli-request-body-decoded.yaml": "407561170256eeb7fd6af55d7a604593d8576b1ccc50a76f691ec7f22346dc47",
     "passive/brotli/brotli-request-body-accepted.yaml": "eadd1a3a43d368c55f81135aef2025902d317d788c37719cadee4a33960efd77"
   }
 }

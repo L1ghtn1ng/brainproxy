@@ -80,6 +80,8 @@ pub(crate) struct Block {
     pub raws: Vec<String>,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// brainproxy extension (`body-hex`): a body given as bytes, sent as is (e.g. compressed data).
+    pub body_bytes: Option<Vec<u8>>,
     /// brainproxy extension: values for the attacked insertion point (scope: param).
     pub inject: Vec<String>,
     pub inject_raw: bool,
@@ -425,6 +427,7 @@ const BLOCK_KEYS: &[&str] = &[
     "raw",
     "headers",
     "body",
+    "body-hex",
     "payloads",
     "attack",
     "matchers",
@@ -671,7 +674,8 @@ fn compile_block(
         raws.push(raw);
     }
     let inject = list(b.get("inject"));
-    let sends = ["path", "raw", "inject", "body", "headers", "payloads"].iter().any(|k| obj.contains_key(*k));
+    let sends =
+        ["path", "raw", "inject", "body", "body-hex", "headers", "payloads"].iter().any(|k| obj.contains_key(*k));
     match scope {
         _ if passive && sends => return invalid("scope: passive blocks only have matchers and extractors"),
         _ if passive => {}
@@ -743,12 +747,23 @@ fn compile_block(
     if matchers.is_empty() && extractors.is_empty() {
         return invalid("request block without matchers or extractors");
     }
+    let body_bytes = match b.get("body-hex").map(|v| s(v).unwrap_or_default()) {
+        None => None,
+        Some(_) if b.get("body").is_some() || !raws.is_empty() => {
+            return invalid("`body-hex` replaces `body` (path requests only)")
+        }
+        Some(h) => match hex::decode(h.split_whitespace().collect::<String>()) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => return invalid("`body-hex` is not hex"),
+        },
+    };
     Ok(Block {
         method,
         paths,
         raws,
         headers,
         body: b.get("body").and_then(s).unwrap_or_default(),
+        body_bytes,
         inject,
         inject_raw: flag(b, "inject-raw"),
         payloads,

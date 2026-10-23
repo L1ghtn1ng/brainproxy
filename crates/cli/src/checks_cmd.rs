@@ -189,13 +189,19 @@ pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Res
             };
             let v = if a.job_id.is_some() { crate::jobs_cmd::run_job(project, a.job_id, |_| run())? } else { run()? };
             out.ok(v.clone(), || {
-                format!(
+                let mut s = format!(
                     "stored {} of {} {} (commit {})",
                     v["stored"],
                     v["templates"],
                     if feed { "feed checks" } else { "HTTP templates" },
                     v["commit"].as_str().filter(|c| !c.is_empty()).unwrap_or("-")
-                )
+                );
+                for kind in ["added", "changed", "removed"] {
+                    for f in v["changes"][kind].as_array().into_iter().flatten() {
+                        s.push_str(&format!("\n  {kind}: {}", f.as_str().unwrap_or("")));
+                    }
+                }
+                s
             });
             Ok(())
         }

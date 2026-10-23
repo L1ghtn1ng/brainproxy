@@ -31,10 +31,10 @@ pub enum ScanCmd {
         #[arg(long)]
         active: bool,
     },
-    /// Enable passive rules by id.
-    Enable { ids: Vec<u32> },
-    /// Disable passive rules by id.
-    Disable { ids: Vec<u32> },
+    /// Enable passive rules by id, or passive checks by check id.
+    Enable { ids: Vec<String> },
+    /// Disable passive rules by id, or passive checks by check id.
+    Disable { ids: Vec<String> },
     /// ZAP data files the rules read (error patterns, hidden files, sensitive names): status, update, reset.
     #[command(subcommand)]
     Data(DataCmd),
@@ -187,6 +187,22 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
                         "alerts": r.alerts().iter().map(|a| json!({"alert_ref": a.alert_ref, "name": a.name, "risk": a.risk.as_str()})).collect::<Vec<_>>(),
                     })
                 })
+                .chain(passive::checks().iter().filter(|c| {
+                    filter.as_deref().is_none_or(|f| {
+                        let f = f.to_ascii_lowercase();
+                        c.def().name.to_ascii_lowercase().contains(&f) || c.id().to_ascii_lowercase().contains(&f)
+                    })
+                }).map(|c| {
+                    let d = c.def();
+                    json!({
+                        "id": c.id(),
+                        "name": d.name,
+                        "check": true,
+                        "enabled": !settings.disabled_checks.iter().any(|x| x == c.id()),
+                        "max_risk": d.risk.as_str(),
+                        "alerts": [{"alert_ref": d.alert_ref, "name": d.name, "risk": d.risk.as_str()}],
+                    })
+                }))
                 .collect();
             out.ok(json!({"count": rules.len(), "sources": settings.sources, "rules": rules}), || {
                 rules
@@ -219,20 +235,30 @@ pub fn scan(project: &Path, home: &Path, cmd: ScanCmd, out: &Out) -> Result<(), 
     Ok(())
 }
 
-fn update_disabled(store: &Store, ids: &[u32], disable: bool, out: &Out) -> Result<(), Error> {
+/// `ids` are rule ids (numbers) or passive check ids.
+fn update_disabled(store: &Store, ids: &[String], disable: bool, out: &Out) -> Result<(), Error> {
     if ids.is_empty() {
         return Err(Error::InvalidInput("give at least one rule id".into()));
     }
     let known: Vec<u32> = passive::all_rules().iter().map(|r| r.id()).collect();
-    if let Some(bad) = ids.iter().find(|id| !known.contains(id)) {
-        return Err(Error::NotFound(format!("passive rule {bad}")));
+    let (mut rules, mut checks) = (Vec::new(), Vec::new());
+    for id in ids {
+        match id.parse::<u32>() {
+            Ok(n) if known.contains(&n) => rules.push(n),
+            Ok(_) => return Err(Error::NotFound(format!("passive rule {id}"))),
+            Err(_) if passive::checks().iter().any(|c| c.id() == id) => checks.push(id.clone()),
+            Err(_) => return Err(Error::NotFound(format!("passive rule or check {id}"))),
+        }
     }
     let mut settings: PassiveSettings = store.setting(SETTINGS_KEY)?;
-    settings.disabled.retain(|d| !ids.contains(d));
+    settings.disabled.retain(|d| !rules.contains(d));
+    settings.disabled_checks.retain(|d| !checks.contains(d));
     if disable {
-        settings.disabled.extend_from_slice(ids);
+        settings.disabled.extend_from_slice(&rules);
+        settings.disabled_checks.extend(checks);
     }
     settings.disabled.sort_unstable();
+    settings.disabled_checks.sort();
     store.set_setting(SETTINGS_KEY, &settings)?;
     out.ok(json!(settings), || format!("disabled rules: {:?}", settings.disabled));
     Ok(())

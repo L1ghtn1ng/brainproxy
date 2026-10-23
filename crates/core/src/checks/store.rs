@@ -46,6 +46,16 @@ pub struct Manifest {
     /// The brainproxy feed: id of the key that signed it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signed_by: String,
+    /// The brainproxy feed: what the last update changed, by file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Changes>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct Changes {
+    pub added: Vec<String>,
+    pub changed: Vec<String>,
+    pub removed: Vec<String>,
 }
 
 pub enum Source {

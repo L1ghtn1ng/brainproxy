@@ -560,6 +560,7 @@ async fn feed_is_signed_and_verified() {
     std::fs::write(src.join("http/unsigned.yaml"), GIT_CONFIG.replace("id: git-config", "id: unsigned")).unwrap();
     let m = feed::update_with(&home, Source::Dir(base.join("repo")), keys).await.unwrap();
     assert_eq!((m.templates, m.stored, m.signed_by.as_str()), (1, 1, id.as_str()));
+    assert_eq!(m.changes.unwrap().added, vec!["http/git.yaml".to_string()]);
     assert!(brainproxy_dir(&home).join("http/git.yaml").is_file());
     assert!(!brainproxy_dir(&home).join("http/unsigned.yaml").exists());
     assert_eq!(nuclei_status(&home).brainproxy.unwrap().signed_by, id);
@@ -579,6 +580,10 @@ async fn feed_is_signed_and_verified() {
     std::fs::write(src.join("http/git.yaml"), GIT_CONFIG.replace("[core]", "[c0re]")).unwrap();
     assert!(fails("file").await.contains("sha256"));
     feed::sign(&src, TEST_KEY).unwrap();
+    std::fs::remove_file(src.join("http/unsigned.yaml")).unwrap();
+    feed::sign(&src, TEST_KEY).unwrap();
+    let c = feed::update_with(&home, Source::Dir(src.clone()), keys).await.unwrap().changes.unwrap();
+    assert_eq!((c.added.len(), c.changed, c.removed.len()), (0, vec!["http/git.yaml".to_string()], 0));
     let list = std::fs::read_to_string(src.join("feed.json")).unwrap();
     std::fs::write(src.join("feed.json"), list.replace("\"version\": 1", "\"version\":1")).unwrap();
     assert!(fails("list").await.contains("doesn't match"));
@@ -632,4 +637,21 @@ fn repository_feed_verifies() {
         let loaded = load(&[dir.join(rel)], &LoadOptions::default()).unwrap();
         assert!(loaded.skipped.is_empty(), "{rel}: {:?}", loaded.skipped);
     }
+}
+
+#[test]
+fn body_hex_sends_bytes() {
+    let y = |b: &str| {
+        format!("id: h\ninfo: {{severity: low}}\nhttp:\n  - method: POST\n    path: ['{{{{BaseURL}}}}/']\n{b}\n    matchers: [{{type: status, status: [200]}}]\n")
+    };
+    let c = parse_str(&y("    body-hex: '8f00 807b7d03'")).unwrap();
+    assert_eq!(c.blocks[0].body_bytes.as_deref(), Some(&[0x8f, 0x00, 0x80, 0x7b, 0x7d, 0x03][..]));
+    assert!(invalid_reason(&y("    body-hex: zz")).contains("not hex"));
+    assert!(invalid_reason(&y("    body: x\n    body-hex: '00'")).contains("replaces `body`"));
+    // The feed probe's streams are valid Brotli for "{}" and "{".
+    let br = |hex: &str| {
+        let headers = vec![("Content-Encoding".to_string(), "br".to_string())];
+        crate::capture::decode_body(&headers, &::hex::decode(hex).unwrap())
+    };
+    assert_eq!((br("8f00807b7d03"), br("0f00807b03")), (b"{}".to_vec(), b"{".to_vec()));
 }

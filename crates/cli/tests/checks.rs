@@ -253,3 +253,111 @@ fn scan_data_update_status_reset() {
     assert_eq!(v["data"]["removed"], true);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A JSON API on `/` that, with `decode`, reads Brotli request bodies like Express 5
+/// (the probe's two streams stand for "{}" and "{"), and otherwise refuses them with
+/// 415 like Express 4.
+fn serve_json(decode: bool) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let mut req = Vec::new();
+            let body = loop {
+                let k = s.read(&mut buf).unwrap_or(0);
+                req.extend_from_slice(&buf[..k]);
+                let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    if k == 0 {
+                        break Vec::new();
+                    }
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if req.len() >= end + 4 + len || k == 0 {
+                    break req[end + 4..].to_vec();
+                }
+            };
+            let head = String::from_utf8_lossy(&req).to_ascii_lowercase();
+            let br = head.contains("content-encoding: br");
+            let text = match (br, body.as_slice()) {
+                (false, b) => String::from_utf8_lossy(b).into_owned(),
+                (true, [0x8f, 0x00, 0x80, 0x7b, 0x7d, 0x03]) => "{}".into(),
+                (true, [0x0f, 0x00, 0x80, 0x7b, 0x03]) => "{".into(),
+                (true, _) => "?".into(),
+            };
+            let status = if br && !decode {
+                "415 Unsupported Media Type"
+            } else if text == "{}" || text.is_empty() {
+                "404 Not Found"
+            } else {
+                "400 Bad Request"
+            };
+            let resp = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+    port
+}
+
+#[test]
+fn feed_checks_update_scan_and_switch_off() {
+    let (dir, project, home) = setup("feed");
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let (code, v) =
+        run(&["checks", "update", "--source", "brainproxy", "--from", repo.to_str().unwrap()], &project, &home);
+    assert_eq!(code, 0, "{v}");
+    assert!(!v["data"]["signed_by"].as_str().unwrap().is_empty());
+    assert!(v["data"]["changes"]["added"].as_array().unwrap().len() >= 2, "{v}");
+    let (_, v) =
+        run(&["checks", "update", "--source", "brainproxy", "--from", repo.to_str().unwrap()], &project, &home);
+    assert_eq!(v["data"]["changes"]["added"].as_array().unwrap().len(), 0, "nothing new the second time: {v}");
+
+    // The active probe: Express 5-like servers decode Brotli bodies, Express 4-like ones refuse them.
+    let found = |port: u16| {
+        let url = format!("http://127.0.0.1:{port}/");
+        let (code, v) = run(
+            &[
+                "scan",
+                "active",
+                &url,
+                "--no-rules",
+                "--checks",
+                "brainproxy",
+                "--check-ids",
+                "bp-brotli-request-body-decoded",
+            ],
+            &project,
+            &home,
+        );
+        assert_eq!(code, 0, "{v}");
+        let (_, f) = run(
+            &["query", &format!("select count(*) from findings where alert_ref = 'check:bp-brotli-request-body-decoded' and url like '%:{port}/%'")],
+            &project,
+            &home,
+        );
+        f["data"]["rows"][0][0].as_i64().unwrap()
+    };
+    assert_eq!(found(serve_json(true)), 1);
+    assert_eq!(found(serve_json(false)), 0);
+
+    // Passive feed checks are listed with the passive rules and can be switched off.
+    let (code, v) = run(&["scan", "disable", "bp-brotli-request-body-accepted"], &project, &home);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["data"]["disabled_checks"][0], "bp-brotli-request-body-accepted");
+    let (_, v) = run(&["scan", "rules", "--filter", "brotli"], &project, &home);
+    let rule = &v["data"]["rules"][0];
+    assert_eq!(
+        (rule["id"].as_str(), rule["enabled"].as_bool()),
+        (Some("bp-brotli-request-body-accepted"), Some(false))
+    );
+    let (code, _) = run(&["scan", "disable", "no-such-check"], &project, &home);
+    assert_eq!(code, 4);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

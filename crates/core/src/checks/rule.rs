@@ -37,7 +37,10 @@ fn template_key(check: &Check, block: &Block, template: &str, raw: bool) -> Opti
         if raw {
             template.trim().to_string()
         } else {
-            format!("{} {template}\n{:?}\n{}\n{}", block.method, block.headers, block.body, block.redirects)
+            format!(
+                "{} {template}\n{:?}\n{}\n{:?}\n{}",
+                block.method, block.headers, block.body, block.body_bytes, block.redirects
+            )
         }
     })
 }
@@ -70,6 +73,10 @@ pub struct PassiveCheck {
 }
 
 impl PassiveCheck {
+    pub fn id(&self) -> &str {
+        &self.check.id
+    }
+
     pub fn def(&self) -> &'static AlertDef {
         self.def
     }
@@ -600,9 +607,11 @@ fn build_path(cx: &Cx, block: &Block, template: &str, vars: &HashMap<String, Str
     for (k, v) in &block.headers {
         req = req.set_header(k, &subst(v, vars)?);
     }
-    let body = subst(&block.body, vars)?;
     let mut bytes = req.into_bytes();
-    bytes.extend_from_slice(body.as_bytes());
+    match &block.body_bytes {
+        Some(b) => bytes.extend_from_slice(b),
+        None => bytes.extend_from_slice(subst(&block.body, vars)?.as_bytes()),
+    }
     Some(RawRequest::from_bytes(bytes).update_content_length().into_bytes())
 }
 
