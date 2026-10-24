@@ -314,8 +314,8 @@ jobs:
           cd assets
           ls | grep -v '\.sha256$' | sort | xargs sha256sum > ../SHA256SUMS
           cat ../SHA256SUMS
-      # 0.3.9 only: installs up to 0.3.8 look for the old unversioned names, so give them
-      # copies (with their own .sha256) to update one last time. Drop this step after 0.3.9.
+      # Installs up to 0.3.8 look for the old unversioned names, so give them copies (with
+      # their own .sha256) to update with. Kept while such installs may still be around.
       - name: Unversioned copies for old updaters
         run: |
           version="${GITHUB_REF_NAME#v}"
