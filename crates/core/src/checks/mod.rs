@@ -1184,7 +1184,9 @@ pub struct Filter {
     /// Any of these tags.
     pub tags: Vec<String>,
     pub exclude_tags: Vec<String>,
-    pub min_risk: Option<Risk>,
+    /// Template severity bounds, inclusive. Unlike `Risk`, these tell critical from high.
+    pub min_severity: Option<Severity>,
+    pub max_severity: Option<Severity>,
     /// Kept whatever the other filters say (Nuclei's -itags): checks with any of these
     /// tags, or in a folder of that name (nuclei-templates' `technologies/eol` holds
     /// end-of-life checks that don't all carry the `eol` tag).
@@ -1200,7 +1202,34 @@ impl Filter {
             || (self.ids.is_empty() || self.ids.contains(&c.id))
                 && (self.tags.is_empty() || self.tags.iter().any(has))
                 && !self.exclude_tags.iter().any(has)
-                && self.min_risk.is_none_or(|r| c.risk >= r)
+                && self.min_severity.is_none_or(|m| Severity::of(&c.severity) >= m)
+                && self.max_severity.is_none_or(|m| Severity::of(&c.severity) <= m)
+    }
+}
+
+/// A template's `info.severity`, ordered. `unknown` counts as info, as the loader maps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl Severity {
+    pub fn of(s: &str) -> Self {
+        match s {
+            "critical" => Self::Critical,
+            "high" => Self::High,
+            "medium" => Self::Medium,
+            "low" => Self::Low,
+            _ => Self::Info,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        ["info", "low", "medium", "high", "critical"][self as usize]
     }
 }
 

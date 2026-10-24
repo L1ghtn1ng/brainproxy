@@ -73,9 +73,13 @@ pub struct ActiveArgs {
     /// Only these check ids (comma-separated).
     #[arg(long, value_delimiter = ',')]
     check_ids: Vec<String>,
-    /// Only checks of at least this severity.
+    /// Only checks of at least this template severity (`high` includes critical).
     #[arg(long, value_enum)]
-    check_severity: Option<crate::scan_cmd::RiskArg>,
+    check_severity: Option<crate::checks_cmd::SeverityArg>,
+    /// Only checks of at most this template severity, e.g. `--check-severity high
+    /// --check-severity-max high` for high but not critical. --check-include-tags still wins.
+    #[arg(long, value_enum)]
+    check_severity_max: Option<crate::checks_cmd::SeverityArg>,
     /// A template input (Nuclei's -var), e.g. username=admin; templates using
     /// inputs that aren't given are not loaded. Repeatable.
     #[arg(long = "check-var", value_name = "NAME=VALUE", value_parser = crate::checks_cmd::check_var)]
@@ -142,6 +146,7 @@ pub enum StrengthArg {
 
 pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Result<(), Error> {
     let guard = crate::project_guard(project)?;
+    let band = crate::checks_cmd::severity_band(args.check_severity, args.check_severity_max, "--check-severity")?;
     if let Some(bad) =
         args.rules.iter().chain(&args.exclude_rules).find(|id| !active::all_rules().iter().any(|r| r.id() == **id))
     {
@@ -157,7 +162,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
         return Err(Error::InvalidInput("--no-rules needs --checks".into()));
     }
     let oob = if args.no_oob { None } else { crate::oob_cmd::running(&Store::open(project)?)?.map(|s| s.endpoint) };
-    let (checks, check_summary) = load_checks(home, &args, oob.is_some())?;
+    let (checks, check_summary) = load_checks(home, &args, band, oob.is_some())?;
     if args.background {
         return crate::jobs_cmd::spawn_background("active-scan", project, home, out);
     }
@@ -297,7 +302,12 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
 }
 
 /// Loads and filters the --checks templates; returns them with a summary for the output.
-fn load_checks(home: &Path, args: &ActiveArgs, oob: bool) -> Result<(Vec<checks::Check>, serde_json::Value), Error> {
+fn load_checks(
+    home: &Path,
+    args: &ActiveArgs,
+    (min_severity, max_severity): (Option<checks::Severity>, Option<checks::Severity>),
+    oob: bool,
+) -> Result<(Vec<checks::Check>, serde_json::Value), Error> {
     if args.checks.is_empty() {
         return Ok((vec![], serde_json::Value::Null));
     }
@@ -307,7 +317,8 @@ fn load_checks(home: &Path, args: &ActiveArgs, oob: bool) -> Result<(Vec<checks:
         ids: args.check_ids.clone(),
         tags: args.check_tags.clone(),
         exclude_tags: args.check_exclude_tags.iter().filter(|t| !t.is_empty()).cloned().collect(),
-        min_risk: args.check_severity.map(crate::scan_cmd::RiskArg::get),
+        min_severity,
+        max_severity,
         include_tags: args.check_include_tags.clone(),
     };
     let total = loaded.checks.len();

@@ -150,6 +150,62 @@ fn checks_validate_list_and_scan() {
 }
 
 #[test]
+fn check_severity_band() {
+    let (dir, project, home) = setup("band");
+    let local = home.join("checks/local");
+    std::fs::create_dir_all(&local).unwrap();
+    for sev in ["low", "medium", "high", "critical"] {
+        let t =
+            ENV.replace("dotenv-exposed", &format!("sev-{sev}")).replace("severity: high", &format!("severity: {sev}"));
+        std::fs::write(local.join(format!("{sev}.yaml")), t).unwrap();
+    }
+    // An included tag runs whatever the bounds say.
+    let tagged = ENV.replace("dotenv-exposed", "sev-tagged").replace("severity: high", "severity: critical");
+    std::fs::write(local.join("tagged.yaml"), tagged.replace("tags: exposure,config", "tags: pick")).unwrap();
+    let port = serve();
+    let url = format!("http://127.0.0.1:{port}/");
+    let scan = |extra: &[&str]| {
+        let mut args = vec!["scan", "active", &url, "--checks", "local", "--no-rules"];
+        args.extend_from_slice(extra);
+        let (code, v) = run(&args, &project, &home);
+        assert_eq!(code, 0, "{v}");
+        let mut raised: Vec<String> = v["data"]["raised"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter_map(|k| k.strip_prefix("check:sev-").map(String::from))
+            .collect();
+        raised.sort();
+        raised
+    };
+    assert_eq!(scan(&["--check-severity-max", "medium"]), ["low", "medium"]);
+    assert_eq!(scan(&["--check-severity", "high", "--check-severity-max", "high"]), ["high"]);
+    assert_eq!(scan(&["--check-severity", "critical"]), ["critical", "tagged"]);
+    assert_eq!(scan(&["--check-severity-max", "low", "--check-include-tags", "pick"]), ["low", "tagged"]);
+
+    let (code, v) = run(
+        &["scan", "active", &url, "--checks", "local", "--check-severity", "high", "--check-severity-max", "low"],
+        &project,
+        &home,
+    );
+    assert_eq!(code, 2, "{v}");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("--check-severity-max low is below --check-severity high"),
+        "{v}"
+    );
+
+    let (code, v) = run(&["checks", "list", "local", "--severity-max", "medium"], &project, &home);
+    assert_eq!(code, 0, "{v}");
+    let mut ids: Vec<&str> =
+        v["data"]["checks"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, ["sev-low", "sev-medium"], "{v}");
+    let (code, v) = run(&["checks", "list", "local", "--severity", "high", "--severity-max", "low"], &project, &home);
+    assert_eq!(code, 2, "{v}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn checks_update_from_dir_and_scan_nuclei_store() {
     let (dir, project, home) = setup("nuclei");
     let src = dir.join("nuclei-templates");
