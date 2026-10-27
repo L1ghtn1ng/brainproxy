@@ -36,7 +36,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Release files are named after Cargo.toml's version, and the updater looks for
       # them under the tag's, so a release tag has to match it.
       - name: Tag matches Cargo.toml
@@ -85,7 +85,7 @@ jobs:
           rustup default stable
       # No cache on release builds, so a poisoned cache can't reach published binaries.
       - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
       - name: Build (x86_64, musl-gcc)
@@ -157,7 +157,7 @@ jobs:
           rustup default stable
       # No cache on release builds, so a poisoned cache can't reach published binaries.
       - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release -p brainproxy
       - name: Smoke test
         run: |
@@ -244,7 +244,7 @@ jobs:
           rustup default stable
       # No caches on release builds, so a poisoned cache can't reach published bundles.
       - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: gui-${{ matrix.target }}
           workspaces: |
