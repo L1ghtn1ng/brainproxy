@@ -550,6 +550,51 @@ fn feed_brotli_check_flags_accepted_br_bodies() {
     assert_eq!(passive_hits(&c, "GET / HTTP/1.1\r\nAccept-Encoding: gzip, br\r\n", 200, &[]), 0);
 }
 
+#[test]
+fn feed_php_checks_list_known_vulnerabilities() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../feed/passive/php");
+    let checks: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| passive_check(&std::fs::read_to_string(e.unwrap().path()).unwrap()))
+        .collect();
+    assert_eq!(checks.len(), 4, "one check per severity band");
+    // (findings, matched CVE ids) for one response header.
+    let scan = |name: &str, value: &str| {
+        let resp =
+            crate::scan::active::Response::recorded(200, vec![(name.to_string(), value.to_string())], Vec::new());
+        let mut out = Vec::new();
+        for c in &checks {
+            c.scan("a.test", "GET / HTTP/1.1\r\n", &resp, &mut out);
+        }
+        let cves: Vec<String> = out
+            .iter()
+            .filter_map(|f| f.other_info.lines().find_map(|l| l.strip_prefix("Matched: ")))
+            .flat_map(|m| m.split(", ").map(|n| n.split(' ').next().unwrap().to_string()))
+            .collect();
+        (out.len(), cves)
+    };
+    let (n, cves) = scan("X-Powered-By", "PHP/7.4.33");
+    assert!(n <= 4 && cves.iter().any(|c| c == "CVE-2024-4577"));
+    // Fixed in 7.3.11, so only earlier 7.x releases.
+    assert!(
+        !cves.iter().any(|c| c == "CVE-2019-11043")
+            && scan("X-Powered-By", "PHP/7.3.10").1.iter().any(|c| c == "CVE-2019-11043")
+    );
+    assert!(scan("Server", "Apache/2.4.41 (Unix) PHP/8.3.0").1.iter().any(|c| c == "CVE-2024-2756"));
+    assert!(!scan("X-Powered-By", "PHP/8.1.2").1.iter().any(|c| c == "CVE-2024-2756"));
+    // PHP2Shell is reported by rule 100001, not here.
+    assert!(!scan("X-Powered-By", "PHP/8.2.34").1.iter().any(|c| c.starts_with("CVE-2026-10961")));
+    // Fixed or unreleased versions, versions without a patch number, and other products.
+    for (h, v) in [
+        ("X-Powered-By", "PHP/8.5.12"),
+        ("X-Powered-By", "PHP/9.0.0"),
+        ("X-Powered-By", "PHP/8.2"),
+        ("Server", "Foo-PHP/7.4.33"),
+    ] {
+        assert_eq!(scan(h, v).0, 0, "{v}");
+    }
+}
+
 /// A key for tests only (never trusted by a build).
 const TEST_KEY: &str =
     "MFECAQEwBQYDK2VwBCIEIBpRIkmizhbv7dGtJc9/G+zkXw6t7WRZcrnkbDkqkEv8gSEAGpYIJV1dKseRAbg2qOXP+7CX7vxHR9P+Gap3jDwYgCo=";

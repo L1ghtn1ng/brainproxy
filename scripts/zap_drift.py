@@ -72,7 +72,7 @@ def main():
         subprocess.run(["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout", sync["repository"], str(repo)], check=True)
     head = git(repo, "rev-parse", f"origin/{sync.get('branch', 'main')}").strip()
 
-    report = {"pinned": pinned, "upstream": head, "changed": [], "missing_upstream": [], "data_changed": [], "unported": []}
+    report = {"pinned": pinned, "upstream": head, "changed": [], "missing_upstream": [], "data_changed": [], "feed_changed": [], "unported": []}
     ported = ported_classes()
     tree = git(repo, "ls-tree", "-r", "--name-only", head).splitlines()
     for (addon, cls), ours in sorted(ported.items()):
@@ -97,8 +97,16 @@ def main():
         if git(repo, "diff", "--stat", pinned, head, "--", data["upstream"]).strip():
             report["data_changed"].append(data)
 
+    # Rules covered by generated feed checks: regenerate when their class or data changes.
+    feed_rules = sync.get("feed_rules", {})
+    for cls, rule in sorted(feed_rules.items()):
+        paths = [ADDON_JAVA[rule["addon"]].format(cls), *rule.get("data", [])]
+        log = git(repo, "log", "--format=%h %s", f"{pinned}..{head}", "--", *paths).strip().splitlines()
+        if log:
+            report["feed_changed"].append({"class": cls, "generator": rule["generator"], "ours": rule["ours"], "commits": log})
+
     # Upstream release rules we haven't ported (or deliberately skipped).
-    skipped = set(sync.get("skipped", {}))
+    skipped = set(sync.get("skipped", {})) | set(feed_rules)
     ported_names = {cls for (_, cls) in ported}
     for addon in ("pscanrules", "ascanrules"):
         listing = git(repo, "ls-tree", "--name-only", f"{head}:{ADDON_JAVA[addon].rsplit('/', 1)[0]}")
@@ -107,7 +115,7 @@ def main():
             if cls.endswith("ScanRule") and cls not in ported_names and cls not in skipped:
                 report["unported"].append({"addon": addon, "class": cls})
 
-    drift = report["changed"] or report["missing_upstream"] or report["data_changed"] or report["unported"]
+    drift = report["changed"] or report["missing_upstream"] or report["data_changed"] or report["feed_changed"] or report["unported"]
     if args.json:
         print(json.dumps(report, indent=2))
     else:
@@ -120,6 +128,10 @@ def main():
             print(f"\n## Removed/renamed upstream: {c['class']} ({', '.join(c['ours'])})")
         for d in report["data_changed"]:
             print(f"\n## Data file changed: {d['upstream']} -> {d['ours']}")
+        for c in report["feed_changed"]:
+            print(f"\n## Feed checks to regenerate: {c['class']} -> {c['ours']} (python3 {c['generator']}, then sign the feed)")
+            for line in c["commits"]:
+                print(f"  - {line}")
         if report["unported"]:
             print("\n## Not ported yet:")
             for u in report["unported"]:

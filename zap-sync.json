@@ -1,7 +1,7 @@
 {
   "repository": "https://github.com/zaproxy/zap-extensions.git",
   "branch": "main",
-  "commit": "21f3c6c759756c65ec71016933d0ee72566e58f4",
+  "commit": "859c5151da3f671d151d1909dfcbfa538f5d9e36",
   "data_files": [
     {
       "upstream": "addOns/pscanrules/src/main/zapHomeFiles/xml/application_errors.xml",
@@ -27,5 +27,15 @@
   "skipped": {
     "ZapVersionScanRule": "ZAP-specific",
     "UsernameIdorScanRule": "needs configured usernames"
+  },
+  "feed_rules": {
+    "ServerSideVersionScanRule": {
+      "addon": "pscanrules",
+      "generator": "scripts/php_feed.py",
+      "data": [
+        "addOns/pscanrules/src/main/resources/org/zaproxy/zap/extension/pscanrules/resources/php-known-vulnerabilities.json"
+      ],
+      "ours": "feed/passive/php/"
+    }
   }
 }

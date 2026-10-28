@@ -2,6 +2,10 @@
   "version": 1,
   "files": {
     "http/brotli/brotli-request-body-decoded.yaml": "407561170256eeb7fd6af55d7a604593d8576b1ccc50a76f691ec7f22346dc47",
-    "passive/brotli/brotli-request-body-accepted.yaml": "eadd1a3a43d368c55f81135aef2025902d317d788c37719cadee4a33960efd77"
+    "passive/brotli/brotli-request-body-accepted.yaml": "eadd1a3a43d368c55f81135aef2025902d317d788c37719cadee4a33960efd77",
+    "passive/php/php-known-vulnerabilities-critical.yaml": "d5b03a12e1cb2474799e82dd47b101468a1f81576f2e4af878cfd2b658e83bb6",
+    "passive/php/php-known-vulnerabilities-high.yaml": "53f4a60e3d1e50e300aba9717b7958aca7d0d563203c6f35586e9a901f389105",
+    "passive/php/php-known-vulnerabilities-low.yaml": "5109a11984a5800c01e667c82b15f0b3a9166b0fed936a8ff97728bc0d58c1da",
+    "passive/php/php-known-vulnerabilities-medium.yaml": "a16151ff84696b5d25d70794722d4a08e5b1b411a8302eac716e748689e1324c"
   }
 }
