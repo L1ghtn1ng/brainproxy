@@ -144,6 +144,11 @@ fn temp_is_inside(path: String) -> bool {
 #[tauri::command]
 async fn temp_discard(project: String, locks: tauri::State<'_, TempLocks>) -> Result<(), String> {
     let path = PathBuf::from(&project);
+    // Only one this app holds the lock for (made here, or a leftover it is offering), so an
+    // engagement another app window has open is never deleted from this one.
+    if !locks.held().contains_key(&path) {
+        return Err(format!("{project} is not a temporary engagement this window has open"));
+    }
     if temp::marker(&path).is_none() {
         return Err(format!("{project} is not a temporary project"));
     }

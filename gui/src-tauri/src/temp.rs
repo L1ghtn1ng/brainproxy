@@ -35,10 +35,8 @@ pub struct Location {
 /// tmpfs) has more room, else the OS temp folder, which is on disk. The brainproxy folder
 /// inside it is per user.
 pub fn location() -> Location {
-    let base = std::env::var_os("BRAINPROXY_TEMP_DIR")
-        .map(PathBuf::from)
-        .or_else(ram_base)
-        .unwrap_or_else(std::env::temp_dir);
+    let base =
+        std::env::var_os("BRAINPROXY_TEMP_DIR").map(PathBuf::from).or_else(ram_base).unwrap_or_else(std::env::temp_dir);
     let ram_backed = is_ram_backed(&base);
     Location { root: base.join(folder_name()), ram_backed }
 }
