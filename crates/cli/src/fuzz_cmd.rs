@@ -414,15 +414,15 @@ fn spawn_background(
     let project = std::fs::canonicalize(project)?;
     let log = project.with_extension(format!("fuzz-{run_id}.log"));
     let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
-    let argv = crate::jobs_cmd::child_args();
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&argv);
-    cmd.arg("--attach-run").arg(run_id.to_string());
+    let mut options = vec!["--attach-run".to_string(), run_id.to_string()];
     if let Some(bytes) = request {
         let path = project.with_extension(format!("fuzz-{run_id}.req"));
         std::fs::write(&path, bytes)?;
-        cmd.arg(format!("--attach-request={}", path.display()));
+        options.push(format!("--attach-request={}", path.display()));
     }
+    let argv = crate::jobs_cmd::with_options(crate::jobs_cmd::child_args(), options);
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&argv);
     crate::process::detach(&mut cmd);
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;

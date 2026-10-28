@@ -273,6 +273,45 @@ fn background_start_errors_are_the_childs_own() {
     assert_eq!(msg.matches("invalid input:").count(), 1, "{msg}");
 }
 
+#[test]
+fn background_jobs_keep_job_id_before_a_separator() {
+    // MCP writes `--` before positionals; the child's --job-id must not land after it.
+    let port = serve_site();
+    let project = tmp_project("bgsep");
+    let site = format!("http://127.0.0.1:{port}/");
+    let (code, v) = run(&["crawl", "--background", "--no-robots", "--no-sitemap", "--", &site], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let id = v["data"]["job"].as_i64().unwrap().to_string();
+    let (_, v) = run(&["job", "wait", &id, "--timeout", "30"], &project, None);
+    assert_eq!(v["data"]["state"], "completed", "{v}");
+}
+
+#[test]
+fn queued_jobs_are_reaped_and_keep_a_stop_request() {
+    use brainproxy_core::store::Store;
+    let project = tmp_project("queued");
+    let store = Store::open(&project).unwrap();
+    // A child that died before it marked the job running: failed, with the error from its log.
+    let id = store.job_create("active-scan", "queued", &[]).unwrap();
+    let mut gone = bin().arg("--version").stdout(Stdio::null()).spawn().unwrap();
+    gone.wait().unwrap();
+    store.job_set_pid(id, gone.id()).unwrap();
+    let log = std::fs::canonicalize(&project).unwrap().with_extension(format!("job-{id}.log"));
+    std::fs::write(&log, "{\"ok\":false,\"error\":{\"kind\":\"timeout\",\"message\":\"timed out: login\"}}\n").unwrap();
+    let (_, v) = run(&["job", "status", &id.to_string()], &project, None);
+    assert_eq!(v["data"]["state"], "failed", "{v}");
+    assert_eq!(v["data"]["error"], "timed out: login", "{v}");
+    // A stop requested while queued isn't overwritten when the job's process starts.
+    let id = store.job_create("active-scan", "queued", &[]).unwrap();
+    let (_, v) = run(&["job", "stop", &id.to_string()], &project, None);
+    assert_eq!(v["data"]["state"], "stopping", "{v}");
+    assert!(!store.job_start(id, std::process::id()).unwrap());
+    assert_eq!(store.job_state(id).unwrap(), "stopping");
+    let id = store.job_create("active-scan", "queued", &[]).unwrap();
+    assert!(store.job_start(id, std::process::id()).unwrap());
+    assert_eq!(store.job_state(id).unwrap(), "running");
+}
+
 /// A two-page site: `/` links to `/item?id=1`. Serves until the test process ends.
 fn serve_site() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

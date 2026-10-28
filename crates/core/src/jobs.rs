@@ -81,6 +81,26 @@ impl Store {
         Ok(())
     }
 
+    /// Records the process of a job that hasn't started yet, so a child that dies before
+    /// it marks itself running can be reaped. Keeps a pid the job already set.
+    pub fn job_set_pid(&self, id: i64, pid: u32) -> Result<()> {
+        self.conn.execute("UPDATE jobs SET pid = COALESCE(pid, ?1) WHERE id = ?2", params![pid, id])?;
+        Ok(())
+    }
+
+    /// Marks a job's process as started: queued becomes running. Returns false when the job
+    /// left 'queued' first (a stop requested while it waited); the pid is recorded either way.
+    pub fn job_start(&self, id: i64, pid: u32) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE jobs SET state = 'running', pid = ?1 WHERE id = ?2 AND state = 'queued'",
+            params![pid, id],
+        )?;
+        if n == 0 {
+            self.conn.execute("UPDATE jobs SET pid = ?1 WHERE id = ?2", params![pid, id])?;
+        }
+        Ok(n > 0)
+    }
+
     pub fn job_progress(&self, id: i64, progress: &Value) -> Result<()> {
         self.conn.execute("UPDATE jobs SET progress = ?1 WHERE id = ?2", params![progress.to_string(), id])?;
         Ok(())
