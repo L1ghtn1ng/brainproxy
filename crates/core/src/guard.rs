@@ -123,10 +123,6 @@ impl Entry {
     fn matches_addr(&self, ip: IpAddr, port: u16) -> bool {
         self.port_ok(port) && matches!(self.pattern, Pattern::Net(net, bits) if in_net(ip, net, bits))
     }
-
-    fn names_addr_explicitly(&self, ip: IpAddr) -> bool {
-        matches!(self.pattern, Pattern::Net(net, bits) if in_net(ip, net, bits))
-    }
 }
 
 fn valid_host(h: &str) -> bool {
@@ -262,7 +258,8 @@ impl Scope {
             }
             let allowed = match internal(ip) {
                 None => true,
-                _ if self.include.iter().any(|e| e.names_addr_explicitly(ip)) => true,
+                // Naming the address allows it, on the entry's ports only.
+                _ if addr_ok => true,
                 Some(Internal::Sensitive) => localhost && unwrap_v4(ip).is_loopback(),
                 Some(Internal::Private) => exact,
             };
@@ -387,11 +384,17 @@ impl Guard {
 }
 
 fn system_scope_path() -> Option<PathBuf> {
-    let fixed = Path::new(SYSTEM_SCOPE_PATH);
-    if fixed.exists() {
-        return Some(fixed.to_path_buf());
+    system_scope_at(Path::new(SYSTEM_SCOPE_PATH), std::env::var_os(SYSTEM_SCOPE_ENV))
+}
+
+/// The fixed path whenever something may be there: a file we can't stat (a folder we
+/// may not enter) or a dangling link is configured, so loading it fails rather than
+/// falling back to the environment variable.
+fn system_scope_at(fixed: &Path, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match fixed.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => env.map(PathBuf::from),
+        _ => Some(fixed.to_path_buf()),
     }
-    std::env::var_os(SYSTEM_SCOPE_ENV).map(PathBuf::from)
 }
 
 /// The system scope, if configured. A configured but unreadable or invalid file is
@@ -528,6 +531,31 @@ mod tests {
         // A `localhost` entry means this machine: loopback, not metadata.
         assert_eq!(s.allowed_addrs("localhost", 80, &ips(&["127.0.0.1", "::1"])).unwrap().len(), 2);
         assert!(s.allowed_addrs("localhost", 80, &ips(&["169.254.169.254"])).is_err());
+        // An address named with a port is allowed on that port only, also through a name.
+        let s = Scope::compile(spec(&["*.target.com", "10.0.0.5:443"], &[]), "t").unwrap();
+        assert!(s.allowed_addrs("x.target.com", 443, &ips(&["10.0.0.5"])).is_ok());
+        assert!(s.allowed_addrs("x.target.com", 6379, &ips(&["10.0.0.5"])).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_system_scope_that_cannot_be_checked_is_still_configured() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bp-sysscope-{}", std::process::id()));
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("scope.json"), "{}").unwrap();
+        let env = Some(std::ffi::OsString::from("/tmp/wide.json"));
+        assert_eq!(system_scope_at(&dir.join("none.json"), env.clone()), Some(PathBuf::from("/tmp/wide.json")));
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("dangling.json")).ok();
+        assert_eq!(system_scope_at(&dir.join("dangling.json"), env.clone()), Some(dir.join("dangling.json")));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let fixed = locked.join("scope.json");
+        let got = system_scope_at(&fixed, env);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // (root can stat it anyway; either way it isn't the environment variable.)
+        assert_eq!(got, Some(fixed));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
