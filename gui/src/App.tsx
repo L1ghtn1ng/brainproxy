@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { inTauri, run, setProject } from "./api";
+import { inTauri, run, setProject, tempProjects } from "./api";
 import { AppProvider, autoProxy, useApp, type Tab, type TempInfo } from "./store";
 import { ProxyView } from "./views/Proxy";
 import { RepeaterView } from "./views/Repeater";
@@ -18,7 +18,7 @@ import { SideBrand } from "./ui/Brand";
 import { Boundary } from "./ui/Boundary";
 import { Menu, useMenu } from "./ui/Menu";
 import { ConfirmHost, confirm } from "./ui/Confirm";
-import { Welcome, chooseProjectFile, remember } from "./views/Welcome";
+import { Welcome, remember, saveTempAs } from "./views/Welcome";
 import { usePoll } from "./ui/usePoll";
 import { version } from "../package.json";
 
@@ -28,7 +28,7 @@ const DISCARD = "Its traffic, findings and settings are deleted for good. Use Sa
 export function App() {
   const [project, setProj] = useState<string | null>(null);
   const [temp, setTemp] = useState<TempInfo | null>(null);
-  /** Shown on the welcome screen, e.g. when a temporary project couldn't be wiped. */
+  /** Shown on the welcome screen, e.g. when a temporary project couldn't be deleted. */
   const [notice, setNotice] = useState("");
   const [theme, setTheme] = useState(() => {
     try {
@@ -46,38 +46,42 @@ export function App() {
     }
   }, [theme]);
 
-  const open = useCallback(async (path: string) => {
+  // `temp` is set for a temporary engagement (made by the shell); those never go in Recent.
+  const open = useCallback(async (path: string, tempInfo: TempInfo | null = null) => {
     setProject(path);
-    const info = await run<{ temp: boolean; ram_backed?: boolean }>(["project", "init"]);
-    // A temporary project is gone once closed, so it never goes in Recent.
-    if (!info.temp) remember(path);
-    setTemp(info.temp ? { ramBacked: !!info.ram_backed } : null);
+    await run(["project", "init"]);
+    if (!tempInfo) remember(path);
+    setTemp(tempInfo);
     setNotice("");
     setProj(path);
   }, []);
 
-  // Leaving the project unmounts the shell, which stops a proxy it started. `discard` also
-  // stops the proxy, OOB listener and jobs of a temporary project before wiping it.
+  // Leaving the project unmounts the shell, which stops a proxy it started. The shell's
+  // discard also stops the proxy, OOB listener and jobs of a temporary one before deleting it;
+  // if that fails it is kept, and offered again on the next launch.
   const close = useCallback(async () => {
     if (temp && !(await confirm(DISCARD_TITLE, DISCARD, "Discard", "Keep open"))) return;
+    const leaving = project;
     setProj(null);
     setTemp(null);
-    if (temp) await run(["project", "discard"]).catch((e) => setNotice(`The temporary engagement wasn't wiped: ${e.message}`));
-  }, [temp]);
+    if (temp && leaving)
+      await tempProjects.discard(leaving).catch((e) => setNotice(`The temporary engagement wasn't deleted: ${e}`));
+  }, [temp, project]);
 
   // Copies the temporary project to a file, then carries on in that file.
   const saveAs = useCallback(async () => {
+    const leaving = project;
+    if (!leaving) return;
     const eng = await run<{ engagement: { name: string | null } | null }>(["engagement", "show"]).catch(() => null);
-    const dest = await chooseProjectFile(eng?.engagement?.name ?? "");
+    const dest = await saveTempAs(leaving, eng?.engagement?.name ?? "");
     if (!dest) return;
-    await run(["project", "save", `--output=${dest}`]);
     setProj(null);
     setTemp(null);
-    // The saved file has everything; if this fails the leftover is swept once the app exits.
-    await run(["project", "discard"]).catch(() => {});
+    // The saved file has everything; if this fails it is offered again on the next launch.
+    await tempProjects.discard(leaving).catch(() => {});
     // The shell is gone by now, so a failure is shown on the welcome screen.
     await open(dest).catch((e) => setNotice(`Saved to ${dest}, but it didn't open: ${e.message}`));
-  }, [open]);
+  }, [open, project]);
 
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
   return (
@@ -210,8 +214,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     };
   }, [app.project, refreshStatus]);
 
-  const tempRef = useRef(app.temp);
-  tempRef.current = app.temp;
+  const tempRef = useRef(app.temp ? app.project : null);
+  tempRef.current = app.temp ? app.project : null;
   useEffect(() => {
     if (!inTauri) return;
     // Registering is async: a shell unmounted before it finishes (StrictMode's double mount, a
@@ -221,12 +225,13 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     import("@tauri-apps/api/window")
       .then(({ getCurrentWindow }) =>
         getCurrentWindow().onCloseRequested(async (event) => {
-          if (tempRef.current) {
+          const tempProject = tempRef.current;
+          if (tempProject) {
             // Held open while the question is in the window; closed explicitly on "discard".
             event.preventDefault();
             if (!(await confirm(DISCARD_TITLE, DISCARD, "Discard and quit", "Keep open"))) return;
-            // Stops its proxy too. If it fails, the next launch's sweep wipes it.
-            await run(["project", "discard"]).catch(() => {});
+            // Stops its proxy too. If it fails, it is kept and offered on the next launch.
+            await tempProjects.discard(tempProject).catch(() => {});
             await getCurrentWindow().destroy();
           } else if (startedHere.current) {
             await run(["proxy", "stop"]).catch(() => {});
@@ -242,7 +247,7 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
 
   const save = () => app.saveAs().catch((e) => app.toast(`Not saved: ${e.message}`, "error"));
   const tempTitle = app.temp
-    ? `Temporary engagement, kept ${app.temp.ramBacked ? "in memory (RAM)" : "in the temp folder on disk"} and wiped when it closes. Click to save it as a project file.`
+    ? `Temporary engagement, kept ${app.temp.ramBacked ? "in memory (RAM)" : "in the temp folder on disk"} and deleted when you discard it. Click to save it as a project file.`
     : "";
 
   const proxyToggle = async () => {

@@ -1,29 +1,34 @@
-//! Temporary projects: create, use, save, discard, sweep, and `mcp serve --temp`.
+//! The CLI side of temporary engagements, which are a desktop-app feature: the app's shell
+//! creates and deletes their folders itself. Here: `project save` and `project stop` (which
+//! delete nothing), and the guard that neither the CLI nor `mcp serve` can make or wipe a
+//! self-deleting project, so whatever a script or agent starts keeps its project file.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
-/// A private BRAINPROXY_TEMP_DIR and CA home per test.
+/// A private folder and CA home per test, with a project scoped to 127.0.0.1.
 struct Env {
     dir: PathBuf,
+    project: PathBuf,
 }
 
 impl Env {
     fn new(name: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("bp-temp-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("base")).unwrap();
-        Self { dir }
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = Self { project: dir.join("p.bpdb"), dir };
+        env.ok(&env.project, &["engagement", "start", "--target", "127.0.0.1"]);
+        env
     }
 
     fn cmd(&self, project: &Path) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_brainproxy"));
-        c.env("BRAINPROXY_TEMP_DIR", self.dir.join("base"))
-            .env_remove("BRAINPROXY_PROJECT")
+        c.env_remove("BRAINPROXY_PROJECT")
             .args(["--format", "json", "--home"])
             .arg(self.dir.join("home"))
             .arg("--project")
@@ -43,18 +48,6 @@ impl Env {
         assert_eq!(code, 0, "{args:?} -> {v}");
         v["data"].clone()
     }
-
-    /// A new temp project with an engagement scope.
-    fn temp(&self, extra: &[&str]) -> PathBuf {
-        let mut args = vec!["project", "temp"];
-        args.extend(extra);
-        let d = self.ok(Path::new("unused.bpdb"), &args);
-        assert_eq!(d["temp"], true);
-        let p = PathBuf::from(d["path"].as_str().unwrap());
-        assert!(p.starts_with(self.dir.join("base")), "{p:?}");
-        self.ok(&p, &["engagement", "start", "--target", "127.0.0.1"]);
-        p
-    }
 }
 
 impl Drop for Env {
@@ -64,80 +57,39 @@ impl Drop for Env {
 }
 
 #[test]
-fn create_use_save_and_discard() {
-    let env = Env::new("cycle");
-    let p = env.temp(&[]);
-    let info = env.ok(&p, &["project", "info"]);
-    assert_eq!(info["temp"], true, "{info}");
-    assert!(info["ram_backed"].is_boolean());
-
-    // Save: a normal project with the same data, and never over an existing file.
+fn save_copies_and_never_overwrites() {
+    let env = Env::new("save");
     let saved = env.dir.join("kept/acme.bpdb");
-    env.ok(&p, &["project", "save", "--output", saved.to_str().unwrap()]);
+    env.ok(&env.project, &["project", "save", "--output", saved.to_str().unwrap()]);
     let shown = env.ok(&saved, &["engagement", "show"]);
     assert_eq!(shown["engagement"]["include"], json!(["127.0.0.1"]));
-    assert_eq!(env.ok(&saved, &["project", "info"])["temp"], false);
-    let (code, v) = env.run(&p, &["project", "save", "--output", saved.to_str().unwrap()]);
+
+    let (code, v) = env.run(&env.project, &["project", "save", "--output", saved.to_str().unwrap()]);
     assert_ne!(code, 0, "{v}");
     assert_eq!(v["error"]["kind"], "conflict");
-
-    // Nor into the temp project's own folder, which discard wipes.
-    let inside = p.parent().unwrap().join("keep.bpdb");
-    let (code, v) = env.run(&p, &["project", "save", "--output", inside.to_str().unwrap()]);
-    assert_eq!(v["error"]["kind"], "invalid_input", "{v}");
-    assert_ne!(code, 0);
-
-    // A normal project is never discarded.
-    let (code, v) = env.run(&saved, &["project", "discard"]);
-    assert_ne!(code, 0);
-    assert_eq!(v["error"]["kind"], "invalid_input", "{v}");
-    assert!(saved.exists());
-
-    env.ok(&p, &["project", "discard"]);
-    assert!(!p.parent().unwrap().exists());
 }
 
 #[test]
-fn discard_stops_the_proxy() {
-    let env = Env::new("proxy");
-    let p = env.temp(&[]);
-    let started = env.ok(&p, &["proxy", "start", "--listen", "127.0.0.1:0"]);
+fn stop_stops_the_proxy_and_deletes_nothing() {
+    let env = Env::new("stop");
+    let started = env.ok(&env.project, &["proxy", "start", "--listen", "127.0.0.1:0"]);
     let pid = started["pid"].as_u64().unwrap() as u32;
+
     // A copy saved meanwhile doesn't take the running proxy for its own.
     let copy = env.dir.join("copy.bpdb");
-    env.ok(&p, &["project", "save", "--output", copy.to_str().unwrap()]);
+    env.ok(&env.project, &["project", "save", "--output", copy.to_str().unwrap()]);
     assert_eq!(env.ok(&copy, &["proxy", "status"])["running"], false);
     let (code, _) = env.run(&copy, &["proxy", "stop"]);
     assert_ne!(code, 0);
-    let d = env.ok(&p, &["project", "discard"]);
-    assert_eq!(d["stopped"]["proxy"], pid, "{d}");
-    assert!(!p.parent().unwrap().exists());
+
+    let d = env.ok(&env.project, &["project", "stop"]);
+    assert_eq!(d["proxy"], pid, "{d}");
+    assert_eq!(env.ok(&env.project, &["proxy", "status"])["running"], false);
     #[cfg(unix)]
     assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0, "proxy {pid} still running");
-}
-
-#[test]
-fn sweep_wipes_projects_whose_owner_exited() {
-    let env = Env::new("sweep");
-    let mut owner = sleeper();
-    let owned = env.temp(&["--owner", &owner.id().to_string()]);
-    let unowned = env.temp(&[]);
-
-    // Owner alive: kept.
-    assert_eq!(env.ok(Path::new("x.bpdb"), &["project", "sweep"])["removed"], json!([]));
-    assert!(owned.exists());
-
-    owner.kill().unwrap();
-    owner.wait().unwrap();
-    let removed = env.ok(Path::new("x.bpdb"), &["project", "sweep"])["removed"].clone();
-    assert_eq!(removed.as_array().unwrap().len(), 1, "{removed}");
-    assert!(!owned.parent().unwrap().exists());
-    // Without an owner it stays until discarded.
-    assert!(unowned.exists());
-
-    // An owner that isn't running is refused rather than swept straight away.
-    let (code, v) = env.run(Path::new("x.bpdb"), &["project", "temp", "--owner", "999999999"]);
-    assert_ne!(code, 0, "{v}");
+    assert!(env.project.exists());
+    // Nothing running: stopping again is fine.
+    env.ok(&env.project, &["project", "stop"]);
 }
 
 /// Answers every request after `delay`, so work against it stays busy.
@@ -163,79 +115,56 @@ fn slow_server(delay: Duration) -> u16 {
 }
 
 #[test]
-fn discard_stops_background_fuzzing() {
+fn stop_stops_background_fuzzing() {
     let env = Env::new("fuzz");
-    let p = env.temp(&[]);
     let port = slow_server(Duration::from_millis(200));
     let url = format!("http://127.0.0.1:{port}/§x§");
-    let started = env.ok(&p, &["fuzz", "run", "--url", &url, "-p", "range:1-5000", "-c", "2", "--background"]);
-    let run = started["run"]["id"].as_i64().or_else(|| started["id"].as_i64()).unwrap_or(1);
-    let d = env.ok(&p, &["project", "discard"]);
-    let work = d["stopped"]["work"].as_array().unwrap();
+    let started =
+        env.ok(&env.project, &["fuzz", "run", "--url", &url, "-p", "range:1-5000", "-c", "2", "--background"]);
+    let run = started["run"]["id"].as_i64().unwrap();
+    let d = env.ok(&env.project, &["project", "stop"]);
+    let work = d["work"].as_array().unwrap();
     assert!(work.iter().any(|w| w["kind"] == "fuzz run" && w["id"] == run), "{d}");
-    assert!(!p.parent().unwrap().exists());
-}
-
-#[cfg(unix)]
-fn sleeper() -> std::process::Child {
-    Command::new("sleep").arg("60").spawn().unwrap()
-}
-
-#[cfg(windows)]
-fn sleeper() -> std::process::Child {
-    Command::new("powershell").args(["-NoProfile", "-Command", "Start-Sleep 60"]).spawn().unwrap()
+    let state = env.ok(&env.project, &["fuzz", "status", &run.to_string()]);
+    assert_eq!(state["run"]["state"], "stopped", "{state}");
+    assert!(env.project.exists());
 }
 
 #[test]
-fn mcp_serve_temp_wipes_its_project_on_exit() {
+fn cli_cannot_make_or_wipe_temporary_projects() {
+    let env = Env::new("cli");
+    for cmd in [&["project", "temp"][..], &["project", "discard"], &["project", "sweep"]] {
+        let (code, v) = env.run(&env.project, cmd);
+        assert_eq!(code, 2, "{cmd:?} -> {v}");
+        assert_eq!(v["error"]["kind"], "usage", "{cmd:?} -> {v}");
+    }
+    assert!(env.project.exists());
+}
+
+#[test]
+fn mcp_serve_cannot_make_or_wipe_temporary_projects() {
     let env = Env::new("mcp");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
-        .env("BRAINPROXY_TEMP_DIR", env.dir.join("base"))
-        .env_remove("BRAINPROXY_PROJECT")
-        .arg("--home")
-        .arg(env.dir.join("home"))
-        .args(["mcp", "serve", "--temp"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let out = env.cmd(&env.project).args(["mcp", "serve", "--temp"]).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stdout));
+
+    let mut child =
+        env.cmd(&env.project).args(["mcp", "serve"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    let path = {
-        let mut ask = |id: i64, method: &str, params: Value| -> Value {
-            writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).unwrap();
-            stdin.flush().unwrap();
-            let mut line = String::new();
-            stdout.read_line(&mut line).unwrap();
-            serde_json::from_str(&line).unwrap()
-        };
-        let init = ask(1, "initialize", json!({"protocolVersion": "2025-06-18"}));
-        assert!(init["result"]["instructions"].as_str().unwrap().contains("temporary"), "{init}");
-        let tools = ask(2, "tools/list", json!({}));
-        let names: Vec<&str> =
-            tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"project_save") && !names.contains(&"project_discard"), "{names:?}");
-        let r = ask(3, "tools/call", json!({"name": "project_info", "arguments": {}}));
-        let info: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(info["data"]["temp"], true, "{info}");
-        PathBuf::from(info["data"]["path"].as_str().unwrap())
-    };
-    assert!(path.exists());
-
-    // The client hangs up: the server exits and wipes its project.
+    writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).unwrap();
+    stdin.flush().unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
     drop(stdin);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
+    let _ = child.wait();
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    let names: Vec<&str> =
+        reply["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"project_stop"), "{names:?}");
+    for name in &names {
+        assert!(!["temp", "discard", "sweep", "delete", "wipe"].iter().any(|w| name.contains(w)), "{name}");
     }
-    assert!(child.try_wait().unwrap().is_some(), "server didn't exit");
-    assert!(!path.parent().unwrap().exists(), "{path:?} left behind");
-}
-
-#[test]
-fn mcp_serve_temp_refuses_an_explicit_project() {
-    let env = Env::new("mcp-both");
-    let out = env.cmd(&env.dir.join("p.bpdb")).args(["mcp", "serve", "--temp"]).stdin(Stdio::null()).output().unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stdout).contains("--temp"), "{}", String::from_utf8_lossy(&out.stdout));
+    // Copying the project elsewhere is for the person running the server.
+    assert!(!names.contains(&"project_save"), "{names:?}");
+    assert!(env.project.exists());
 }

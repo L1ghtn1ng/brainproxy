@@ -1,43 +1,31 @@
-//! Temporary projects: a project for one engagement that is never meant to be kept. It is an
-//! ordinary project file (the CLI, proxy and jobs are separate processes sharing it), but it
-//! lives in a RAM-backed folder where the OS has one (Linux tmpfs) and is wiped when its owner
-//! (the desktop app or `mcp serve`) closes it, or by a later sweep if the owner died.
+//! Temporary engagements, a desktop-app feature: a project kept in a RAM-backed folder where the
+//! OS has one (Linux tmpfs), deleted when the user discards it. Only this process creates or
+//! deletes them. The CLI never does: a project started from the CLI or by an agent stays as
+//! proof of the work until a person removes it.
 //!
-//! Layout: `<root>/<id>/temp.bpdb` plus `<root>/<id>/temp.json` (the marker: who owns it).
-//! Everything the project keeps next to its file (logs, browser profiles) lands in that folder
-//! too, so removing the folder removes all of it.
+//! Layout: `<root>/<id>/temp.bpdb`, `<root>/<id>/temp.json` (marker: when it was made, by which
+//! pid) and `<root>/<id>/owner.lock`, locked by the app for as long as it has the project. The
+//! OS releases the lock when the app exits or crashes, so a folder whose lock can be taken is
+//! a leftover; the app asks what to do with it, never deleting one by itself. Everything the
+//! project keeps next to its file (logs, browser profiles) is inside the folder.
 
+use std::fs::{DirBuilder, File};
+use std::hash::{BuildHasher, RandomState};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
-use crate::error::{Error, Result};
-
-/// The project file's name inside its temp folder.
+/// The project file's name inside its folder.
 pub const FILE_NAME: &str = "temp.bpdb";
 const MARKER: &str = "temp.json";
-/// Folders being wiped are renamed to this prefix first, so a half-finished wipe is never
-/// mistaken for a live project and a later sweep can finish it.
-const DISCARDING: &str = ".discard-";
-
-/// The process a temp project belongs to: it is wiped once this process is gone.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Owner {
-    pub pid: u32,
-    /// Process start time (see the CLI's `process::start_time`), so a later process reusing
-    /// the pid isn't taken for the owner.
-    pub start_time: Option<u64>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Marker {
-    pub owner: Option<Owner>,
-    /// Unix seconds.
-    pub created: u64,
-}
+const LOCK: &str = "owner.lock";
+/// Folders being deleted are renamed to this prefix first, so a half-finished delete is never
+/// mistaken for a live project and is finished later.
+const DELETING: &str = ".delete-";
 
 /// Where temp projects go and whether that is RAM rather than disk.
-#[derive(Clone, Debug, Serialize)]
 pub struct Location {
     pub root: PathBuf,
     pub ram_backed: bool,
@@ -47,16 +35,16 @@ pub struct Location {
 /// tmpfs) has more room, else the OS temp folder, which is on disk. The brainproxy folder
 /// inside it is per user.
 pub fn location() -> Location {
-    let base =
-        std::env::var_os("BRAINPROXY_TEMP_DIR").map(PathBuf::from).or_else(ram_base).unwrap_or_else(std::env::temp_dir);
-    let root = base.join(folder_name());
+    let base = std::env::var_os("BRAINPROXY_TEMP_DIR")
+        .map(PathBuf::from)
+        .or_else(ram_base)
+        .unwrap_or_else(std::env::temp_dir);
     let ram_backed = is_ram_backed(&base);
-    Location { root, ram_backed }
+    Location { root: base.join(folder_name()), ram_backed }
 }
 
 /// The runtime dir is often capped at 10% of RAM and /dev/shm at 50%, and captured traffic and
-/// browser profiles grow, so the one with more free space wins. A read-only mount (a sandbox, a
-/// locked-down runtime dir) is skipped.
+/// browser profiles grow, so the one with more free space wins. A read-only mount is skipped.
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_cast)] // statfs field types differ between libc targets.
 fn ram_base() -> Option<PathBuf> {
@@ -106,11 +94,6 @@ fn is_ram_backed(_: &Path) -> bool {
     false
 }
 
-/// Whether the temp project at `project` is in RAM rather than on disk.
-pub fn ram_backed(project: &Path) -> bool {
-    folder_of(project).is_some_and(|d| is_ram_backed(&d))
-}
-
 /// Per user, since /dev/shm and /tmp are shared.
 #[cfg(unix)]
 fn folder_name() -> String {
@@ -123,20 +106,33 @@ fn folder_name() -> String {
     "brainproxy-temp".into()
 }
 
+/// The folder holding `project`, resolved ("." for a bare file name).
+fn folder_of(project: &Path) -> Option<PathBuf> {
+    let dir = project.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::canonicalize(dir).ok()
+}
+
+/// Whether the temp project at `project` is in RAM rather than on disk.
+pub fn ram_backed(project: &Path) -> bool {
+    folder_of(project).is_some_and(|d| is_ram_backed(&d))
+}
+
 /// Creates the root owner-only, refusing one that someone else made (or a symlink planted
 /// there), since /dev/shm and /tmp are writable by everyone.
-fn ensure_root(root: &Path) -> Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
+fn ensure_root(root: &Path) -> io::Result<()> {
+    let mut builder = DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(root).map_err(|e| io_error(format!("cannot create folder {}: {e}", root.display())))?;
+    builder
+        .create(root)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot create folder {}: {e}", root.display())))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::symlink_metadata(root)?;
         if !meta.is_dir() || meta.uid() != unsafe { libc::getuid() } || meta.mode() & 0o077 != 0 {
-            return Err(Error::Conflict(format!(
+            return Err(io::Error::other(format!(
                 "{} must be a folder owned by you with no access for others; remove it or set BRAINPROXY_TEMP_DIR",
                 root.display()
             )));
@@ -145,41 +141,42 @@ fn ensure_root(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn io_error(message: String) -> Error {
-    Error::Io(std::io::Error::other(message))
+/// 128 random bits as hex: RandomState is seeded from the OS's randomness per instance.
+fn random_id() -> String {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let a = RandomState::new().hash_one((std::process::id(), nanos));
+    let b = RandomState::new().hash_one((nanos, std::process::id()));
+    format!("{a:016x}{b:016x}")
 }
 
-/// Makes a new, empty temp project folder and returns the project file's path (not created
-/// yet: the first `Store::open` creates it).
-pub fn create(owner: Option<Owner>) -> Result<PathBuf> {
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Makes a new temp project folder, writes its marker and locks it for this process. Returns
+/// the project file's path (created by the CLI's `project init`) and the lock, which must be
+/// kept for as long as the app has the project.
+pub fn create() -> io::Result<(PathBuf, File)> {
     let root = location().root;
     ensure_root(&root)?;
-    let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
-    let dir = root.join(hex::encode(bytes));
-    let mut builder = std::fs::DirBuilder::new();
+    let dir = root.join(random_id());
+    let mut builder = DirBuilder::new();
     // Not recursive: the root exists, and the project's folder must be a new one.
     builder.recursive(false);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(&dir)?;
-    let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let marker = Marker { owner, created };
-    std::fs::write(dir.join(MARKER), serde_json::to_vec(&marker).unwrap_or_default())?;
-    Ok(dir.join(FILE_NAME))
+    let marker = json!({"created": now(), "pid": std::process::id()});
+    std::fs::write(dir.join(MARKER), marker.to_string())?;
+    let lock = File::create(dir.join(LOCK))?;
+    lock.try_lock().map_err(io::Error::other)?;
+    Ok((dir.join(FILE_NAME), lock))
 }
 
-/// The folder holding `project`, resolved ("." for a bare file name).
-fn folder_of(project: &Path) -> Option<PathBuf> {
-    let dir = project.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    std::fs::canonicalize(dir).ok()
-}
-
-/// The marker of `project` if it is a temp project: named `temp.bpdb`, with a marker beside
-/// it, in a folder directly inside this user's brainproxy temp folder. The layout identifies
-/// it, not today's temp location (which depends on the environment). Anything else is never
-/// wiped.
-pub fn marker(project: &Path) -> Option<Marker> {
+/// The marker of `project` if it is a temp project: named `temp.bpdb`, with a marker beside it,
+/// in a folder directly inside this user's brainproxy temp folder. Anything else is never
+/// deleted.
+pub fn marker(project: &Path) -> Option<Value> {
     if project.file_name()? != FILE_NAME {
         return None;
     }
@@ -190,42 +187,54 @@ pub fn marker(project: &Path) -> Option<Marker> {
     serde_json::from_slice(&std::fs::read(dir.join(MARKER)).ok()?).ok()
 }
 
+/// Temp projects no running app has: their lock could be taken, and is returned held, so no
+/// other app instance offers them at the same time. Each comes with its marker.
+pub fn leftovers() -> Vec<(PathBuf, Value, File)> {
+    finish_deletes();
+    let Ok(entries) = std::fs::read_dir(location().root) else { return Vec::new() };
+    entries
+        .flatten()
+        .map(|e| e.path().join(FILE_NAME))
+        .filter_map(|p| {
+            let marker = marker(&p)?;
+            // A folder without a lock file was being created, or isn't ours: leave it.
+            let lock = File::options().write(true).open(p.parent()?.join(LOCK)).ok()?;
+            lock.try_lock().ok()?;
+            Some((p, marker, lock))
+        })
+        .collect()
+}
+
 /// Whether `path` (which need not exist yet) is inside a temp project's folder, and so would be
-/// wiped with it.
+/// deleted with it.
 pub fn is_inside(path: &Path) -> bool {
     let Ok(abs) = std::path::absolute(path) else { return false };
     let Some(existing) = abs.ancestors().find_map(|a| std::fs::canonicalize(a).ok()) else { return false };
     existing.ancestors().any(|d| marker(&d.join(FILE_NAME)).is_some())
 }
 
-/// Every temp project under the root, with its marker.
-pub fn list() -> Vec<(PathBuf, Marker)> {
-    let Ok(entries) = std::fs::read_dir(location().root) else { return Vec::new() };
-    entries.flatten().map(|e| e.path().join(FILE_NAME)).filter_map(|p| marker(&p).map(|m| (p, m))).collect()
-}
-
-/// Removes a temp project's folder and everything in it. The caller stops whatever still
-/// uses it first. Refuses anything that isn't a temp project.
-pub fn remove(project: &Path) -> Result<()> {
+/// Deletes a temp project's folder and everything in it. The caller has stopped everything
+/// using it and dropped its lock (Windows can't rename a folder with an open file). Refuses
+/// anything that isn't a temp project.
+pub fn remove(project: &Path) -> io::Result<()> {
     if marker(project).is_none() {
-        return Err(Error::InvalidInput(format!("{} is not a temporary project", project.display())));
+        return Err(io::Error::other(format!("{} is not a temporary project", project.display())));
     }
-    let dir = folder_of(project).ok_or_else(|| Error::NotFound(format!("folder of {}", project.display())))?;
+    let dir = folder_of(project).ok_or_else(|| io::Error::other("the project's folder is gone"))?;
     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let claimed = dir.with_file_name(format!("{DISCARDING}{name}"));
+    let claimed = dir.with_file_name(format!("{DELETING}{name}"));
     std::fs::rename(&dir, &claimed)?;
-    // A sweep finishing leftovers may be removing the same folder at the same time.
     match std::fs::remove_dir_all(&claimed) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
 }
 
-/// Finishes wipes that were interrupted (folders left with the discarding prefix).
-pub fn remove_leftovers() {
+/// Finishes deletes that were interrupted: those folders were already chosen for deletion.
+fn finish_deletes() {
     let Ok(entries) = std::fs::read_dir(location().root) else { return };
     for e in entries.flatten() {
-        if e.file_name().to_string_lossy().starts_with(DISCARDING) {
+        if e.file_name().to_string_lossy().starts_with(DELETING) {
             let _ = std::fs::remove_dir_all(e.path());
         }
     }
@@ -238,27 +247,33 @@ mod tests {
     /// One test touching the env var, so tests running in parallel don't race on it.
     #[test]
     fn create_find_and_remove() {
-        let base = std::env::temp_dir().join(format!("bp-temp-unit-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("bp-gui-temp-unit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         std::env::set_var("BRAINPROXY_TEMP_DIR", &base);
 
-        let owner = Owner { pid: 4242, start_time: Some(7) };
-        let p = create(Some(owner)).unwrap();
+        let (p, lock) = create().unwrap();
         assert_eq!(p.file_name().unwrap(), FILE_NAME);
         assert!(p.parent().unwrap().starts_with(&base));
-        assert_eq!(marker(&p).unwrap().owner, Some(owner));
-        assert_eq!(list().len(), 1);
+        assert_eq!(marker(&p).unwrap()["pid"], std::process::id());
+        // Held by us: not a leftover.
+        assert!(leftovers().is_empty());
+        drop(lock);
+        // Released (as when the app exits or crashes): offered, and held while offered.
+        let found = leftovers();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, p);
+        assert!(leftovers().is_empty());
 
-        // Only the real layout counts: a project elsewhere with a look-alike marker doesn't.
+        // Only the real layout counts: a look-alike elsewhere isn't a temp project.
         let fake = base.join("elsewhere");
         std::fs::create_dir_all(&fake).unwrap();
-        std::fs::write(fake.join(MARKER), b"{\"owner\":null,\"created\":0}").unwrap();
+        std::fs::write(fake.join(MARKER), b"{}").unwrap();
         assert!(marker(&fake.join(FILE_NAME)).is_none());
         assert!(remove(&fake.join(FILE_NAME)).is_err());
         assert!(fake.exists());
 
-        // Anything saved inside it would be wiped with it.
+        // Anything saved inside it would be deleted with it.
         assert!(is_inside(&p.parent().unwrap().join("kept/acme.bpdb")));
         assert!(!is_inside(&base.join("kept/acme.bpdb")));
 
@@ -267,15 +282,15 @@ mod tests {
         assert!(marker(&p).is_some());
         std::env::set_var("BRAINPROXY_TEMP_DIR", &base);
 
+        drop(found);
         std::fs::write(&p, b"data").unwrap();
         remove(&p).unwrap();
         assert!(!p.parent().unwrap().exists());
-        assert!(list().is_empty());
 
-        // An interrupted wipe is finished later.
-        let left = location().root.join(format!("{DISCARDING}abc"));
+        // An interrupted delete is finished later.
+        let left = location().root.join(format!("{DELETING}abc"));
         std::fs::create_dir_all(&left).unwrap();
-        remove_leftovers();
+        finish_deletes();
         assert!(!left.exists());
 
         #[cfg(unix)]

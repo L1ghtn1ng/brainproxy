@@ -346,10 +346,8 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Project(c) => match c {
             project_cmd::ProjectCmd::Init => "project init",
             project_cmd::ProjectCmd::Info => "project info",
-            project_cmd::ProjectCmd::Temp { .. } => "project temp",
-            project_cmd::ProjectCmd::Discard => "project discard",
             project_cmd::ProjectCmd::Save { .. } => "project save",
-            project_cmd::ProjectCmd::Sweep => "project sweep",
+            project_cmd::ProjectCmd::Stop => "project stop",
         },
         Cmd::Send(_) => "send",
         Cmd::History(HistoryCmd::List { .. }) => "history list",

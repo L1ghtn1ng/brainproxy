@@ -1063,7 +1063,7 @@ function Project() {
         <dd>
           {app.temp ? (
             <>
-              Temporary, {app.temp.ramBacked ? "in memory (RAM)" : "in the temp folder on disk"}: wiped when it closes.{" "}
+              Temporary, {app.temp.ramBacked ? "in memory (RAM)" : "in the temp folder on disk"}: deleted when you discard it.{" "}
               <button className="link" onClick={() => app.saveAs().catch((e) => app.toast(`Not saved: ${e.message}`, "error"))}>
                 Save as…
               </button>

@@ -13,12 +13,13 @@ React UI (gui/src)  --invoke("cli")-->  Tauri shell (gui/src-tauri)  --spawn--> 
 
 - **Every engine call is a CLI invocation** returning the JSON envelope, exactly like
   `mcp serve` runs tools. The GUI has no second code path into the engine: scope checks,
-  errors, and output are the CLI's, and anything the GUI can do an agent can do too.
-- The shell (`src-tauri/src/main.rs`) has two commands: `cli(project, args, stdin, env)`,
-  and `app_pid()`, the app's pid, which owns its temporary projects. `--project` is left
-  out while no project is open (an empty `project`). The binary is `$BRAINPROXY_BIN`, else
-  a `brainproxy` next to the app executable (bundle the sidecar there), else `brainproxy`
-  on PATH.
+  errors, and output are the CLI's, and anything the GUI can do an agent can do too. The
+  one exception is temporary engagements (below): the shell itself creates and deletes
+  their folders, because nothing reachable from the CLI or MCP may make a project that
+  deletes itself.
+- The shell (`src-tauri/src/main.rs`) runs the CLI with `cli(project, args, stdin, env)`.
+  The binary is `$BRAINPROXY_BIN`, else a `brainproxy` next to the app executable (bundle
+  the sidecar there), else `brainproxy` on PATH.
   - `stdin` is bytes (a number array, `Vec<u8>`), written to the child unchanged; `api.ts`
     sends text as UTF-8. Bodies the CLI returns as base64 are shown one char per byte
     (`bodyText`), and `textBytes(text, true)` turns them back into the same bytes, so
@@ -49,14 +50,35 @@ checked and shown as a chip), optional exclusions, an explicit note that the sco
 change later, and an "I have permission to test these targets" check. It runs
 `engagement start` on the new file and opens it. Recent and existing projects are below.
 
-"Temporary engagement" is the same form without the file step: it runs `project temp
---owner <app pid>`, then `engagement start` on that path (discarding it if that fails).
-Temporary projects never go in Recent. The welcome screen runs `project sweep` on show,
-which wipes temporary projects left by a crashed app and says whether new ones are
-RAM-backed. While one is open the top bar shows a **temp** badge (click: Save as…), and
-the sidebar has *Save as…*: `project save --output FILE`, then `project discard` and open
-FILE. Switching project or closing the window asks first (an in-app dialog, `ui/Confirm.tsx`:
-native ones differ per OS), then runs `project discard`.
+### Temporary engagements
+
+"Temporary engagement" (desktop app only) is the same form without the file step. The
+project goes in a RAM-backed folder where the OS has one and is deleted when the user
+discards it. Only the shell (`src-tauri/src/temp.rs`) creates or deletes these folders: the
+CLI has no command for it, so a project a script or agent starts always keeps its file.
+
+- **Where:** `$BRAINPROXY_TEMP_DIR`, else on Linux whichever of `$XDG_RUNTIME_DIR` and
+  `/dev/shm` (tmpfs, not read-only) has more room, else the OS temp folder, which is on disk
+  (the UI says "in the temp folder" then). Inside it, a per-user `brainproxy-temp-<uid>`
+  folder (`0700`; refused if someone else owns it, others can access it, or it is a symlink),
+  and one folder per project: `temp.bpdb`, the marker `temp.json` (when it was made, by
+  which pid), and `owner.lock`. A project counts as temporary only by this layout, and only
+  such folders are ever deleted.
+- **Creating:** `temp_create` makes the folder and locks `owner.lock` for this app; the UI
+  then runs `project init` and `engagement start` on `<folder>/temp.bpdb` like any project
+  (discarding it if the scope is refused). Temporary projects never go in Recent.
+- **While open:** the top bar shows a `temp · in memory` / `temp · on disk` badge (click:
+  Save as…), and the sidebar and Settings › Project have *Save as…*: `project save --output
+  FILE` (refused inside a temp folder, `temp_is_inside`), then discard, then open FILE.
+- **Discarding:** Switch project or closing the window asks first (an in-app dialog,
+  `ui/Confirm.tsx`, since native ones differ per OS). `temp_discard` then runs `project stop`
+  (proxy, OOB listener, jobs and fuzz runs; it deletes nothing) and, once everything has
+  stopped, deletes the folder. If something won't stop, the folder is kept.
+- **Leftovers:** the OS releases `owner.lock` when the app exits or crashes, so a folder
+  whose lock can be taken belongs to no running app. The welcome screen lists those
+  (`temp_leftovers`, which keeps them locked so a second window doesn't offer them too):
+  "Unsaved temporary engagement … from <date>" with *Save as…* (save, delete the temporary
+  one, open the copy) and *Delete* (asks first). Nothing is deleted unless the user chooses.
 
 ## Layout
 
@@ -86,7 +108,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles, match & replace, intercept options, proxy (status, start, setup for browsers/curl/shell), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *`, `rules *`, `intercept *`, `proxy status/start`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary projects), `engagement show` |
+| | Settings | Auth profiles, match & replace, intercept options, proxy (status, start, setup for browsers/curl/shell), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *`, `rules *`, `intercept *`, `proxy status/start`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
 
 ### Guided scan
 

@@ -946,6 +946,22 @@ select {
   margin: 4px 6px;
   background: var(--border);
 }
+/* Temporary engagements left behind, offered on the welcome screen. */
+.leftovers {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.leftover {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--medium);
+  border-radius: 10px;
+}
+
 /* In-app confirmation (ui/Confirm.tsx). */
 .confirm-backdrop {
   position: fixed;

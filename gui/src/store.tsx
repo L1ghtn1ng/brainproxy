@@ -36,7 +36,7 @@ interface Toast {
   kind: "info" | "error";
 }
 
-/** An open temporary project: wiped when it closes. Not RAM-backed where the OS has no RAM folder. */
+/** An open temporary project: deleted when the user discards it. Not RAM-backed where the OS has no RAM folder. */
 export interface TempInfo {
   ramBacked: boolean;
 }
