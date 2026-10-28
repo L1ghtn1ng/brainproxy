@@ -487,6 +487,48 @@ impl Expr {
         }
     }
 
+    /// Every string literal in the expression.
+    pub fn strings<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Expr::Lit(Value::Str(s)) => out.push(s),
+            Expr::Lit(_) | Expr::Var(_) => {}
+            Expr::Not(e) | Expr::Neg(e) => e.strings(out),
+            Expr::Bin(_, a, b) => {
+                a.strings(out);
+                b.strings(out);
+            }
+            Expr::Call(_, args, _) => args.iter().for_each(|a| a.strings(out)),
+        }
+    }
+
+    /// The expression with every string literal passed through `fill`, as Nuclei fills
+    /// `{{placeholders}}` in an expression before evaluating it. A literal regex that
+    /// changes is compiled again.
+    pub fn filled(&self, fill: &dyn Fn(&str) -> String) -> Expr {
+        match self {
+            Expr::Lit(Value::Str(s)) => Expr::Lit(Value::Str(fill(s))),
+            Expr::Lit(_) | Expr::Var(_) => self.clone(),
+            Expr::Not(e) => Expr::Not(Box::new(e.filled(fill))),
+            Expr::Neg(e) => Expr::Neg(Box::new(e.filled(fill))),
+            Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(a.filled(fill)), Box::new(b.filled(fill))),
+            Expr::Call(f, args, re) => {
+                let args: Vec<Expr> = args.iter().map(|a| a.filled(fill)).collect();
+                let pattern = match f {
+                    Func::Regex => args.first(),
+                    Func::ReplaceRegex => args.get(1),
+                    _ => None,
+                };
+                let re = match (pattern, &re.0) {
+                    (Some(Expr::Lit(Value::Str(src))), Some((old, _))) if src != old => {
+                        LazyRegex(Some((src.clone(), Default::default())))
+                    }
+                    _ => re.clone(),
+                };
+                Expr::Call(*f, args, re)
+            }
+        }
+    }
+
     /// Evaluates the expression; None when a variable is missing or a value has
     /// the wrong type (Nuclei treats such an evaluation as no match).
     pub fn eval(&self, env: &dyn Fn(&str) -> Option<Value>) -> Option<Value> {

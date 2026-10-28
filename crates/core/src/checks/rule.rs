@@ -208,16 +208,52 @@ fn builtins(cx: &Cx, scope: RuleScope) -> HashMap<String, String> {
 fn subst(text: &str, vars: &HashMap<String, String>) -> Option<String> {
     let mut missing = false;
     let out = PLACEHOLDER.replace_all(text, |c: &regex::Captures| {
-        let value = vars.get(&c[1]).cloned().or_else(|| {
-            let env = |name: &str| vars.get(name).map(|v| Value::Str(v.clone()));
-            super::dsl::parse(&c[1]).ok()?.eval(&env).map(Value::into_string)
-        });
-        value.unwrap_or_else(|| {
+        placeholder(&c[1], vars).unwrap_or_else(|| {
             missing = true;
             String::new()
         })
     });
     (!missing).then(|| out.into_owned())
+}
+
+/// The value of one placeholder: a variable, or a DSL expression over them.
+fn placeholder(name: &str, vars: &HashMap<String, String>) -> Option<String> {
+    vars.get(name).cloned().or_else(|| {
+        let env = |name: &str| vars.get(name).map(|v| Value::Str(v.clone()));
+        super::dsl::parse(name).ok()?.eval(&env).map(Value::into_string)
+    })
+}
+
+/// A DSL expression with the placeholders in its strings filled, as Nuclei does before
+/// evaluating (`contains(body, '{{randstr}}')`). One without a value stays as written.
+fn fill_dsl<'e>(e: &'e super::dsl::Expr, vars: &HashMap<String, String>) -> std::borrow::Cow<'e, super::dsl::Expr> {
+    let mut strings = Vec::new();
+    e.strings(&mut strings);
+    if !strings.iter().any(|s| PLACEHOLDER.is_match(s)) {
+        return std::borrow::Cow::Borrowed(e);
+    }
+    let fill = |s: &str| {
+        PLACEHOLDER
+            .replace_all(s, |c: &regex::Captures| placeholder(&c[1], vars).unwrap_or_else(|| c[0].to_string()))
+            .into_owned()
+    };
+    std::borrow::Cow::Owned(e.filled(&fill))
+}
+
+/// The string literals of a block's DSL matchers (immediate ones) and extractors.
+pub(crate) fn dsl_strings(b: &Block) -> Vec<&str> {
+    let mut out = Vec::new();
+    for m in b.matchers.iter().filter(|m| !m.oob) {
+        if let MatchKind::Dsl(exprs) = &m.kind {
+            exprs.iter().for_each(|e| e.strings(&mut out));
+        }
+    }
+    for e in &b.extractors {
+        if let ExtractKind::Dsl(exprs) = &e.kind {
+            exprs.iter().for_each(|e| e.strings(&mut out));
+        }
+    }
+    out
 }
 
 /// Adds a `randstr*` value for every such placeholder in the check.
@@ -232,6 +268,7 @@ fn add_randstr(check: &Check, vars: &mut HashMap<String, String>) {
                 texts.extend(w.iter().map(String::as_str));
             }
         }
+        texts.extend(dsl_strings(b));
     }
     for t in texts {
         for c in PLACEHOLDER.captures_iter(t) {
@@ -423,10 +460,13 @@ fn set_oob(check: &Check, vars: &mut HashMap<String, String>, p: &Payload) {
     let host =
         if p.dns { p.host.clone() } else { p.url.trim_start_matches("http://").trim_end_matches('/').to_string() };
     vars.insert("interactsh-url".into(), host);
+    // Also variables that use it through another one (`jndi: ldap://{{callback}}/x`).
+    let mut changed = vec!["interactsh-url"];
     for (k, v) in &check.variables {
-        if v.contains("interactsh-url") && !check.inputs.iter().any(|(i, _)| i == k) {
+        if changed.iter().any(|c| v.contains(c)) && !check.inputs.iter().any(|(i, _)| i == k) {
             if let Some(x) = subst(v, vars) {
                 vars.insert(k.clone(), x);
+                changed.push(k.as_str());
             }
         }
     }
@@ -593,17 +633,13 @@ pub fn alert_from_json(check: &serde_json::Value) -> Option<&'static AlertDef> {
 /// `path:` requests: the base request's headers (cookies, auth) with the
 /// template's method, path, headers, and body. Other origins are skipped.
 fn build_path(cx: &Cx, block: &Block, template: &str, vars: &HashMap<String, String>) -> Option<Vec<u8>> {
-    let url = url::Url::parse(&subst(template, vars)?).ok()?;
+    let filled = subst(template, vars)?;
+    let url = url::Url::parse(&filled).ok()?;
     let target = crate::http::Target::from_url(url.as_str()).ok()?;
     if target != *cx.target() {
         return None;
     }
-    let mut pq = url.path().to_string();
-    if let Some(q) = url.query() {
-        pq.push('?');
-        pq.push_str(q);
-    }
-    let mut req = RawRequest::from_bytes(cx.request_for(&block.method, &pq));
+    let mut req = RawRequest::from_bytes(cx.request_for(&block.method, &request_target(&filled)));
     for (k, v) in &block.headers {
         req = req.set_header(k, &subst(v, vars)?);
     }
@@ -613,6 +649,27 @@ fn build_path(cx: &Cx, block: &Block, template: &str, vars: &HashMap<String, Str
         None => bytes.extend_from_slice(subst(&block.body, vars)?.as_bytes()),
     }
     Some(RawRequest::from_bytes(bytes).update_content_length().into_bytes())
+}
+
+/// The path and query of a filled-in `path:` URL as written, like Nuclei: `..`, `%2e` and
+/// `\` segments are sent, not resolved (path-traversal checks depend on them). Only bytes
+/// that can't appear in a request line are escaped; the fragment is dropped.
+fn request_target(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let tail = &rest[rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len())..];
+    let tail = tail.split('#').next().unwrap_or("");
+    let mut out = String::new();
+    if !tail.starts_with(['/', '\\']) {
+        out.push('/');
+    }
+    for b in tail.bytes() {
+        if b.is_ascii_graphic() {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// `raw:` requests: line endings normalized and Content-Length fixed unless
@@ -706,7 +763,7 @@ fn matches(env: &Env, seen: &[Response], m: &Matcher, vars: &HashMap<String, Str
     let (hit, evidence) = match &m.kind {
         MatchKind::Dsl(exprs) => {
             let lookup = |name: &str| dsl_value(env, seen, vars, name);
-            let hit = |e: &super::dsl::Expr| e.matches(&lookup);
+            let hit = |e: &super::dsl::Expr| fill_dsl(e, vars).matches(&lookup);
             (if m.and { exprs.iter().all(hit) } else { exprs.iter().any(hit) }, None)
         }
         MatchKind::Status(codes) => (codes.contains(&resp.status), Some(resp.status_line.clone())),
@@ -761,7 +818,13 @@ fn extract(env: &Env, seen: &[Response], e: &Extractor, vars: &HashMap<String, S
     match &e.kind {
         ExtractKind::Dsl(exprs) => {
             let lookup = |name: &str| dsl_value(env, seen, vars, name);
-            out.extend(exprs.iter().filter_map(|x| x.eval(&lookup)).map(Value::into_string).filter(|v| !v.is_empty()));
+            out.extend(
+                exprs
+                    .iter()
+                    .filter_map(|x| fill_dsl(x, vars).eval(&lookup))
+                    .map(Value::into_string)
+                    .filter(|v| !v.is_empty()),
+            );
         }
         ExtractKind::Json(paths) => {
             if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&part_text(env, seen, &e.part)) {
@@ -929,4 +992,33 @@ fn evaluate(
         cx.report(rule.alerts[0].raise(param, evidence).attack(attack).other_info(info), resp);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn variables_using_the_oob_url_through_another_get_it() {
+        let yaml = "id: x\ninfo: {severity: low}\nvariables:\n  callback: '{{interactsh-url}}'\n  jndi: 'ldap%3a//{{callback}}/zz'\n  plain: 'p'\nhttp:\n  - path: ['{{BaseURL}}/?a={{jndi}}']\n    matchers:\n      - type: status\n        status: [200]\n";
+        let opts = super::super::LoadOptions { oob: true, ..Default::default() };
+        let check = super::super::parse(yaml, Path::new("t.yaml"), None, &opts).unwrap_or_else(|_| panic!("loads"));
+        let mut vars = HashMap::new();
+        let p = Payload { token: "t".into(), host: "t.oob.test".into(), url: "http://t.oob.test/".into(), dns: true };
+        set_oob(&check, &mut vars, &p);
+        assert_eq!(vars["callback"], "t.oob.test");
+        assert_eq!(vars["jndi"], "ldap%3a//t.oob.test/zz");
+        assert!(!vars.contains_key("plain"));
+    }
+
+    #[test]
+    fn path_requests_keep_the_path_as_written() {
+        assert_eq!(request_target("http://a.test/js/../.htpasswd"), "/js/../.htpasswd");
+        assert_eq!(request_target("http://a.test:8080/.%2e/%2e%2e/etc"), "/.%2e/%2e%2e/etc");
+        assert_eq!(request_target(r"http://a.test/static\..\web.config"), r"/static\..\web.config");
+        assert_eq!(request_target("http://a.test?x=1 2#frag"), "/?x=1%202");
+        assert_eq!(request_target("http://a.test"), "/");
+        assert_eq!(request_target("http://a.test/é"), "/%C3%A9");
+    }
 }

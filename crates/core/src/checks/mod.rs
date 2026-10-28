@@ -344,7 +344,15 @@ pub fn load(paths: &[PathBuf], opts: &LoadOptions) -> Result<Loaded> {
         let handles: Vec<_> = files
             .chunks(chunk)
             .map(|c| {
-                sc.spawn(move || c.iter().map(|(f, root)| (f.clone(), parse_file(f, root, opts))).collect::<Vec<_>>())
+                sc.spawn(move || {
+                    // A template that trips a bug in the parser is skipped, not its whole chunk.
+                    let parse = |f: &Path, root: &Path| {
+                        std::panic::catch_unwind(|| parse_file(f, root, opts)).unwrap_or_else(|_| {
+                            Err((None, Problem::Invalid("the parser failed on this template".into())))
+                        })
+                    };
+                    c.iter().map(|(f, root)| (f.clone(), parse(f, root))).collect::<Vec<_>>()
+                })
             })
             .collect();
         handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
@@ -800,7 +808,9 @@ fn raw_annotations(raw: &str) -> std::result::Result<(Option<std::time::Duration
         match name {
             "timeout" => {
                 let secs = value.strip_suffix('s').unwrap_or(value).trim();
-                let Ok(secs) = secs.parse::<f64>() else { return invalid(format!("bad @timeout {value:?}")) };
+                let Some(secs) = secs.parse::<f64>().ok().filter(|s| s.is_finite()) else {
+                    return invalid(format!("bad @timeout {value:?}"));
+                };
                 timeout = Some(std::time::Duration::from_secs_f64(secs.clamp(0.1, 600.0)));
             }
             other => return unsupported(format!("raw request annotation @{other}")),
@@ -1128,6 +1138,30 @@ fn check_placeholders(
                 let list = if input(v) { &mut used_inputs } else { &mut missing };
                 if !list.iter().any(|x| x == v) {
                     list.push(v.to_string());
+                }
+            }
+        }
+    }
+    // Placeholders in DSL strings are filled when they have a value and kept as written
+    // otherwise, so only the OOB URL and inputs matter here.
+    for b in blocks.iter() {
+        for t in rule::dsl_strings(b) {
+            for c in PLACEHOLDER.captures_iter(t) {
+                let mut used = vec![c[1].to_string()];
+                if let Ok(e) = dsl::parse(&c[1]) {
+                    let mut names = Vec::new();
+                    e.vars(&mut names);
+                    used.extend(names.into_iter().map(str::to_string));
+                }
+                for v in used.iter().map(String::as_str) {
+                    if v == "interactsh-url" {
+                        if !opts.oob {
+                            return unsupported(NEEDS_OOB);
+                        }
+                        oob_url = true;
+                    } else if input(v) && !known.contains(v) && !used_inputs.iter().any(|x| x == v) {
+                        used_inputs.push(v.to_string());
+                    }
                 }
             }
         }

@@ -76,7 +76,9 @@ http(3))`; later blocks only run when needed, JavaScript flows are unsupported).
 Request blocks:
 
 - `method` + `path` list, or `raw` requests (line endings normalized, Content-Length fixed
-  unless `unsafe: true`); `headers`, `body`. A raw request's `@timeout: 20s` line sets its
+  unless `unsafe: true`); `headers`, `body`. A `path` is sent as written, like Nuclei:
+  `..`, `%2e%2e` and `\` segments are not resolved (only spaces and other bytes a request
+  line can't hold are percent-encoded). A raw request's `@timeout: 20s` line sets its
   timeout; otherwise `scan active --check-timeout` applies (default 10 s).
 - `payloads` with `attack` batteringram | pitchfork | clusterbomb, at most 1000
   combinations per block. A payload is an inline list or a file (one value per non-empty
@@ -91,7 +93,9 @@ Request blocks:
   `status`, `size`, `binary`, `dsl`; `condition`, `negative`, `case-insensitive`,
   `internal` (counts for the block and `flow`, but a block whose matchers are all
   internal reports nothing); parts `body` (default), `header`, `all`/`response`/`raw`,
-  one response header (`content_type`), or a numbered part (`body_2`).
+  one response header (`content_type`), or a numbered part (`body_2`). Placeholders in a
+  DSL expression's strings are filled before it is evaluated (`contains(body,
+  '{{randstr}}')`); one without a value stays as written.
 - `extractors`: `regex` (with `group`), `kval`, `dsl`, and `json` with jq paths
   (`.a.b`, `.a[0]`, `.["k"]`, `.items[]`, and pipes of these; no `select`, `..`, or
   operators); `internal: true` extractors feed later requests as `{{name}}`, and named
@@ -115,8 +119,8 @@ Out-of-band: with an OOB listener running (`brainproxy oob start`, docs/OOB.md),
 `{{interactsh-url}}` is a fresh listener payload for every request (one per sequence
 with req-condition): `<token>.<domain>` in DNS mode, `<host>:<port>/<token>` in host
 mode, so `http://{{interactsh-url}}/...` reaches the listener either way (DNS-only uses
-such as `nslookup {{interactsh-url}}` need DNS mode). Variables using it are evaluated
-again per request. Matchers on `interactsh_protocol`, `interactsh_request`,
+such as `nslookup {{interactsh-url}}` need DNS mode). Variables using it, directly or
+through another variable, are evaluated again per request. Matchers on `interactsh_protocol`, `interactsh_request`,
 `interactsh_response`, `interactsh_ip` (as `part:` or DSL variables) are evaluated when
 an interaction with the request's token is correlated, at the end of the scan
 (`--oob-wait`) or by a later `oob poll`: with `matchers-condition: and`, the request is
