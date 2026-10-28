@@ -122,19 +122,18 @@ pub(crate) fn rekey_findings(conn: &rusqlite::Connection) -> Result<()> {
             }
         }
     }
-    let tx = conn.unchecked_transaction()?;
-    // Temporary unique keys first, so no update collides with a row that is about to go.
-    tx.execute("UPDATE findings SET dedupe = 'v10-' || id", [])?;
+    // In the migration's transaction. Temporary unique keys first, so no update collides
+    // with a row that is about to go.
+    conn.execute("UPDATE findings SET dedupe = 'v10-' || id", [])?;
     for id in drop {
-        tx.execute("DELETE FROM findings WHERE id = ?1", [id])?;
+        conn.execute("DELETE FROM findings WHERE id = ?1", [id])?;
     }
     for (key, k) in kept {
-        tx.execute(
+        conn.execute(
             "UPDATE findings SET dedupe = ?1, hits = ?2, last_history_id = ?3, state = ?4 WHERE id = ?5",
             params![key, k.hits, k.last, k.state, k.id],
         )?;
     }
-    tx.commit()?;
     Ok(())
 }
 
