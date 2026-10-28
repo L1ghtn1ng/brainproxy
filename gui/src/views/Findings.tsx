@@ -48,7 +48,7 @@ export function FindingsView({ active }: { active: boolean }) {
   const scans = useMemo(() => (jobs?.jobs ?? []).filter((j) => j.kind === "active-scan" && (j.state === "completed" || j.state === "stopped")), [jobs]);
   const scan = scans.find((j) => j.id === scanId) ?? scans[0];
   const [seenRows, refreshSeen] = usePoll<{ rows: [number, Seen][] }>(
-    () => (scan && compare !== "all" ? run(["query", compareSql(scanScope(scan))]) : Promise.resolve({ rows: [] })),
+    () => (scan && compare !== "all" ? run(["query", "--limit", "10000", compareSql(scanScope(scan))]) : Promise.resolve({ rows: [] })),
     5000,
     active && compare !== "all",
   );

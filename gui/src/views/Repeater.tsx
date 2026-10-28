@@ -149,9 +149,11 @@ function RepeaterTabView({ tab }: { tab: RepeaterTab }) {
     setRaw(sent.list[at].raw);
   };
 
+  // Views stay mounted when hidden: only while Replay is showing.
+  const showing = app.tab === "repeater";
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      if (showing && (e.metaKey || e.ctrlKey) && e.key === "Enter") {
         e.preventDefault();
         if (!busy) send();
       }
