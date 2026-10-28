@@ -28,23 +28,57 @@ export const getProject = () => project;
 export interface CliInput {
   stdin?: string | Uint8Array;
   env?: Record<string, string>;
+  /** Run against this project instead of the open one. */
+  project?: string;
 }
 
 export async function cli<T = any>(args: string[], input: string | Uint8Array | CliInput = {}): Promise<Envelope<T>> {
-  const { stdin, env } = typeof input === "string" || input instanceof Uint8Array ? { stdin: input, env: undefined } : input;
+  const { stdin, env, project: target } =
+    typeof input === "string" || input instanceof Uint8Array ? { stdin: input, env: undefined, project: undefined } : input;
+  const proj = target ?? project;
   // Bytes go as a number array (Vec<u8> in Tauri, a Buffer in the dev bridge), so nothing is re-encoded.
   const bytes = stdin == null ? null : Array.from(typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin);
   if (inTauri) {
     const { invoke } = await import("@tauri-apps/api/core");
-    return invoke<Envelope<T>>("cli", { project, args, stdin: bytes, env: env ?? null });
+    return invoke<Envelope<T>>("cli", { project: proj, args, stdin: bytes, env: env ?? null });
   }
   const res = await fetch("/api/cli", {
     method: "POST",
     headers: { "content-type": "application/json", "x-brainproxy": "1" },
-    body: JSON.stringify({ project, args, stdin: bytes, env }),
+    body: JSON.stringify({ project: proj, args, stdin: bytes, env }),
   });
   return res.json();
 }
+
+/** A temporary engagement left by an app that exited without discarding it. */
+export interface TempLeftover {
+  path: string;
+  /** Unix seconds. */
+  created: number;
+  ram_backed: boolean;
+}
+
+async function shell<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<T>(command, args);
+}
+
+/**
+ * Temporary engagements (desktop app only). The shell creates and deletes their folders: no CLI
+ * command can, so a project an agent or script starts always stays until a person removes it.
+ * Errors reject with the shell's message.
+ */
+export const tempProjects = {
+  /** Whether new ones go to RAM. */
+  location: () => shell<{ ram_backed: boolean }>("temp_location"),
+  /** A new temp project's path; open it like any project. */
+  create: () => shell<{ path: string; ram_backed: boolean }>("temp_create"),
+  leftovers: () => shell<TempLeftover[]>("temp_leftovers"),
+  /** Whether a file at `path` would be deleted with a temp project. */
+  isInside: (path: string) => shell<boolean>("temp_is_inside", { path }),
+  /** Stops everything running for it (`project stop`), then deletes its folder. */
+  discard: (project: string) => shell<void>("temp_discard", { project }),
+};
 
 /** Runs a command and returns its data, throwing CliError when ok is false. */
 export async function run<T = any>(args: string[], input?: string | Uint8Array | CliInput): Promise<T> {

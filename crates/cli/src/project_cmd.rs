@@ -1,0 +1,95 @@
+//! `project`: the project file itself. Nothing here deletes a project: a project started
+//! from the CLI or by an agent stays as proof of the work until a person removes it.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use brainproxy_core::store::Store;
+use brainproxy_core::Error;
+use clap::Subcommand;
+use serde_json::{json, Value};
+
+use crate::output::Out;
+use crate::process;
+
+#[derive(Subcommand)]
+pub enum ProjectCmd {
+    /// Create the project file if missing and report its location.
+    Init,
+    /// Show project statistics.
+    Info,
+    /// Copy the project to a new file (a consistent snapshot, safe while it is in use).
+    #[command(after_help = "Missing folders are created; an existing file is never overwritten. The copy \
+        doesn't take over the original's running proxy, OOB listener or background work.")]
+    Save {
+        /// File to write, e.g. /home/you/engagements/acme.bpdb.
+        #[arg(long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Stop everything running for this project: its proxy, OOB listener, jobs and fuzz runs.
+    #[command(after_help = "Jobs and fuzz runs are asked to stop and given 10 s to finish; it fails, naming \
+        them, if any are still running. Nothing is deleted.")]
+    Stop,
+}
+
+pub fn project(path: &Path, cmd: ProjectCmd, out: &Out) -> Result<(), Error> {
+    match cmd {
+        ProjectCmd::Init | ProjectCmd::Info => {
+            let store = Store::open(path)?;
+            let shown = std::fs::canonicalize(path).unwrap_or(path.to_path_buf());
+            let count = store.count()?;
+            let data = json!({"path": shown, "history_count": count});
+            match cmd {
+                ProjectCmd::Init => out.ok(data, || format!("project ready: {}", shown.display())),
+                _ => out.ok(data, || format!("{}\nhistory entries: {count}", shown.display())),
+            }
+        }
+        ProjectCmd::Save { output } => {
+            let store = Store::open(path)?;
+            store.save_as(&output)?;
+            let saved = std::fs::canonicalize(&output).unwrap_or(output);
+            out.ok(json!({"path": saved, "from": path}), || format!("saved to {}", saved.display()));
+        }
+        ProjectCmd::Stop => {
+            let stopped = stop_all(path)?;
+            out.ok(stopped.clone(), || format!("stopped: {stopped}"));
+        }
+    }
+    Ok(())
+}
+
+/// Stops the project's proxy, OOB listener, jobs and fuzz runs. Returns what was stopped;
+/// fails if some work is still running after being asked to stop.
+fn stop_all(path: &Path) -> Result<Value, Error> {
+    let store = Store::open(path)?;
+    let proxy = crate::proxy_cmd::stop(&store)?.map(|(pid, _)| pid);
+    let oob = crate::oob_cmd::stop(&store)?.map(|(pid, _)| pid);
+    let work = store.unfinished_work()?;
+
+    // Jobs and fuzz runs poll for the stop request and exit. It is repeated while waiting: one
+    // still queued has no process yet and marks itself running once its process starts. They
+    // are never signalled: no start time is recorded for them, so a pid reused by another
+    // process can't be told apart.
+    let busy = || -> Result<Vec<(String, i64, Option<u32>)>, Error> {
+        store.stop_all_work()?;
+        let work = store.unfinished_work()?;
+        Ok(work.into_iter().filter(|(_, _, pid)| pid.is_none_or(process::alive)).collect())
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut left = busy()?;
+    while !left.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        left = busy()?;
+    }
+    // Work that never got a process has nothing to stop.
+    let stuck: Vec<String> =
+        left.iter().filter_map(|(what, id, pid)| pid.map(|pid| format!("{what} {id} (pid {pid})"))).collect();
+    if !stuck.is_empty() {
+        return Err(Error::Conflict(format!(
+            "still running after being asked to stop: {}; wait for them to finish (or stop those processes)",
+            stuck.join(", ")
+        )));
+    }
+    let work: Vec<Value> = work.iter().map(|(what, id, _)| json!({"kind": what, "id": id})).collect();
+    Ok(json!({"proxy": proxy, "oob": oob, "work": work}))
+}

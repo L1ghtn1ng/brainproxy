@@ -337,6 +337,9 @@ brainproxy findings list
 brainproxy findings show 12
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
 brainproxy report html -o acme-report.html
+
+brainproxy project save --output ~/work/acme-copy.bpdb   # consistent copy, safe while in use; never overwrites
+brainproxy project stop     # stop the project's proxy, OOB listener, jobs and fuzz runs (deletes nothing)
 ```
 
 Crawl and active-scan scope and safety flags:

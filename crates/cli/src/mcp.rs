@@ -27,9 +27,11 @@ use serde_json::{json, Map, Value};
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// Commands not offered as tools: the server itself, foreground servers that never
-/// return (their `start` variants run them in the background), and the feed signing
-/// key's commands (publishing checks is for a maintainer, not an agent).
-const EXCLUDED: &[&str] = &["mcp serve", "proxy run", "oob run", "checks feed keygen", "checks feed sign"];
+/// return (their `start` variants run them in the background), the feed signing
+/// key's commands (publishing checks is for a maintainer, not an agent), and `project save`
+/// (copying the project elsewhere is for the person running the server).
+const EXCLUDED: &[&str] =
+    &["mcp serve", "proxy run", "oob run", "checks feed keygen", "checks feed sign", "project save"];
 
 /// Tool calls that may run at once; more are refused until one finishes.
 const MAX_CALLS: usize = 16;
@@ -80,6 +82,8 @@ const HINTS: &[(&str, Hints)] = &[
     ("auth record finish", REPLACE),
     ("project init", SET),
     ("project info", READ),
+    // Stops the proxy, OOB listener and background work; deletes nothing.
+    ("project stop", REPLACE),
     ("send", NET),
     ("proxy start", ADD),
     ("proxy stop", REPLACE),

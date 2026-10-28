@@ -62,7 +62,8 @@ proxy do.
 One tool per leaf command of the clap definition, so the list can't drift from the CLI or
 from `capabilities`: `send`, `history_list`, `scan_active`, `job_wait`, ... (the command path
 joined with `_`). Left out: `mcp serve` itself and the foreground servers `proxy run` and
-`oob run`, which never return (use `proxy_start` / `oob_start`).
+`oob run`, which never return (use `proxy_start` / `oob_start`); the feed signing commands;
+and `project save`, since copying the project elsewhere is for the person running the server.
 
 - **description**: the command's about text plus its notes (`after_help`).
 - **inputSchema**: one property per flag or positional, named like `capabilities` names it

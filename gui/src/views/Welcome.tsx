@@ -1,8 +1,11 @@
-// Welcome screen: start a new engagement (project file + write-once scope) or open an
-// existing project.
+// Welcome screen: start a new engagement (project file + write-once scope), a temporary one
+// (desktop app only: no file to pick; deleted when discarded), or open an existing project.
+// Temporary ones a closed or crashed app left behind are offered here, never deleted unasked.
 
-import { useMemo, useState } from "react";
-import { inTauri, run, setProject } from "../api";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { inTauri, run, setProject, tempProjects, type TempLeftover } from "../api";
+import type { TempInfo } from "../store";
+import { confirm } from "../ui/Confirm";
 import { Logo } from "../ui/Logo";
 import { MadeBy } from "../ui/Brand";
 
@@ -43,6 +46,21 @@ const isAbsolute = (path: string) =>
   (navigator.userAgent.includes("Windows") ? /^([a-z]:[\\/]|\\\\)/i : /^\//).test(path);
 const FULL_PATH = "Use a full path, e.g. /home/you/engagements";
 
+/** Where to save a project named after the engagement; null if the user cancels. */
+export async function chooseProjectFile(name: string): Promise<string | null> {
+  let p: string | null;
+  if (inTauri) {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    p = await dialog.save({ filters: FILTERS, defaultPath: fileName(name) });
+  } else {
+    const dir = dirOf(recent()[0] ?? "");
+    p = window.prompt("Save the engagement as (full path):", dir ? `${dir}/${fileName(name)}` : "")?.trim() || null;
+    if (p && !isAbsolute(p)) throw new Error(`${FULL_PATH}/${fileName(name)}.`);
+  }
+  if (typeof p !== "string") return null;
+  return p.endsWith(".bpdb") ? p : `${p}.bpdb`;
+}
+
 const TARGET = /^(\*\.)?([a-z0-9-]+\.)*[a-z0-9-]+(\/\d{1,3})?(:\d{1,5})?$|^\[[0-9a-f:]+\](:\d{1,5})?$/i;
 
 /** One scope entry from a line: pasted URLs become host[:port]; returns null for blanks. */
@@ -61,10 +79,17 @@ export function parseTarget(line: string): { value: string; ok: boolean } | null
   return { value: t, ok: TARGET.test(t) };
 }
 
-export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
-  const [mode, setMode] = useState<"home" | "new">("home");
+type Open = (path: string, temp?: TempInfo | null) => Promise<void>;
+
+export function Welcome({ open, notice }: { open: Open; notice?: string }) {
+  const [mode, setMode] = useState<"home" | "new" | "temp">("home");
   const [error, setError] = useState("");
   const [path, setPath] = useState("");
+  // Whether new temporary engagements go to RAM.
+  const [ramBacked, setRamBacked] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (inTauri) tempProjects.location().then((d) => setRamBacked(d.ram_backed), () => {});
+  }, []);
   const tryOpen = (p: string) =>
     isAbsolute(p) ? open(p).catch((e) => setError(String(e.message ?? e))) : setError(`${FULL_PATH}/project.bpdb.`);
 
@@ -79,7 +104,7 @@ export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
       <div className="picker-madeby">
         <MadeBy />
       </div>
-      <div className={`picker-card ${mode === "new" ? "wide" : ""}`}>
+      <div className={`picker-card ${mode !== "home" ? "wide" : ""}`}>
         <div className="picker-brand">
           <Logo size={40} />
           <div>
@@ -87,15 +112,25 @@ export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
             <p className="muted">Web security testing workbench</p>
           </div>
         </div>
-        {mode === "new" ? (
-          <NewEngagement open={open} cancel={() => setMode("home")} />
+        {mode !== "home" ? (
+          <NewEngagement open={open} cancel={() => setMode("home")} temp={mode === "temp" ? { ramBacked } : null} />
         ) : (
           <>
+            {inTauri && <Leftovers open={open} />}
             <div className="welcome-actions">
               <button className="welcome-action primary" onClick={() => setMode("new")}>
                 <span className="welcome-action-title">New engagement</span>
                 <span className="welcome-action-sub">Create a project and set the targets you're allowed to test</span>
               </button>
+              {inTauri && (
+                <button className="welcome-action" onClick={() => setMode("temp")}>
+                  <span className="welcome-action-title">Temporary engagement</span>
+                  <span className="welcome-action-sub">
+                    No file: {ramBacked == null ? "" : ramBacked ? "kept in memory and " : "kept in the temp folder and "}deleted
+                    when you close it
+                  </span>
+                </button>
+              )}
               {inTauri && (
                 <button className="welcome-action" onClick={browse}>
                   <span className="welcome-action-title">Open project…</span>
@@ -116,6 +151,7 @@ export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
               </form>
             )}
             {error && <div className="error">{error}</div>}
+            {notice && <div className="error">{notice}</div>}
             {recent().length > 0 && (
               <div className="recent">
                 <div className="label">Recent</div>
@@ -138,7 +174,86 @@ export function Welcome({ open }: { open: (path: string) => Promise<void> }) {
   );
 }
 
-function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>; cancel: () => void }) {
+/** Saves a temporary engagement's project to a file the user picks; the saved path, or null if cancelled. */
+export async function saveTempAs(project: string, name: string): Promise<string | null> {
+  const dest = await chooseProjectFile(name);
+  if (!dest) return null;
+  if (await tempProjects.isInside(dest)) throw new Error(`${dest} is inside a temporary engagement's folder, which is deleted with it`);
+  await run(["project", "save", `--output=${dest}`], { project });
+  return dest;
+}
+
+/** Temporary engagements an app left without discarding (closed while one couldn't be deleted, or crashed). */
+function Leftovers({ open }: { open: Open }) {
+  const [items, setItems] = useState<(TempLeftover & { name: string })[]>([]);
+  const [error, setError] = useState("");
+  const load = useCallback(async () => {
+    const found = await tempProjects.leftovers().catch(() => []);
+    const named = await Promise.all(
+      found.map(async (l) => {
+        const eng = await run<{ engagement: { name: string | null } | null }>(["engagement", "show"], { project: l.path }).catch(() => null);
+        return { ...l, name: eng?.engagement?.name ?? "" };
+      }),
+    );
+    setItems(named);
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+  if (items.length === 0) return null;
+
+  const act = (f: () => Promise<void>) => () => {
+    setError("");
+    f().catch((e) => setError(String(e?.message ?? e)));
+  };
+  // Saved, the copy is opened and the temporary one deleted, as Save as… does in an open one.
+  const saveAs = (l: TempLeftover & { name: string }) =>
+    act(async () => {
+      const dest = await saveTempAs(l.path, l.name);
+      if (!dest) return;
+      await tempProjects.discard(l.path).catch(() => {});
+      await open(dest);
+    });
+  const remove = (l: TempLeftover) =>
+    act(async () => {
+      const yes = await confirm(
+        "Delete this temporary engagement?",
+        "Its traffic, findings and settings are deleted for good. Save as… keeps them.",
+        "Delete",
+        "Keep",
+      );
+      if (!yes) return;
+      await tempProjects.discard(l.path);
+      await load();
+    });
+
+  return (
+    <div className="leftovers">
+      {items.map((l) => (
+        <div key={l.path} className="leftover">
+          <div className="grow">
+            <div>Unsaved temporary engagement{l.name ? `: ${l.name}` : ""}</div>
+            <div className="muted small">
+              From {new Date(l.created * 1000).toLocaleString()}, {l.ram_backed ? "in memory" : "in the temp folder"}
+            </div>
+          </div>
+          <button className="btn" onClick={saveAs(l)}>
+            Save as…
+          </button>
+          <button className="btn danger" onClick={remove(l)}>
+            Delete
+          </button>
+        </div>
+      ))}
+      {error && <div className="error">{error}</div>}
+    </div>
+  );
+}
+
+/** Where a temporary project will live; `ramBacked` is null until the shell has said. */
+type TempPlace = { ramBacked: boolean | null };
+
+function NewEngagement({ open, cancel, temp }: { open: Open; cancel: () => void; temp: TempPlace | null }) {
   const [name, setName] = useState("");
   const [dir, setDir] = useState(() => dirOf(recent()[0] ?? ""));
   const [file, setFile] = useState<string | null>(null); // set when the user picked a file explicitly
@@ -155,7 +270,7 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
   const valid = included.filter((t) => t.ok).length;
   const projectPath = file ?? (dir ? `${dir.replace(/\/$/, "")}/${fileName(name)}` : "");
   const relative = !!projectPath && !isAbsolute(projectPath);
-  const ready = included.length > 0 && bad.length === 0 && !!projectPath && !relative && authorized && !busy;
+  const ready = included.length > 0 && bad.length === 0 && (temp ? true : !!projectPath && !relative) && authorized && !busy;
 
   const chooseLocation = async () => {
     const dialog = await import("@tauri-apps/plugin-dialog");
@@ -163,18 +278,42 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
     if (typeof p === "string") setFile(p.endsWith(".bpdb") ? p : `${p}.bpdb`);
   };
 
+  const engagementStart = () =>
+    run([
+      "engagement",
+      "start",
+      ...(name.trim() ? [`--name=${name.trim()}`] : []),
+      ...included.map((t) => `--target=${t.value}`),
+      ...excluded.map((t) => `--exclude=${t.value}`),
+    ]);
+
+  const createTemp = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      // The shell makes the folder and locks it for this app; a crash leaves it to be offered on the next launch.
+      const t = await tempProjects.create();
+      setProject(t.path);
+      try {
+        await engagementStart();
+      } catch (e) {
+        await tempProjects.discard(t.path).catch(() => {});
+        throw e;
+      }
+      await open(t.path, { ramBacked: t.ram_backed });
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+      setBusy(false);
+    }
+  };
+
   const create = async () => {
+    if (temp) return createTemp();
     setBusy(true);
     setError("");
     setProject(projectPath);
     try {
-      await run([
-        "engagement",
-        "start",
-        ...(name.trim() ? [`--name=${name.trim()}`] : []),
-        ...included.map((t) => `--target=${t.value}`),
-        ...excluded.map((t) => `--exclude=${t.value}`),
-      ]);
+      await engagementStart();
       remember(projectPath);
       await open(projectPath);
     } catch (e: any) {
@@ -197,6 +336,23 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
         </div>
       </div>
 
+      {temp ? (
+        <div className="engage-step">
+          <span className="step-n">2</span>
+          <div className="grow">
+            <label className="label">Storage</label>
+            <div className="hint">
+              No file to choose.{" "}
+              {temp.ramBacked == null
+                ? ""
+                : temp.ramBacked
+                  ? "The project is kept in memory (a RAM-backed folder, not a disk filesystem). "
+                  : "The project goes in the system temp folder, on disk, as this OS has no memory-backed folder. "}
+              It is deleted when you switch project or close brainproxy, after asking. Use Save as… to keep it.
+            </div>
+          </div>
+        </div>
+      ) : (
       <div className="engage-step">
         <span className="step-n">2</span>
         <div className="grow">
@@ -217,6 +373,7 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
           {relative && <div className="error">{FULL_PATH} (missing folders are created).</div>}
         </div>
       </div>
+      )}
 
       <div className="engage-step">
         <span className="step-n">3</span>
@@ -291,7 +448,7 @@ function NewEngagement({ open, cancel }: { open: (path: string) => Promise<void>
         </button>
         <span className="grow" />
         <button className="btn primary" disabled={!ready} onClick={create}>
-          {busy ? "Creating…" : `Create engagement${valid ? ` · ${valid} target${valid === 1 ? "" : "s"}` : ""}`}
+          {busy ? "Creating…" : `Create ${temp ? "temporary " : ""}engagement${valid ? ` · ${valid} target${valid === 1 ? "" : "s"}` : ""}`}
         </button>
       </div>
     </div>
