@@ -77,7 +77,12 @@ pub fn scan_message(msg: &Message, settings: &PassiveSettings) -> Vec<Finding> {
     let mut out = Vec::new();
     for rule in all_rules() {
         if !settings.disabled.contains(&rule.id()) {
-            rule.scan(msg, &mut out);
+            // A rule that panics on one response loses its findings there, but doesn't stop
+            // the scan: the watermark would never pass that row and every scan would fail.
+            let mut found = Vec::new();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rule.scan(msg, &mut found))).is_ok() {
+                out.append(&mut found);
+            }
         }
     }
     let checks: Vec<_> = checks().iter().filter(|c| !settings.disabled_checks.iter().any(|d| d == c.id())).collect();
