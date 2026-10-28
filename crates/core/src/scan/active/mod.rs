@@ -343,12 +343,7 @@ impl Cx {
     }
 
     async fn send_to_once(&self, target: &Target, request: Vec<u8>) -> Result<Response> {
-        if self.stopped() {
-            return Err(Error::Protocol("scan stopped".into()));
-        }
-        if let Some(l) = &self.shared.limiter {
-            l.wait().await;
-        }
+        self.rate_turn().await?;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         let Some(auth) = &self.shared.auth else {
             let ex = self.shared.client.send(&RawRequest::from_bytes(request), target).await?;
@@ -377,15 +372,33 @@ impl Cx {
         cell.get_or_init(|| async { send.await.map_err(|e| e.to_string()) }).await.clone().map_err(Error::Protocol)
     }
 
+    /// Waits for this request's turn under `--rate`. With many units queued at a slow
+    /// rate a turn can be far off, so the wait ends early, with an error, when the scan
+    /// stops or reaches `--max-minutes`.
+    async fn rate_turn(&self) -> Result<()> {
+        let stopped = || Err(Error::Protocol("scan stopped".into()));
+        if self.stopped() {
+            return stopped();
+        }
+        if let Some(l) = &self.shared.limiter {
+            let at = l.slot().await;
+            while Instant::now() < at {
+                if self.stopped() {
+                    return stopped();
+                }
+                tokio::time::sleep_until(at.min(Instant::now() + Duration::from_millis(250)).into()).await;
+            }
+            if self.stopped() {
+                return stopped();
+            }
+        }
+        Ok(())
+    }
+
     /// A raw TCP connection to `host:port` for rules that speak another protocol
     /// (e.g. TLS records). Goes through the client, so the engagement scope applies.
     pub async fn connect_raw(&self, host: &str, port: u16) -> Result<crate::http::client::Stream> {
-        if self.stopped() {
-            return Err(Error::Protocol("scan stopped".into()));
-        }
-        if let Some(l) = &self.shared.limiter {
-            l.wait().await;
-        }
+        self.rate_turn().await?;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         self.shared.client.connect(&Target { scheme: "http".into(), host: host.into(), port }).await
     }
@@ -557,13 +570,15 @@ impl Limiter {
     }
 
     pub(crate) async fn wait(&self) {
-        let at = {
-            let mut next = self.next.lock().await;
-            let at = (*next).max(Instant::now());
-            *next = at + self.interval;
-            at
-        };
-        tokio::time::sleep_until(at.into()).await;
+        tokio::time::sleep_until(self.slot().await.into()).await;
+    }
+
+    /// Takes the next slot: when the caller may send.
+    pub(crate) async fn slot(&self) -> Instant {
+        let mut next = self.next.lock().await;
+        let at = (*next).max(Instant::now());
+        *next = at + self.interval;
+        at
     }
 }
 
