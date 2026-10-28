@@ -6,9 +6,10 @@ use regex::bytes::Regex as BytesRegex;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::capture::decode_body;
+use crate::capture::decode_body_fully;
 use crate::error::{Error, Result};
 use crate::http::request::split_head_body;
+use crate::http::response::dechunk;
 use crate::http::{parse_response_head, RawRequest};
 
 pub const SCOPE_KEY: &str = "scope";
@@ -107,6 +108,12 @@ pub struct CompiledRule {
     replace: String,
 }
 
+/// Checks a rule's pattern whether or not it is enabled: a bad one saved disabled would
+/// stop the proxy loading any settings once enabled.
+pub fn validate_rule(rule: &Rule) -> Result<()> {
+    compile_rules(std::slice::from_ref(&Rule { enabled: true, ..rule.clone() })).map(|_| ())
+}
+
 pub fn compile_rules(rules: &[Rule]) -> Result<Vec<CompiledRule>> {
     rules
         .iter()
@@ -134,9 +141,16 @@ pub fn apply_request_rules(rules: &[CompiledRule], req: Vec<u8>) -> Vec<u8> {
     if active.is_empty() {
         return req;
     }
-    let (head, body) = split_head_body(&req);
+    let (head, raw_body) = split_head_body(&req);
     let (mut first, mut headers) = split_lines(head);
-    let mut body = body.to_vec();
+    // Body rules see the data, not the chunk framing (which they would break).
+    let chunked = headers.iter().any(|h| {
+        h.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+        })
+    });
+    let has_body_rule = active.iter().any(|r| r.location == RuleLocation::RequestBody && r.bytes.is_some());
+    let mut body = if chunked && has_body_rule { dechunk(raw_body) } else { raw_body.to_vec() };
     let mut body_changed = false;
     for rule in active {
         match rule.location {
@@ -156,12 +170,23 @@ pub fn apply_request_rules(rules: &[CompiledRule], req: Vec<u8>) -> Vec<u8> {
             _ => {}
         }
     }
-    let out = join(&first, &headers, &body);
-    if body_changed {
-        RawRequest::from_bytes(out).update_content_length().into_bytes()
-    } else {
-        out
+    if !body_changed {
+        return join(&first, &headers, if chunked && has_body_rule { raw_body } else { &body });
     }
+    if chunked {
+        reframe(&mut headers, body.len());
+        return join(&first, &headers, &body);
+    }
+    RawRequest::from_bytes(join(&first, &headers, &body)).update_content_length().into_bytes()
+}
+
+/// Drops the framing and coding headers of a decoded body and gives its length.
+fn reframe(headers: &mut Vec<String>, len: usize) {
+    headers.retain(|h| {
+        let name = h.split(':').next().unwrap_or("").trim();
+        !["content-length", "transfer-encoding", "content-encoding"].iter().any(|n| name.eq_ignore_ascii_case(n))
+    });
+    headers.push(format!("Content-Length: {len}"));
 }
 
 /// Applies response rules to the final response (after any 1xx interim
@@ -177,28 +202,29 @@ pub fn apply_response_rules(rules: &[CompiledRule], resp: Vec<u8>) -> Vec<u8> {
     let Ok(parsed) = parse_response_head(rest) else { return resp };
     let (head, raw_body) = split_head_body(rest);
     let (first, mut headers) = split_lines(head);
-    let mut body: Option<Vec<u8>> = None;
+    // Decoded once, when a body rule needs it; None if it can't be decoded (then body rules
+    // leave it alone: without its Content-Encoding the client couldn't read it).
+    let mut decoded: Option<Option<Vec<u8>>> = None;
+    let mut body_changed = false;
     for rule in active {
         match rule.location {
             RuleLocation::ResponseHeader => apply_header_rule(rule, &mut headers),
             RuleLocation::ResponseBody => {
                 if let Some(re) = &rule.bytes {
-                    let current = body.take().unwrap_or_else(|| decode_body(&parsed.headers, raw_body));
-                    body = Some(re.replace_all(&current, rule.replace.as_bytes()).into_owned());
+                    let current = decoded.get_or_insert_with(|| decode_body_fully(&parsed.headers, raw_body));
+                    if let Some(current) = current {
+                        let new = re.replace_all(current, rule.replace.as_bytes()).into_owned();
+                        body_changed |= new != *current;
+                        *current = new;
+                    }
                 }
             }
             _ => {}
         }
     }
-    let body = match body {
+    let body = match decoded.flatten().filter(|_| body_changed) {
         Some(b) => {
-            headers.retain(|h| {
-                let name = h.split(':').next().unwrap_or("").trim();
-                !["content-length", "transfer-encoding", "content-encoding"]
-                    .iter()
-                    .any(|n| name.eq_ignore_ascii_case(n))
-            });
-            headers.push(format!("Content-Length: {}", b.len()));
+            reframe(&mut headers, b.len());
             b
         }
         None => raw_body.to_vec(),
@@ -390,6 +416,37 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n{\"admin\": false}\r\n0\r\n\r\n".to_vec(),
         );
         assert_eq!(String::from_utf8(out).unwrap(), "HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"admin\": true}");
+    }
+
+    #[test]
+    fn request_body_rule_on_a_chunked_body_reframes_it() {
+        let rules = compile_rules(&[rule(1, RuleLocation::RequestBody, "role=user", "role=admin")]).unwrap();
+        let req = b"POST /p HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nrole=user\r\n0\r\n\r\n";
+        let out = apply_request_rules(&rules, req.to_vec());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nrole=admin"
+        );
+        // No match: sent as it came, chunks and all.
+        let rules = compile_rules(&[rule(1, RuleLocation::RequestBody, "nothing", "x")]).unwrap();
+        assert_eq!(apply_request_rules(&rules, req.to_vec()), req.to_vec());
+    }
+
+    #[test]
+    fn response_body_rules_leave_bodies_they_cannot_decode_or_do_not_change() {
+        let rules = compile_rules(&[rule(1, RuleLocation::ResponseBody, "a", "b")]).unwrap();
+        let zstd = b"HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\nContent-Length: 4\r\n\r\n(\xb5/\xfd".to_vec();
+        assert_eq!(apply_response_rules(&rules, zstd.clone()), zstd);
+        let head = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 120\r\n\r\n".to_vec();
+        assert_eq!(apply_response_rules(&rules, head.clone()), head);
+    }
+
+    #[test]
+    fn disabled_rules_are_validated_too() {
+        let mut r = rule(1, RuleLocation::RequestHeader, "(", "x");
+        r.enabled = false;
+        assert!(compile_rules(std::slice::from_ref(&r)).is_ok());
+        assert!(validate_rule(&r).is_err());
     }
 
     #[test]

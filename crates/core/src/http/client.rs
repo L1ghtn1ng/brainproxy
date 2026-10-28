@@ -350,15 +350,64 @@ pub fn close_after(request: &[u8], response: &[u8], method: &str) -> bool {
         .head()
         .map(|h| h.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")))
         .unwrap_or(true);
+    // More than one message went out (pipelined or smuggled, or a body longer than its
+    // Content-Length): the server's other answers may still arrive, and the next request
+    // on this connection would read them.
+    if req_close || !one_message(request) {
+        return true;
+    }
     let Ok(h) = parse_response_head(final_response(response)) else { return true };
-    req_close
-        || h.status == 101
+    h.status == 101
         || h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"))
         || (h.version == "HTTP/1.0" && !h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive")))
         || (h.header("content-length").is_none()
             && !h.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
             && !method.eq_ignore_ascii_case("HEAD")
             && !matches!(h.status, 100..=199 | 204 | 304))
+}
+
+/// Whether `request` is exactly one HTTP/1 message: its body is all its framing says.
+fn one_message(request: &[u8]) -> bool {
+    let (head, body) = crate::http::request::split_head_body(request);
+    if !head.ends_with(b"\r\n\r\n") {
+        return false;
+    }
+    let Ok(h) = RawRequest::from_bytes(head.to_vec()).head() else { return false };
+    let header = |n: &str| h.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.trim());
+    match (header("transfer-encoding"), header("content-length")) {
+        (Some(_), Some(_)) => false,
+        (Some(te), None) => te.to_ascii_lowercase().ends_with("chunked") && chunked_len(body) == Some(body.len()),
+        (None, Some(cl)) => cl.parse::<usize>().is_ok_and(|n| n == body.len()),
+        (None, None) => body.is_empty(),
+    }
+}
+
+/// The length of a complete chunked body (through the last chunk and trailers).
+fn chunked_len(body: &[u8]) -> Option<usize> {
+    let line = |from: usize| body.get(from..)?.windows(2).position(|w| w == b"\r\n").map(|i| from + i);
+    let mut pos = 0;
+    loop {
+        let end = line(pos)?;
+        let size = std::str::from_utf8(&body[pos..end]).ok()?.split(';').next()?.trim();
+        let size = usize::from_str_radix(size, 16).ok()?;
+        pos = end + 2;
+        if size == 0 {
+            // Trailer lines, then the empty line.
+            loop {
+                let end = line(pos)?;
+                let empty = end == pos;
+                pos = end + 2;
+                if empty {
+                    return Some(pos);
+                }
+            }
+        }
+        pos = pos.checked_add(size)?;
+        if body.get(pos..pos + 2)? != b"\r\n" {
+            return None;
+        }
+        pos += 2;
+    }
 }
 
 /// The final response after any interim 1xx responses.
@@ -425,6 +474,18 @@ mod tests {
 
     use super::*;
     use crate::guard::ScopeSpec;
+
+    #[test]
+    fn connections_that_carried_more_than_one_request_are_not_reused() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let ok = |req: &[u8]| !close_after(req, resp, "GET");
+        assert!(ok(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"));
+        assert!(ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nab"));
+        assert!(ok(b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n"));
+        assert!(!ok(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n"));
+        assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nabGET / HTTP/1.1\r\n\r\n"));
+        assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
+    }
 
     /// A keep-alive server; with `drop_idle` it closes each connection after one
     /// response without saying so (as servers do with idle connections).
