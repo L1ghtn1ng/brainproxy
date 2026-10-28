@@ -14,7 +14,10 @@ export interface ScanJob {
  * What a scan covered: its time window; sites as origins (null = everything recorded, [] =
  * only requests picked by --where/--history-id, which can't be told apart here); the
  * ported rules it ran (`rules` null = all of them, less `excludeRules`; none with
- * --no-rules); and its declarative checks (none without --checks; `checkIds` null = any).
+ * --no-rules); and the declarative checks known to have run: those named with
+ * --check-ids. Without them, which checks ran depends on their severity and tags
+ * (--check-severity, the default --check-exclude-tags), which findings don't record, so
+ * no check finding is taken as covered.
  */
 export interface ScanScope {
   start: string;
@@ -23,8 +26,7 @@ export interface ScanScope {
   rules: number[] | null;
   excludeRules: number[];
   portedRules: boolean;
-  checks: boolean;
-  checkIds: string[] | null;
+  checkIds: string[];
   crawled: boolean;
 }
 
@@ -58,8 +60,7 @@ export function scanScope(job: ScanJob, now = new Date().toISOString()): ScanSco
     rules: numbers(values("--rules")),
     excludeRules: numbers(values("--exclude-rules")) ?? [],
     portedRules: !has("--no-rules"),
-    checks: has("--checks"),
-    checkIds: values("--check-ids"),
+    checkIds: has("--checks") && !["--check-severity", "--check-severity-max", "--check-tags"].some(has) ? (values("--check-ids") ?? []) : [],
     crawled: job.args.includes("--crawl"),
   };
 }
@@ -79,7 +80,7 @@ export function compareSql(s: ScanScope): string {
   const isCheck = "substr(f.alert_ref, 1, 6) = 'check:'";
   const excluded = s.excludeRules.length ? ` AND f.rule_id NOT IN (${s.excludeRules.join(", ")})` : "";
   const rule = !s.portedRules ? "0" : `${s.rules ? `f.rule_id IN (${s.rules.join(", ")})` : "1"}${excluded}`;
-  const check = !s.checks ? "0" : s.checkIds ? `f.alert_ref IN (${s.checkIds.map((id) => q(`check:${id}`)).join(", ")})` : "1";
+  const check = s.checkIds.length ? `f.alert_ref IN (${s.checkIds.map((id) => q(`check:${id}`)).join(", ")})` : "0";
   const active = `(${isCheck} AND ${check}) OR (NOT ${isCheck} AND ${rule})`;
   const covered = `${site} AND ((f.source = 'active' AND (${active})) OR (f.source = 'passive' AND ${s.crawled && !s.rules ? 1 : 0}))`;
   return `SELECT f.id, CASE

@@ -345,6 +345,59 @@ fn serve_site() -> u16 {
     port
 }
 
+/// `/allowed/` answers with a 103 Early Hints, then a page linking `/allowed/next`;
+/// everything else is a plain page. Records the request lines.
+fn serve_early_hints() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let log = log.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 16384];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf[len..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
+                log.lock().unwrap().push(line.clone());
+                let body = if line.starts_with("GET /allowed/ ") { "<a href=\"/allowed/next\">next</a>" } else { "ok" };
+                let hints = if line.starts_with("GET /allowed/ ") {
+                    "HTTP/1.1 103 Early Hints\r\nLink: </x.css>; rel=preload\r\n\r\n"
+                } else {
+                    ""
+                };
+                let resp = format!(
+                    "{hints}HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn crawl_filters_its_first_requests_and_reads_past_early_hints() {
+    let (port, seen) = serve_early_hints();
+    let project = tmp_project("crawlfilters");
+    let site = format!("http://127.0.0.1:{port}/allowed/");
+    let (code, v) = run(&["crawl", &site, "--path-prefix", "/allowed", "--exclude", "robots|sitemap"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let seen = seen.lock().unwrap().clone();
+    assert!(!seen.iter().any(|l| l.contains("robots.txt") || l.contains("sitemap.xml")), "{seen:?}");
+    // The page after the 103 is the one read: its link is followed.
+    assert!(seen.iter().any(|l| l.starts_with("GET /allowed/next ")), "{seen:?}");
+    assert_eq!(v["data"]["by_status"]["200"], 2, "{v}");
+}
+
 /// Like the Supportdesk lab: `/` links to `/login` (sets a device cookie) and to
 /// `/docs`, a 401 page that names `/api/doc.html?publickey=…` only in its text.
 fn serve_cookie_site() -> u16 {

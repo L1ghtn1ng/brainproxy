@@ -759,7 +759,20 @@ impl AuthSession {
             }
             let Some(next) = head.header("location").and_then(|l| current.join(l).ok()) else { break };
             current = next;
-            let (r, t) = RawRequest::build("GET", current.as_str(), &[], b"")?;
+            // 307 and 308 repeat the request there (a login POST stays a POST, with its
+            // body); the others continue with a GET, as browsers do.
+            let (r, t) = match req.head() {
+                Ok(h) if matches!(head.status, 307 | 308) => {
+                    let framing = ["host", "content-length", "transfer-encoding"];
+                    let headers: Vec<(String, String)> = h
+                        .headers
+                        .into_iter()
+                        .filter(|(k, _)| !framing.iter().any(|f| k.eq_ignore_ascii_case(f)))
+                        .collect();
+                    RawRequest::build(&h.method, current.as_str(), &headers, req.body())?
+                }
+                _ => RawRequest::build("GET", current.as_str(), &[], b"")?,
+            };
             ex = self.client.send(&RawRequest::from_bytes(self.apply(r.as_bytes(), &[])), &t).await?;
             self.observe(&ex.response);
             find_token(&ex.response);

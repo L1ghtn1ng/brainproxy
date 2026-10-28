@@ -379,6 +379,46 @@ fn spawn_fixed(response: &'static str) -> u16 {
 }
 
 #[test]
+fn a_rule_that_changes_the_method_frames_the_response_by_it() {
+    let env = Env::new("method");
+    // Answers like a server answering HEAD: a Content-Length, no body, and keeps the
+    // connection open (read as a GET's response, it never ends).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut s in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let mut seen = Vec::new();
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+                std::thread::sleep(Duration::from_secs(60));
+            });
+        }
+    });
+    let proxy = env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["listen"].as_str().unwrap().to_string();
+    env.ok(&["rules", "add", "--location", "request-line", "--match", "^GET ", "--replace", "HEAD "]);
+    wait_for_settings();
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(&proxy).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    write!(s, "GET http://127.0.0.1:{port}/h HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") && s.read(&mut byte).unwrap_or(0) == 1 {
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head);
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+}
+
+#[test]
 fn passive_scan_and_findings() {
     let env = Env::new("passive");
     let port = spawn_fixed(

@@ -196,17 +196,23 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
             queue.push_back((req, depth));
         }
     };
+    // The seeds, robots.txt and sitemap.xml pass the same filters (--path-prefix, --exclude)
+    // as every link found later.
     for u in &seeds {
-        push(Req { method: "GET".into(), url: strip_fragment(u), body: None }, 0, &mut queue, &mut seen);
+        let mut start = vec![u.clone()];
         let mut origin = u.clone();
         origin.set_query(None);
+        origin.set_fragment(None);
         if cfg.robots {
             origin.set_path("/robots.txt");
-            push(Req { method: "GET".into(), url: origin.to_string(), body: None }, 0, &mut queue, &mut seen);
+            start.push(origin.clone());
         }
         if cfg.sitemap {
             origin.set_path("/sitemap.xml");
-            push(Req { method: "GET".into(), url: origin.to_string(), body: None }, 0, &mut queue, &mut seen);
+            start.push(origin.clone());
+        }
+        for u in start.iter().filter(|u| scope.allows(u)) {
+            push(Req { method: "GET".into(), url: strip_fragment(u), body: None }, 0, &mut queue, &mut seen);
         }
     }
 
@@ -253,10 +259,12 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
             }
             Ok((response, ms)) => {
                 let page = Url::parse(&req.url).ok();
-                if let (Some(page), Ok(head)) = (page.as_ref(), parse_response_head(&response)) {
+                // The final response, after any interim ones (100 Continue, 103 Early Hints).
+                let last = crate::http::client::final_response(&response);
+                if let (Some(page), Ok(head)) = (page.as_ref(), parse_response_head(last)) {
                     *summary.by_status.entry(head.status.to_string()).or_default() += 1;
                     endpoints.insert(endpoint(&req, page));
-                    let body = decode_body(&head.headers, split_head_body(&response).1);
+                    let body = decode_body(&head.headers, split_head_body(last).1);
                     let found = if depth < cfg.max_depth {
                         extract(page, &head.headers, &body, cfg.submit_forms)
                     } else {

@@ -158,6 +158,11 @@ fn handle(mut s: TcpStream, app: &Mutex<App>) {
             }
             redirect("/login", "Set-Cookie: sid=; Max-Age=0\r\n")
         }
+        // The login moved: a 307 keeps the method and body.
+        ("POST", "/api/login-moved") => {
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: /api/login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string()
+        }
         ("POST", "/api/login" | "/api/login-redirect") => {
             let v: Value = serde_json::from_str(&body).unwrap_or_default();
             if v["username"] == USER && v["password"] == PASS {
@@ -395,6 +400,35 @@ fn token_on_the_login_redirect_is_used() {
     );
     let r = ok(&p, &["send", "--url", &srv.url("/api/me"), "--auth", "api"]);
     assert_eq!(r["response"]["status"], 200, "{r}");
+}
+
+#[test]
+fn login_follows_a_307_with_its_method_and_body() {
+    let srv = Server::start(100);
+    let p = tmp_project("json307");
+    ok(
+        &p,
+        &[
+            "auth",
+            "add",
+            "api",
+            "--login-url",
+            &srv.url("/api/login-moved"),
+            "--login-body",
+            r#"{"username":"{{username}}","password":"{{password}}"}"#,
+            "--username",
+            USER,
+            "--password-env",
+            "BP_TEST_PASSWORD",
+            "--token-regex",
+            r#""token":"([^"]+)""#,
+            "--token-header",
+            "Authorization: Bearer {{token}}",
+        ],
+    );
+    let r = ok(&p, &["send", "--url", &srv.url("/api/me"), "--auth", "api"]);
+    assert_eq!(r["response"]["status"], 200, "{r}");
+    assert!(srv.log().iter().any(|l| l.starts_with("POST /api/login HTTP")), "{:?}", srv.log());
 }
 
 #[test]
