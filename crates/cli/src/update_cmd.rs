@@ -55,12 +55,10 @@ pub fn update(cmd: UpdateCmd, out: &Out) -> Result<(), Error> {
             });
         }
         UpdateCmd::Download { kind, dir } => {
-            let name = update::asset_name(kind.into())
+            let name = update::asset_name(kind.into(), &release.version)
                 .ok_or_else(|| Error::NotFound(format!("a release download for this platform; see {}", release.url)))?;
-            let asset =
-                release.assets.iter().find(|a| a.name == name).ok_or_else(|| {
-                    Error::NotFound(format!("{name} in release {}; see {}", release.tag, release.url))
-                })?;
+            let asset = update::find_asset(&release, kind.into())
+                .ok_or_else(|| Error::NotFound(format!("{name} in release {}; see {}", release.tag, release.url)))?;
             let dir = dir.or_else(update::downloads_dir).unwrap_or_else(|| PathBuf::from("."));
             let (path, sha256) = rt.block_on(update::download(&release, asset, &dir))?;
             let mut v = describe(&release, kind);
@@ -73,8 +71,7 @@ pub fn update(cmd: UpdateCmd, out: &Out) -> Result<(), Error> {
 }
 
 fn describe(release: &Release, kind: KindArg) -> serde_json::Value {
-    let name = update::asset_name(kind.into());
-    let asset = release.assets.iter().find(|a| Some(&a.name) == name.as_ref());
+    let asset = update::find_asset(release, kind.into());
     json!({
         "current": update::CURRENT,
         "latest": release.version,

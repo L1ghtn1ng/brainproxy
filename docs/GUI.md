@@ -144,10 +144,15 @@ to the app executable as `brainproxy`, where the shell looks first. Assets:
 
 | Asset | Platform |
 | --- | --- |
-| `brainproxy-gui-macos-arm64.dmg` | macOS, Apple silicon |
-| `brainproxy-gui-linux-x86_64.deb`, `.AppImage` | Linux x86_64 (needs WebKitGTK 4.1) |
+| `brainproxy-gui-<version>-macos-arm64.dmg` | macOS, Apple silicon |
+| `brainproxy-gui-<version>-linux-x86_64.deb`, `.AppImage` | Linux x86_64 (needs WebKitGTK 4.1) |
+| `brainproxy-gui-<version>-windows-x86_64-setup.exe`, `.msi` | Windows 10 and 11, x86_64 |
 
-Each has a `.sha256`. The macOS app is not signed or notarized: after copying it to
+`<version>` is Cargo.toml's (`brainproxy-gui-0.3.9-macos-arm64.dmg`). The updater looks for
+the tag's version in the names (and for the unversioned names of releases up to 0.3.8), so
+the `check` job fails a tag that doesn't match Cargo.toml. Each asset has a `.sha256`, and
+the `checksums` job adds one `SHA256SUMS` for the whole release. Downloads keep the asset
+name, so the opener scope `$DOWNLOAD/brainproxy-gui-*` covers them. The macOS app is not signed or notarized: after copying it to
 Applications, open it once, then choose System Settings → Privacy & Security → Open Anyway, or run
 `xattr -dr com.apple.quarantine /Applications/brainproxy.app`.
 

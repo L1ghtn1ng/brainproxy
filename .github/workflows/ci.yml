@@ -36,7 +36,18 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Release files are named after Cargo.toml's version, and the updater looks for
+      # them under the tag's, so a release tag has to match it.
+      - name: Tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --no-fail-fast
@@ -52,23 +63,29 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            asset: brainproxy-linux-x86_64
+            platform: linux-x86_64
           - target: aarch64-unknown-linux-musl
-            asset: brainproxy-linux-arm64
+            platform: linux-arm64
     env:
       TARGET: ${{ matrix.target }}
-      ASSET: ${{ matrix.asset }}
+      PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The pattern allows for the CRLF checkout Windows runners make.
+      - name: Asset name
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          [ -n "$version" ] || { echo "::error::no version in Cargo.toml"; exit 1; }
+          echo "ASSET=brainproxy-$version-$PLATFORM" >> "$GITHUB_ENV"
       - name: Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --target "$TARGET" --no-self-update
           rustup default stable
       # No cache on release builds, so a poisoned cache can't reach published binaries.
       - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
       - name: Build (x86_64, musl-gcc)
@@ -102,16 +119,16 @@ jobs:
           sha256sum "$ASSET" > "$ASSET.sha256"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ matrix.asset }}
+          name: ${{ env.ASSET }}
           path: |
-            ${{ matrix.asset }}
-            ${{ matrix.asset }}.sha256
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
       - if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
-            ${{ matrix.asset }}
-            ${{ matrix.asset }}.sha256
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
 
   windows:
     needs: check
@@ -123,18 +140,24 @@ jobs:
       run:
         shell: bash
     env:
-      asset: brainproxy-windows-x86_64.exe
+      PLATFORM: windows-x86_64.exe
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The pattern allows for the CRLF checkout Windows runners make.
+      - name: Asset name
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          [ -n "$version" ] || { echo "::error::no version in Cargo.toml"; exit 1; }
+          echo "ASSET=brainproxy-$version-$PLATFORM" >> "$GITHUB_ENV"
       - name: Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
       # No cache on release builds, so a poisoned cache can't reach published binaries.
       - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release -p brainproxy
       - name: Smoke test
         run: |
@@ -143,20 +166,20 @@ jobs:
           $bin --format json --project smoke.bpdb capabilities > /dev/null
           $bin --format json --project smoke.bpdb engagement start --target 127.0.0.1
       - run: |
-          cp target/release/brainproxy.exe "$asset"
-          sha256sum "$asset" > "$asset.sha256"
+          cp target/release/brainproxy.exe "$ASSET"
+          sha256sum "$ASSET" > "$ASSET.sha256"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ env.asset }}
+          name: ${{ env.ASSET }}
           path: |
-            ${{ env.asset }}
-            ${{ env.asset }}.sha256
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
       - if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
-            ${{ env.asset }}
-            ${{ env.asset }}.sha256
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
 
   # The desktop GUI (gui/): type-check and build the frontend on every push.
   gui-check:
@@ -192,30 +215,36 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset: brainproxy-gui-macos-arm64
+            platform: macos-arm64
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            asset: brainproxy-gui-linux-x86_64
+            platform: linux-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset: brainproxy-gui-windows-x86_64
+            platform: windows-x86_64
     defaults:
       run:
         shell: bash
     env:
       TARGET: ${{ matrix.target }}
-      ASSET: ${{ matrix.asset }}
+      PLATFORM: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The pattern allows for the CRLF checkout Windows runners make.
+      - name: Asset name
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          [ -n "$version" ] || { echo "::error::no version in Cargo.toml"; exit 1; }
+          echo "ASSET=brainproxy-gui-$version-$PLATFORM" >> "$GITHUB_ENV"
       - name: Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal --target "$TARGET" --no-self-update
           rustup default stable
       # No caches on release builds, so a poisoned cache can't reach published bundles.
       - if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: gui-${{ matrix.target }}
           workspaces: |
@@ -260,9 +289,47 @@ jobs:
           cd out && for f in *; do sum "$f" > "$f.sha256"; done && ls -la
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ matrix.asset }}
+          name: ${{ env.ASSET }}
           path: out/*
       - if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: out/*
+
+  # One SHA256SUMS over every release file, for `sha256sum -c SHA256SUMS`.
+  checksums:
+    needs: [static, windows, gui]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # upload release assets on tags
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: brainproxy-*
+          path: assets
+          merge-multiple: true
+      - run: |
+          cd assets
+          ls | grep -v '\.sha256$' | sort | xargs sha256sum > ../SHA256SUMS
+          cat ../SHA256SUMS
+      # Installs up to 0.3.8 look for the old unversioned names, so give them copies (with
+      # their own .sha256) to update with. Kept while such installs may still be around.
+      - name: Unversioned copies for old updaters
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir legacy
+          cd assets
+          for f in $(ls | grep -v '\.sha256$'); do
+            old="${f/-$version-/-}"
+            [ "$old" != "$f" ] || { echo "::error::$f has no version in its name"; exit 1; }
+            cp "$f" "../legacy/$old"
+            (cd ../legacy && sha256sum "$old" > "$old.sha256")
+          done
+          ls -la ../legacy
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            SHA256SUMS
+            legacy/*

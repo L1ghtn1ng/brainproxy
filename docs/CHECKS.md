@@ -50,6 +50,12 @@ brainproxy checks status
 `~/.local/share/brainproxy`. Checks only run when `scan active --checks` names them.
 `--check-tags` (any of), `--check-exclude-tags` (default `dos,fuzz,intrusive`),
 `--check-ids`, and `--check-severity` narrow the set; `--no-rules` skips the ZAP rules.
+`--check-severity` is a floor and `--check-severity-max` a cap on the template's severity
+(info < low < medium < high < critical, `unknown` counts as info), so a run can be split into
+bands: `--check-severity high` first (critical included), then `--check-severity-max medium`.
+`--check-severity critical` is critical only; `--check-severity high --check-severity-max high`
+is high without critical. A cap below the floor is refused (exit 2). `checks list --severity`
+and `--severity-max` preview the same band.
 `--check-include-tags` adds checks with those tags, or in a folder of that name, whatever
 the other filters say (Nuclei's `-itags`). The desktop app's scans use
 `--check-include-tags eol` for the end-of-life checks in nuclei-templates'

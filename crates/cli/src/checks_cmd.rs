@@ -2,13 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use brainproxy_core::checks::{self, Filter, Source};
+use brainproxy_core::checks::{self, Filter, Severity, Source};
 use brainproxy_core::Error;
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use serde_json::json;
 
 use crate::output::Out;
-use crate::scan_cmd::RiskArg;
 
 #[derive(Subcommand)]
 pub enum ChecksCmd {
@@ -79,8 +78,12 @@ pub struct ListArgs {
     /// filters say, as `scan active --check-include-tags` selects them.
     #[arg(long, value_delimiter = ',')]
     include_tags: Vec<String>,
+    /// Only checks of at least this template severity (`high` includes critical).
     #[arg(long, value_enum)]
-    severity: Option<RiskArg>,
+    severity: Option<SeverityArg>,
+    /// Only checks of at most this template severity, e.g. `--severity-max medium`.
+    #[arg(long, value_enum)]
+    severity_max: Option<SeverityArg>,
     /// List templates that were not loaded instead.
     #[arg(long)]
     skipped: bool,
@@ -233,6 +236,7 @@ pub fn checks_cmd(project: &Path, home: &Path, cmd: ChecksCmd, out: &Out) -> Res
 }
 
 fn list(project: &Path, home: &Path, a: ListArgs, out: &Out) -> Result<(), Error> {
+    let (min_severity, max_severity) = severity_band(a.severity, a.severity_max, "--severity")?;
     let selectors = if a.selectors.is_empty() { vec!["all".to_string()] } else { a.selectors.clone() };
     let opts = checks::LoadOptions { vars: a.check_vars.clone(), oob: oob_running(project), ..Default::default() };
     let loaded = checks::load(&checks::resolve_selectors(home, &selectors), &opts)?;
@@ -240,7 +244,8 @@ fn list(project: &Path, home: &Path, a: ListArgs, out: &Out) -> Result<(), Error
         ids: vec![],
         tags: a.tags.clone(),
         exclude_tags: a.exclude_tags.clone(),
-        min_risk: a.severity.map(RiskArg::get),
+        min_severity,
+        max_severity,
         include_tags: a.include_tags.clone(),
     };
     let text = a.filter.as_deref().map(str::to_ascii_lowercase);
@@ -333,4 +338,35 @@ fn feed(cmd: FeedCmd, out: &Out) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// A template severity for the check filters; `critical` is above `high`.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum SeverityArg {
+    Info,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl SeverityArg {
+    fn get(self) -> Severity {
+        [Severity::Info, Severity::Low, Severity::Medium, Severity::High, Severity::Critical][self as usize]
+    }
+}
+
+/// The severity bounds of `<flag>` and `<flag>-max`, refused when the cap is below the floor.
+pub fn severity_band(
+    min: Option<SeverityArg>,
+    max: Option<SeverityArg>,
+    flag: &str,
+) -> Result<(Option<Severity>, Option<Severity>), Error> {
+    let (min, max) = (min.map(SeverityArg::get), max.map(SeverityArg::get));
+    if let (Some(lo), Some(hi)) = (min, max) {
+        if hi < lo {
+            return Err(Error::InvalidInput(format!("{flag}-max {} is below {flag} {}", hi.as_str(), lo.as_str())));
+        }
+    }
+    Ok((min, max))
 }

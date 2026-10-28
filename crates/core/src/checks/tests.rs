@@ -235,16 +235,26 @@ fn filter_and_load_dedupes() {
     assert!(Filter::default().keep(c));
     assert!(Filter { tags: vec!["GIT".into()], ..Default::default() }.keep(c));
     assert!(!Filter { exclude_tags: vec!["exposure".into()], ..Default::default() }.keep(c));
-    assert!(!Filter { min_risk: Some(Risk::High), ..Default::default() }.keep(c));
+    assert!(!Filter { min_severity: Some(Severity::High), ..Default::default() }.keep(c));
     assert!(!Filter { ids: vec!["other".into()], ..Default::default() }.keep(c));
     // Included tags win over the other filters; a folder of that name counts too.
-    let high = Filter { min_risk: Some(Risk::High), include_tags: vec!["git".into()], ..Default::default() };
+    let high = Filter { min_severity: Some(Severity::High), include_tags: vec!["git".into()], ..Default::default() };
     assert!(high.keep(c));
     let mut in_eol = c.clone();
     in_eol.tags.clear();
     in_eol.file = std::path::PathBuf::from("nuclei/http/technologies/eol/x-eol.yaml");
-    assert!(Filter { min_risk: Some(Risk::High), include_tags: vec!["eol".into()], ..Default::default() }.keep(&in_eol));
-    assert!(!Filter { min_risk: Some(Risk::High), ..Default::default() }.keep(&in_eol));
+    assert!(Filter { min_severity: Some(Severity::High), include_tags: vec!["eol".into()], ..Default::default() }
+        .keep(&in_eol));
+    assert!(!Filter { min_severity: Some(Severity::High), ..Default::default() }.keep(&in_eol));
+    // A band: high but not critical.
+    let band = Filter { min_severity: Some(Severity::High), max_severity: Some(Severity::High), ..Default::default() };
+    let mut sev = c.clone();
+    for (s, kept) in [("medium", false), ("high", true), ("critical", false)] {
+        sev.severity = s.into();
+        assert_eq!(band.keep(&sev), kept, "{s}");
+    }
+    sev.severity = "unknown".into();
+    assert!(Filter { max_severity: Some(Severity::Info), ..Default::default() }.keep(&sev));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

@@ -15,30 +15,33 @@ Contents: [Install](#install) · [Concepts](#concepts) · [First engagement (des
 
 ## Install
 
-Downloads are on the GitHub release page. Each file has a `.sha256` next to it.
+Downloads are on the GitHub release page. Their names carry the version, written `<version>`
+below (e.g. `brainproxy-gui-0.3.9-macos-arm64.dmg`; releases up to 0.3.8 leave it out). Each
+file has a `.sha256` next to it, and `SHA256SUMS` lists them all: check what you downloaded
+with `sha256sum -c --ignore-missing SHA256SUMS`.
 
 | You want | Download |
 | --- | --- |
-| Desktop app on a Mac (Apple silicon) | `brainproxy-gui-macos-arm64.dmg` |
-| Desktop app on Debian, Ubuntu, or Kali | `brainproxy-gui-linux-x86_64.deb` |
-| Desktop app on another Linux, no install | `brainproxy-gui-linux-x86_64.AppImage` |
-| Desktop app on Windows 10 or 11 | `brainproxy-gui-windows-x86_64-setup.exe` (or the `.msi`) |
-| Command line only (servers, agents, Kali) | `brainproxy-linux-x86_64` or `brainproxy-linux-arm64` |
-| Command line only on Windows | `brainproxy-windows-x86_64.exe` |
+| Desktop app on a Mac (Apple silicon) | `brainproxy-gui-<version>-macos-arm64.dmg` |
+| Desktop app on Debian, Ubuntu, or Kali | `brainproxy-gui-<version>-linux-x86_64.deb` |
+| Desktop app on another Linux, no install | `brainproxy-gui-<version>-linux-x86_64.AppImage` |
+| Desktop app on Windows 10 or 11 | `brainproxy-gui-<version>-windows-x86_64-setup.exe` (or the `.msi`) |
+| Command line only (servers, agents, Kali) | `brainproxy-<version>-linux-x86_64` or `brainproxy-<version>-linux-arm64` |
+| Command line only on Windows | `brainproxy-<version>-windows-x86_64.exe` |
 
 - **macOS:** open the `.dmg` and drag brainproxy to Applications. The app isn't signed
   yet: open it once, then choose System Settings → Privacy & Security → Open Anyway, or run
   `xattr -dr com.apple.quarantine /Applications/brainproxy.app`.
-- **Debian/Ubuntu/Kali:** `sudo apt install ./brainproxy-gui-linux-x86_64.deb`. This installs
+- **Debian/Ubuntu/Kali:** `sudo apt install ./brainproxy-gui-<version>-linux-x86_64.deb`. This installs
   WebKitGTK if it is missing and adds a menu entry.
-- **AppImage:** `chmod +x brainproxy-gui-linux-x86_64.AppImage`, then run it. It needs
+- **AppImage:** `chmod +x brainproxy-gui-<version>-linux-x86_64.AppImage`, then run it. It needs
   WebKitGTK 4.1, which current distributions include.
 - **Windows:** run the `-setup.exe` (installs for your user) or the `.msi`. The installer
   isn't signed yet, so SmartScreen shows "Windows protected your PC": choose More info →
   Run anyway. The app uses the WebView2 runtime that comes with Windows 10 and 11. The
   command-line `.exe` needs no install; rename it `brainproxy.exe` and put it on your `PATH`.
 - **Command line:** the Linux binaries are static with no dependencies:
-  `chmod +x brainproxy-linux-x86_64 && sudo mv brainproxy-linux-x86_64 /usr/local/bin/brainproxy`.
+  `sudo install -m755 brainproxy-<version>-linux-x86_64 /usr/local/bin/brainproxy`.
 
 The desktop app includes the command-line tool, so you don't need both.
 
@@ -47,8 +50,9 @@ Overview, with a button that downloads the installer to your Downloads folder (c
 against its published sha256) and one that opens it. Close brainproxy before installing.
 Settings › Rules & data turns the check off, or makes the download automatic. On the
 command line, `brainproxy update check` says whether a newer release exists and
-`brainproxy update download` saves the binary for this machine (`--kind gui` for the app
-installer, `--dir` for another folder). Neither installs anything. The AppImage is larger
+`brainproxy update download` saves the binary for this machine under its release name, e.g.
+`brainproxy-0.3.9-linux-x86_64` (`--kind gui` for the app installer, `--dir` for another
+folder). Neither installs anything. The AppImage is larger
 than the download limit; get it from the release page.
 
 ---

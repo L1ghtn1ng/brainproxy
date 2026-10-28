@@ -40,10 +40,11 @@ tool in the desktop app, the command line, agents, and troubleshooting.
 ## Desktop app
 
 Tagged releases also attach the desktop GUI with the CLI bundled inside:
-`brainproxy-gui-macos-arm64.dmg`, `brainproxy-gui-linux-x86_64.deb` / `.AppImage`, and
-`brainproxy-gui-windows-x86_64.msi` / `-setup.exe`. The apps aren't signed yet: on macOS open
+`brainproxy-gui-<version>-macos-arm64.dmg`, `brainproxy-gui-<version>-linux-x86_64.deb` / `.AppImage`, and
+`brainproxy-gui-<version>-windows-x86_64.msi` / `-setup.exe` (e.g. `brainproxy-gui-0.3.9-macos-arm64.dmg`;
+releases up to 0.3.8 have no version in the names). The apps aren't signed yet: on macOS open
 the app once, then System Settings → Privacy & Security → Open Anyway; on Windows choose More info → Run anyway. The
-command line alone for Windows is `brainproxy-windows-x86_64.exe`; the bundled one is
+command line alone for Windows is `brainproxy-<version>-windows-x86_64.exe`; the bundled one is
 `C:\Program Files\brainproxy\brainproxy.exe` (`.msi`) or `%LOCALAPPDATA%\brainproxy\brainproxy.exe`
 (`-setup.exe`). See
 [docs/GUI.md](docs/GUI.md).
@@ -56,12 +57,17 @@ command line alone for Windows is `brainproxy-windows-x86_64.exe`; the bundled o
 
 brainproxy builds into one static binary with no runtime dependencies, for **arm64**
 (Braintruder's Kali target) and x86_64. Tagged releases attach both
-(`brainproxy-linux-arm64`, `brainproxy-linux-x86_64`) with `.sha256` files:
+(`brainproxy-<version>-linux-arm64`, `brainproxy-<version>-linux-x86_64`), each with a `.sha256`
+file, plus one `SHA256SUMS` covering every download in the release (up to 0.3.8 the names have
+no `<version>-`, and there is no `SHA256SUMS`):
 
 ```sh
-curl -LO https://github.com/r4nd0mth1ngs/brainproxy/releases/latest/download/brainproxy-linux-arm64
-sha256sum -c <(curl -sL https://github.com/r4nd0mth1ngs/brainproxy/releases/latest/download/brainproxy-linux-arm64.sha256)
-sudo install -m755 brainproxy-linux-arm64 /usr/local/bin/brainproxy
+v=$(curl -fsSLo /dev/null -w '%{url_effective}' https://github.com/r4nd0mth1ngs/brainproxy/releases/latest | sed 's|.*/tag/v||')
+f=brainproxy-$v-linux-arm64
+curl -fLO https://github.com/r4nd0mth1ngs/brainproxy/releases/download/v$v/$f
+curl -fLO https://github.com/r4nd0mth1ngs/brainproxy/releases/download/v$v/$f.sha256
+sha256sum -c $f.sha256
+sudo install -m755 $f /usr/local/bin/brainproxy
 ```
 
 Build an arm64 binary from any Linux machine:
@@ -82,7 +88,7 @@ make static                    # -> target/x86_64-unknown-linux-musl/release/bra
 sudo make install              # -> /usr/local/bin/brainproxy
 ```
 
-Or copy the `brainproxy-linux-x86_64` artifact from CI (or a tagged release) onto the runner.
+Or copy the `brainproxy-<version>-linux-x86_64` artifact from CI (or a tagged release) onto the runner.
 
 ## Engagement scope (required)
 
