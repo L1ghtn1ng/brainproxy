@@ -158,14 +158,22 @@ fn handle(mut s: TcpStream, app: &Mutex<App>) {
             }
             redirect("/login", "Set-Cookie: sid=; Max-Age=0\r\n")
         }
-        ("POST", "/api/login") => {
+        ("POST", "/api/login" | "/api/login-redirect") => {
             let v: Value = serde_json::from_str(&body).unwrap_or_default();
             if v["username"] == USER && v["password"] == PASS {
                 let token = format!("bearer{n}");
                 a.tokens.insert(token.clone());
                 a.logins += 1;
                 let json = format!("{{\"token\":\"{token}\"}}");
-                html("200 OK", "", &json)
+                if path == "/api/login-redirect" {
+                    // The token comes with the redirect, not the page it leads to.
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    )
+                } else {
+                    html("200 OK", "", &json)
+                }
             } else {
                 html("403 Forbidden", "", "{\"error\":\"bad credentials\"}")
             }
@@ -359,6 +367,34 @@ fn json_login_with_bearer_token() {
     assert_eq!(r["response"]["status"], 200, "{r}");
     let h = ok(&p, &["auth", "headers", "api"]);
     assert!(h["headers"][0].as_str().unwrap().starts_with("Authorization: Bearer bearer"), "{h}");
+}
+
+#[test]
+fn token_on_the_login_redirect_is_used() {
+    let srv = Server::start(100);
+    let p = tmp_project("jsonredirect");
+    ok(
+        &p,
+        &[
+            "auth",
+            "add",
+            "api",
+            "--login-url",
+            &srv.url("/api/login-redirect"),
+            "--login-body",
+            r#"{"username":"{{username}}","password":"{{password}}"}"#,
+            "--username",
+            USER,
+            "--password-env",
+            "BP_TEST_PASSWORD",
+            "--token-regex",
+            r#""token":"([^"]+)""#,
+            "--token-header",
+            "Authorization: Bearer {{token}}",
+        ],
+    );
+    let r = ok(&p, &["send", "--url", &srv.url("/api/me"), "--auth", "api"]);
+    assert_eq!(r["response"]["status"], 200, "{r}");
 }
 
 #[test]

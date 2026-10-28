@@ -275,6 +275,10 @@ impl Vault {
 
     /// Registers a profile's session values: cookies, token, static headers.
     fn put_session(&self, p: &AuthProfile, st: &SessionState) {
+        // A static Cookie header's cookies first, so a learned cookie of the same name wins.
+        for (k, v) in static_cookies(p) {
+            self.put(placeholder(&p.name, &format!("cookie:{k}")), &v, Some("cookie"), None);
+        }
         for (k, v) in &st.cookies {
             self.put(placeholder(&p.name, &format!("cookie:{k}")), v, Some("cookie"), None);
         }
@@ -283,7 +287,7 @@ impl Vault {
                 self.put(placeholder(&p.name, "token"), tok, Some(k), None);
             }
         }
-        for (k, v) in &p.headers {
+        for (k, v) in p.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie")) {
             self.put(placeholder(&p.name, &format!("header:{k}")), v, Some(k), None);
         }
     }
@@ -522,16 +526,23 @@ impl AuthSession {
         }
         let ph = |kind: &str| placeholder(&self.profile.name, kind);
         let mut req = RawRequest::from_bytes(raw.to_vec());
-        if !st.cookies.is_empty() {
+        // Learned cookies, and those of a static Cookie header, merged into the request's.
+        let mut session: Vec<String> = st.cookies.iter().map(|(k, _)| k.clone()).collect();
+        for (k, _) in static_cookies(&self.profile) {
+            if !session.contains(&k) {
+                session.push(k);
+            }
+        }
+        if !session.is_empty() {
             let existing = request_cookies(raw);
             let mut merged: Vec<(String, String)> = Vec::new();
             for (k, v) in &existing {
-                let replaced = !keep.contains(&k.as_str()) && st.cookies.iter().any(|(n, _)| n == k);
+                let replaced = !keep.contains(&k.as_str()) && session.contains(k);
                 if !replaced {
                     merged.push((k.clone(), v.clone()));
                 }
             }
-            for (k, _) in &st.cookies {
+            for k in &session {
                 if !merged.iter().any(|(n, _)| n == k) {
                     merged.push((k.clone(), ph(&format!("cookie:{k}"))));
                 }
@@ -544,7 +555,7 @@ impl AuthSession {
                 req = req.set_header(k.trim(), v.trim());
             }
         }
-        for (k, _) in &self.profile.headers {
+        for (k, _) in self.profile.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie")) {
             req = req.set_header(k, &ph(&format!("header:{k}")));
         }
         req.into_bytes()
@@ -707,15 +718,7 @@ impl AuthSession {
         let target = Target::from_url(login_url)?;
         let req = match &p.login_request {
             Some(tpl) => {
-                let ct = tpl.to_ascii_lowercase();
-                let enc = if ct.contains("application/json") {
-                    Enc::Json
-                } else if ct.contains("x-www-form-urlencoded") {
-                    Enc::Form
-                } else {
-                    Enc::Raw
-                };
-                let text = substitute(tpl, &username, &placeholder(&p.name, enc.password_kind()), &csrf, enc);
+                let text = fill_template(tpl, &username, &p.name, &csrf);
                 RawRequest::from_bytes(text.into_bytes()).normalize_line_endings().update_content_length()
             }
             None => {
@@ -732,9 +735,21 @@ impl AuthSession {
             }
         };
 
+        // The token may come with any response of the login: the first one (often a
+        // redirect) or one after it.
+        let mut token = None;
+        let mut find_token = |response: &[u8]| {
+            if let (None, Some(re)) = (&token, &self.re.token) {
+                token = re
+                    .captures(&response_text(response))
+                    .and_then(|c| c.get(1).or_else(|| c.get(0)))
+                    .map(|m| m.as_str().to_string());
+            }
+        };
         // Send, following redirects (with cookies) like a browser would.
         let mut ex = self.client.send(&RawRequest::from_bytes(self.apply(req.as_bytes(), &[])), &target).await?;
         self.observe(&ex.response);
+        find_token(&ex.response);
         history.push(self.record(&ex));
         let mut current = url::Url::parse(login_url).map_err(|e| Error::InvalidInput(e.to_string()))?;
         for _ in 0..5 {
@@ -747,13 +762,12 @@ impl AuthSession {
             let (r, t) = RawRequest::build("GET", current.as_str(), &[], b"")?;
             ex = self.client.send(&RawRequest::from_bytes(self.apply(r.as_bytes(), &[])), &t).await?;
             self.observe(&ex.response);
+            find_token(&ex.response);
             history.push(self.record(&ex));
         }
 
         let final_text = response_text(&ex.response);
-        if let Some(re) = &self.re.token {
-            let token =
-                re.captures(&final_text).and_then(|c| c.get(1).or_else(|| c.get(0))).map(|m| m.as_str().to_string());
+        if self.re.token.is_some() {
             self.state.lock().unwrap().token = token;
         }
 
@@ -842,6 +856,54 @@ fn encode(v: &str, enc: Enc) -> String {
         }
         Enc::Raw => v.to_string(),
     }
+}
+
+/// The cookies of a profile's static Cookie header.
+fn static_cookies(p: &AuthProfile) -> Vec<(String, String)> {
+    p.headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .flat_map(|(_, v)| v.split(';'))
+        .filter_map(|c| {
+            let (k, v) = c.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .filter(|(k, _)| !k.is_empty())
+        .collect()
+}
+
+/// Fills a raw login request template part by part: the body encoded for its
+/// Content-Type (sniffed as JSON when there is none), header values as they are (a
+/// CSRF header carries the token itself), and the request line URL-encoded.
+fn fill_template(tpl: &str, user: &str, profile: &str, csrf: &str) -> String {
+    let (head, sep, body) = match (tpl.find("\r\n\r\n"), tpl.find("\n\n")) {
+        (Some(a), b) if b.is_none_or(|b| a < b) => (&tpl[..a], "\r\n\r\n", &tpl[a + 4..]),
+        (_, Some(b)) => (&tpl[..b], "\n\n", &tpl[b + 2..]),
+        _ => (tpl, "", ""),
+    };
+    let (line, headers) = head.split_once('\n').map_or((head, None), |(l, h)| (l, Some(h)));
+    let content_type = headers
+        .into_iter()
+        .flat_map(str::lines)
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.to_ascii_lowercase());
+    let enc = match content_type {
+        Some(ct) if ct.contains("json") => Enc::Json,
+        Some(ct) if ct.contains("x-www-form-urlencoded") => Enc::Form,
+        Some(_) => Enc::Raw,
+        None if body.trim_start().starts_with('{') => Enc::Json,
+        None => Enc::Raw,
+    };
+    let fill = |text: &str, enc: Enc| substitute(text, user, &placeholder(profile, enc.password_kind()), csrf, enc);
+    let mut out = fill(line, Enc::Form);
+    if let Some(h) = headers {
+        out.push('\n');
+        out.push_str(&fill(h, Enc::Raw));
+    }
+    out.push_str(sep);
+    out.push_str(&fill(body, enc));
+    out
 }
 
 /// Fills a login template. `pass` goes in as given (the password placeholder for
@@ -934,6 +996,39 @@ mod tests {
         assert_eq!(substitute("u={{username}}&p={{password}}", "a b", "PW", "", Enc::Form), "u=a+b&p=PW");
         assert_eq!(encode("p&w", Enc::Form), "p%26w");
         assert_eq!(encode("q\"x", Enc::Json), r#"q\"x"#);
+    }
+
+    #[test]
+    fn login_templates_encode_each_part_for_its_place() {
+        let tpl = "POST /login?u={{username}} HTTP/1.1\nAccept: application/json, */*\nContent-Type: application/x-www-form-urlencoded\nX-CSRF-Token: {{csrf}}\n\nuser={{username}}&pw={{password}}&t={{csrf}}";
+        let out = fill_template(tpl, "alice+qa@corp.test", "t", "ab+c/d=1");
+        let pw = placeholder("t", "password:form");
+        assert_eq!(
+            out,
+            format!("POST /login?u=alice%2Bqa%40corp.test HTTP/1.1\nAccept: application/json, */*\nContent-Type: application/x-www-form-urlencoded\nX-CSRF-Token: ab+c/d=1\n\nuser=alice%2Bqa%40corp.test&pw={pw}&t=ab%2Bc%2Fd%3D1")
+        );
+        let json = fill_template(
+            "POST / HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"u\":\"{{username}}\"}",
+            "a\"b",
+            "t",
+            "",
+        );
+        assert!(json.ends_with("{\"u\":\"a\\\"b\"}"), "{json}");
+    }
+
+    #[test]
+    fn a_static_cookie_header_merges_with_the_request_cookies() {
+        let p = AuthProfile {
+            name: "t".into(),
+            headers: vec![("Cookie".into(), "sid=LOGGEDIN; theme=dark".into())],
+            ..Default::default()
+        };
+        let s = session(p);
+        let req = b"GET /x HTTP/1.1\r\nHost: a.test\r\nCookie: sid=PAYLOAD; other=1\r\n\r\n";
+        let sent = wire(&s, &s.apply(req, &["sid"])).unwrap();
+        assert!(sent.contains("Cookie: sid=PAYLOAD; other=1; theme=dark\r\n"), "{sent}");
+        let sent = wire(&s, &s.apply(req, &[])).unwrap();
+        assert!(sent.contains("Cookie: other=1; sid=LOGGEDIN; theme=dark\r\n"), "{sent}");
     }
 
     #[test]
