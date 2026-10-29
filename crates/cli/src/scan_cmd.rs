@@ -85,7 +85,7 @@ pub enum FindingsCmd {
         #[arg(long)]
         state: Option<String>,
         /// Only findings from this scanner.
-        #[arg(long, value_parser = ["passive", "active"])]
+        #[arg(long, value_parser = ["passive", "active", "authz"])]
         source: Option<String>,
         /// One row per instance instead of grouping.
         #[arg(long)]

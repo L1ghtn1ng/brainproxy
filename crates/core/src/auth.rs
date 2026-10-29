@@ -998,7 +998,7 @@ fn replayed_headers(headers: Vec<(String, String)>, same_origin: bool) -> Vec<(S
 }
 
 /// The cookies of a profile's static Cookie header.
-fn static_cookies(p: &AuthProfile) -> Vec<(String, String)> {
+pub(crate) fn static_cookies(p: &AuthProfile) -> Vec<(String, String)> {
     p.headers
         .iter()
         .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))

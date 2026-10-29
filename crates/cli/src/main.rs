@@ -3,6 +3,7 @@
 
 mod active_cmd;
 mod auth_cmd;
+mod authz_cmd;
 mod browser_cmd;
 mod capabilities;
 mod checks_cmd;
@@ -79,6 +80,11 @@ enum Cmd {
     /// Login profiles and sessions; use one with `--auth NAME` on send, fuzz, crawl, scan active, proxy.
     #[command(subcommand)]
     Auth(auth_cmd::AuthCmd),
+
+    /// Access-control testing: re-send recorded requests as other auth profiles and without
+    /// a session, and compare with the owner's responses (IDOR, missing authorization).
+    #[command(subcommand)]
+    Authz(authz_cmd::AuthzCmd),
 
     /// Manage the project file.
     #[command(subcommand)]
@@ -408,6 +414,12 @@ fn command_name(cmd: &Cmd) -> String {
                 auth_cmd::RuleCmd::Remove { .. } => "auth rule remove",
             },
         },
+        Cmd::Authz(c) => match c {
+            authz_cmd::AuthzCmd::Run(_) => "authz run",
+            authz_cmd::AuthzCmd::Results { .. } => "authz results",
+            authz_cmd::AuthzCmd::Matrix { .. } => "authz matrix",
+            authz_cmd::AuthzCmd::List { .. } => "authz list",
+        },
         Cmd::Job(_) => "job",
         Cmd::Oob(c) => match c {
             oob_cmd::OobCmd::Start(_) => "oob start",
@@ -489,6 +501,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Update(cmd) => update_cmd::update(cmd, out)?,
         Cmd::Engagement(cmd) => engagement_cmd::engagement(&cli.project, cmd, out)?,
         Cmd::Auth(cmd) => auth_cmd::auth(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
+        Cmd::Authz(cmd) => authz_cmd::authz(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Findings(cmd) => scan_cmd::findings(&cli.project, cmd, out)?,
         Cmd::Report(args) => report_cmd::report(&cli.project, args, out)?,
         Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,
@@ -702,7 +715,8 @@ fn schema_json() -> Value {
             {"name": "findings", "description": "Scanner findings, de-duplicated (hits counts repeats). Join finding_types ON alert_ref for description/solution.", "columns": cols(brainproxy_core::scan::findings_db::FINDING_COLUMNS)},
             {"name": "finding_types", "description": "Description, solution, refs (JSON), and tags (JSON) per alert_ref."},
             {"name": "auth_profiles", "description": "Login profiles (profile JSON) and their stored session state (state JSON: cookies, token, logged_in). Not readable with query (it holds secrets); use auth list / auth show (redacted)."},
-            {"name": "jobs", "description": "Background jobs (crawl, active scan).", "columns": cols(brainproxy_core::jobs::JOB_COLUMNS)},
+            {"name": "authz_results", "description": "Access-control test results: one row per request and identity (authz run). Join history ON history.id = authz_results.history_id (or baseline_history_id).", "columns": cols(brainproxy_core::authz::AUTHZ_RESULT_COLUMNS)},
+            {"name": "jobs", "description": "Background jobs (crawl, active scan, authz run).", "columns": cols(brainproxy_core::jobs::JOB_COLUMNS)},
             {"name": "oob_payloads", "description": "Out-of-band payload tokens: from active rules (source scan) or `oob payload` (manual).", "columns": cols(brainproxy_core::oob::PAYLOAD_COLUMNS)},
             {"name": "oob_interactions", "description": "Interactions received by the OOB listener. Join oob_payloads ON token.", "columns": cols(brainproxy_core::oob::INTERACTION_COLUMNS)},
             {"name": "history_fts", "description": "FTS5 full-text index over url, req_headers, req_body_text, resp_headers, resp_body_text. rowid = history.id. Query with: WHERE history_fts MATCH 'term'."},

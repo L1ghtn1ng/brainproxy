@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS finding_types (
 pub const FINDING_COLUMNS: &[(&str, &str, &str)] = &[
     ("id", "INTEGER", "Finding id"),
     ("time", "TEXT", "When first seen"),
-    ("source", "TEXT", "passive (later: active)"),
+    ("source", "TEXT", "passive, active, or authz"),
     ("rule_id", "INTEGER", "Rule id (ZAP plugin id for ported rules)"),
     ("alert_ref", "TEXT", "Alert type id; join finding_types for description/solution"),
     ("name", "TEXT", "Alert name"),
