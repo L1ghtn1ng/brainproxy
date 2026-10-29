@@ -1,12 +1,14 @@
 // Viewer and editor for one raw HTTP message: Raw (highlighted, editable when onChange is
 // given), Pretty (JSON and form bodies formatted), Hex, and for responses Render (HTML in a
 // sandboxed iframe with no network, images), with a search bar.
-// Line endings are shown and edited as \n; `send` normalizes them back to CRLF.
+// Line endings are shown and edited as \n; `send` turns the head's back into CRLF and an
+// edit keeps the body's own (see message.ts).
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { decode, encodeAll } from "./urlencode";
 import { RENDER_CAP, renderable } from "./render";
 import { textBytes } from "../api";
+import { normalizeHead, withBody } from "./message";
 
 type Mode = "raw" | "pretty" | "hex" | "render";
 
@@ -124,7 +126,7 @@ export function HttpView(p: {
     if (!el || !p.onChange || el.selectionStart === el.selectionEnd) return;
     const { selectionStart: a, selectionEnd: b, value } = el;
     const next = f(value.slice(a, b));
-    p.onChange(value.slice(0, a) + next + value.slice(b));
+    p.onChange(withBody(value.slice(0, a) + next + value.slice(b), p.value));
     requestAnimationFrame(() => {
       el.focus();
       el.setSelectionRange(a, a + next.length);
@@ -137,7 +139,8 @@ export function HttpView(p: {
   const [big, setBig] = useState(false);
   useEffect(() => setBig(false), [text]);
   const tooBig = text.length > RENDER_CAP && !big;
-  const rendered = useMemo(() => (view === "render" && !tooBig ? renderable(text) : null), [view, tooBig, text]);
+  // From the body's own bytes: a PNG's signature holds \r\n.
+  const rendered = useMemo(() => (view === "render" && !tooBig ? renderable(normalizeHead(p.value)) : null), [view, tooBig, p.value]);
   const editable = !!p.onChange && view === "raw";
   const shown = useMemo(() => (view === "pretty" ? pretty(text) : text), [view, text]);
   const bytes = useMemo(() => textBytes(p.value, p.binary), [p.value, p.binary]);
@@ -227,7 +230,7 @@ export function HttpView(p: {
               spellCheck={false}
               value={text}
               placeholder={p.placeholder}
-              onChange={(e) => p.onChange!(e.target.value)}
+              onChange={(e) => p.onChange!(withBody(e.target.value, p.value))}
               onScroll={(e) => {
                 if (back.current) back.current.scrollTop = e.currentTarget.scrollTop;
               }}

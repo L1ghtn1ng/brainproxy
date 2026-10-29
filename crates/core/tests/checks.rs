@@ -75,6 +75,16 @@ fn run(port: u16, path: &str, templates: &[(&str, &str)]) -> ActiveSummary {
 }
 
 fn run_opts(port: u16, path: &str, templates: &[(&str, &str)], opts: &checks::LoadOptions) -> ActiveSummary {
+    run_with(port, path, templates, opts, |_| {})
+}
+
+fn run_with(
+    port: u16,
+    path: &str,
+    templates: &[(&str, &str)],
+    opts: &checks::LoadOptions,
+    tweak: impl FnOnce(&mut ActiveConfig),
+) -> ActiveSummary {
     let dir = tmp(&format!("t{port}"));
     for (name, text) in templates {
         std::fs::write(dir.join(name), text).unwrap();
@@ -85,7 +95,7 @@ fn run_opts(port: u16, path: &str, templates: &[(&str, &str)], opts: &checks::Lo
     let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: sid=abc\r\n\r\n");
     let guard =
         Guard::from_specs(vec![ScopeSpec { name: None, include: vec!["127.0.0.1".into()], exclude: vec![] }]).unwrap();
-    let cfg = ActiveConfig {
+    let mut cfg = ActiveConfig {
         strength: Strength::Medium,
         concurrency: 4,
         rate: None,
@@ -106,6 +116,7 @@ fn run_opts(port: u16, path: &str, templates: &[(&str, &str)], opts: &checks::Lo
         oob: None,
         oob_wait: Duration::ZERO,
     };
+    tweak(&mut cfg);
     let targets = vec![ScanTarget {
         history_id: None,
         target,
@@ -253,6 +264,57 @@ http:
     });
     let s = run(port, "/search?q=x", &[("ssti.yaml", SSTI)]);
     assert_eq!(s.raised.get("check:bp-ssti"), Some(&1), "{s:?}");
+}
+
+#[test]
+fn placeholders_in_dsl_and_raw_paths() {
+    // `{{randstr}}` and a variable inside DSL strings are filled before evaluating; a
+    // placeholder without a value stays literal. The `..` in the path is sent as written.
+    const ECHO: &str = r#"
+id: dsl-echo
+info: {name: DSL echo, severity: low}
+variables:
+  num: "31337"
+http:
+  - path: ["{{BaseURL}}/d/../e?x={{randstr}}&n={{num}}"]
+    matchers:
+      - type: dsl
+        condition: and
+        dsl:
+          - 'contains(body, "{{randstr}}")'
+          - "contains(body, 'n={{num}}')"
+          - '!contains(body, "{{nothing_here}}")'
+"#;
+    let (port, seen) = spawn(|req| {
+        let line = req.lines().next().unwrap_or("").to_string();
+        resp("200 OK", "", &line)
+    });
+    let s = run(port, "/", &[("e.yaml", ECHO)]);
+    assert_eq!(s.raised.len(), 1, "{s:?}");
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|r| r.starts_with("GET /d/../e?x=")), "{seen:?}");
+}
+
+#[test]
+fn max_duration_ends_waits_for_a_rate_slot() {
+    // Eight units queue for slots 2 s apart; the scan stops after 1 s instead of
+    // sending the queued requests over the next 14 s.
+    let templates: Vec<(String, String)> = (0..8)
+        .map(|i| {
+            let t = format!("id: slow-{i}\ninfo: {{name: Slow {i}, severity: info}}\nhttp:\n  - path: ['{{{{BaseURL}}}}/p{i}']\n    matchers:\n      - type: status\n        status: [599]\n");
+            (format!("s{i}.yaml"), t)
+        })
+        .collect();
+    let refs: Vec<(&str, &str)> = templates.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (port, seen) = spawn(|_| resp("200 OK", "", "ok"));
+    let started = std::time::Instant::now();
+    run_with(port, "/", &refs, &Default::default(), |cfg| {
+        cfg.rate = Some(0.5);
+        cfg.concurrency = 8;
+        cfg.max_duration = Some(Duration::from_secs(1));
+    });
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert!(seen.lock().unwrap().len() <= 2, "{:?}", seen.lock().unwrap().len());
 }
 
 #[test]

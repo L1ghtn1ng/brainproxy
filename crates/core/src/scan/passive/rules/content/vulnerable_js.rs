@@ -146,7 +146,9 @@ fn at_or_above(v1: &str, v2: &str) -> bool {
         match (num(x), num(y)) {
             (true, false) => return true,
             (false, true) => return false,
-            (false, false) => return x > y,
+            // Equal words (beta, rc) compare the parts after them, as Retire.js does.
+            (false, false) if x != y => return x > y,
+            (false, false) => continue,
             _ => {}
         }
         let (x, y) = (x.parse::<u128>().unwrap_or(0), y.parse::<u128>().unwrap_or(0));
@@ -314,6 +316,9 @@ mod tests {
         assert!(!at_or_above("1.2", "1.12.4"));
         assert!(at_or_above("3.0.0", "3.0.0-rc1"));
         assert!(!at_or_above("3.0.0-beta1", "3.0.0-rc1"));
+        assert!(at_or_above("3.0.0-rc.1", "3.0.0-rc.1"));
+        assert!(at_or_above("4.9.0-beta.5", "4.9.0-beta.3"));
+        assert!(!at_or_above("4.9.0-beta.2", "4.9.0-beta.3"));
         assert!(good_candidate("1.8.3") && !good_candidate("7a06f256") && !good_candidate("0.0.0"));
     }
 

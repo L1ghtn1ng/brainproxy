@@ -411,6 +411,9 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         }
     }
 
+    // A rule or an edit may have changed the method (GET to HEAD): the response is framed
+    // by the one sent.
+    let method = RawRequest::from_bytes(request.clone()).head().map(|h| h.method).unwrap_or(method);
     let generation = auth.map(|a| a.generation()).unwrap_or(0);
     let started = Instant::now();
     let mut upstream = forward(ctx, target, &request, &method, h2).await;

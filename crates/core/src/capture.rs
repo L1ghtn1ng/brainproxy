@@ -125,11 +125,25 @@ fn text(body: &[u8]) -> Option<String> {
 /// Removes chunked framing and content encoding (gzip, deflate, br). If decoding
 /// fails, returns the bytes as they were.
 pub fn decode_body(headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
+    decode(headers, body).0
+}
+
+/// The body with chunked framing and every content coding removed, or None when a
+/// coding couldn't be decoded (zstd, compress, a corrupt stream): then the body can't be
+/// sent on without its Content-Encoding.
+pub fn decode_body_fully(headers: &[(String, String)], body: &[u8]) -> Option<Vec<u8>> {
+    let (out, all) = decode(headers, body);
+    all.then_some(out)
+}
+
+/// The decoded body, and whether every content coding was removed.
+fn decode(headers: &[(String, String)], body: &[u8]) -> (Vec<u8>, bool) {
     let has = |name: &str, token: &str| header(headers, name).map(|v| v.to_ascii_lowercase().contains(token));
     let mut out = if has("transfer-encoding", "chunked").unwrap_or(false) { dechunk(body) } else { body.to_vec() };
     if let Some(enc) = header(headers, "content-encoding") {
         for coding in enc.split(',').rev().map(|c| c.trim().to_ascii_lowercase()) {
             let decoded = match coding.as_str() {
+                "" | "identity" => Some(out.clone()),
                 "gzip" | "x-gzip" => read_limited(flate2::read::MultiGzDecoder::new(&out[..])),
                 "deflate" => read_limited(flate2::read::ZlibDecoder::new(&out[..]))
                     .or_else(|| read_limited(flate2::read::DeflateDecoder::new(&out[..]))),
@@ -138,11 +152,11 @@ pub fn decode_body(headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
             };
             match decoded {
                 Some(d) => out = d,
-                None => break,
+                None => return (out, false),
             }
         }
     }
-    out
+    (out, true)
 }
 
 fn read_limited(r: impl Read) -> Option<Vec<u8>> {

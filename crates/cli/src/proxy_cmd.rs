@@ -564,7 +564,7 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
             let id = rules.iter().map(|r| r.id).max().unwrap_or(0) + 1;
             let rule =
                 Rule { id, location: RuleLocation::parse(&location)?, pattern, replace, enabled: !disabled, comment };
-            brainproxy_core::proxy::config::compile_rules(std::slice::from_ref(&rule))?;
+            brainproxy_core::proxy::config::validate_rule(&rule)?;
             rules.push(rule);
         }
         RulesCmd::Remove { id } => {
@@ -573,6 +573,7 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
         }
         RulesCmd::Enable { id } => {
             let i = find(&mut rules, id)?;
+            brainproxy_core::proxy::config::validate_rule(&rules[i])?;
             rules[i].enabled = true;
         }
         RulesCmd::Disable { id } => {

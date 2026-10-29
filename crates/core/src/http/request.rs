@@ -115,51 +115,37 @@ impl RawRequest {
     }
 
     /// Sets the header, replacing every existing header with the same name
-    /// (case-insensitive), or appends it if missing.
+    /// (case-insensitive), or appends it if missing. Other lines keep their bytes.
     pub fn set_header(self, name: &str, value: &str) -> Self {
         let (head, body) = self.split();
-        let head = String::from_utf8_lossy(head).into_owned();
-        let mut lines: Vec<&str> = head.trim_end_matches("\r\n").split("\r\n").collect();
         let new_line = format!("{name}: {value}");
+        let mut lines: Vec<&[u8]> = Vec::new();
         let mut replaced = false;
-        let mut i = 1;
-        while i < lines.len() {
-            let is_match = lines[i].split_once(':').map(|(k, _)| k.trim().eq_ignore_ascii_case(name)).unwrap_or(false);
-            if is_match {
-                if replaced {
-                    lines.remove(i);
-                    continue;
+        for (i, line) in head_lines(head).into_iter().enumerate() {
+            if i > 0 && is_header(line, name) {
+                if !replaced {
+                    lines.push(new_line.as_bytes());
+                    replaced = true;
                 }
-                lines[i] = &new_line;
-                replaced = true;
+            } else {
+                lines.push(line);
             }
-            i += 1;
         }
         if !replaced {
-            lines.push(&new_line);
+            lines.push(new_line.as_bytes());
         }
-        let mut out = lines.join("\r\n").into_bytes();
-        out.extend_from_slice(b"\r\n\r\n");
-        out.extend_from_slice(body);
-        Self { bytes: out }
+        Self { bytes: join_head(&lines, body) }
     }
 
     pub fn remove_header(self, name: &str) -> Self {
         let (head, body) = self.split();
-        let head = String::from_utf8_lossy(head).into_owned();
-        let lines: Vec<&str> = head
-            .trim_end_matches("\r\n")
-            .split("\r\n")
+        let lines: Vec<&[u8]> = head_lines(head)
+            .into_iter()
             .enumerate()
-            .filter(|(i, l)| {
-                *i == 0 || !l.split_once(':').map(|(k, _)| k.trim().eq_ignore_ascii_case(name)).unwrap_or(false)
-            })
+            .filter(|(i, l)| *i == 0 || !is_header(l, name))
             .map(|(_, l)| l)
             .collect();
-        let mut out = lines.join("\r\n").into_bytes();
-        out.extend_from_slice(b"\r\n\r\n");
-        out.extend_from_slice(body);
-        Self { bytes: out }
+        Self { bytes: join_head(&lines, body) }
     }
 
     /// Rewrites `Content-Length` to the actual body length, like other proxy tools'
@@ -240,9 +226,47 @@ fn parse_request_head(head: &[u8]) -> Result<RequestHead> {
     Ok(RequestHead { method: method.to_string(), target: target.to_string(), version: version.to_string(), headers })
 }
 
+/// The lines of a request head, without the blank line that ends it.
+fn head_lines(head: &[u8]) -> Vec<&[u8]> {
+    let mut h = head;
+    while let Some(rest) = h.strip_suffix(b"\r\n") {
+        h = rest;
+    }
+    let mut lines = Vec::new();
+    while let Some(i) = h.windows(2).position(|w| w == b"\r\n") {
+        lines.push(&h[..i]);
+        h = &h[i + 2..];
+    }
+    lines.push(h);
+    lines
+}
+
+/// Whether a head line is the header `name` (case-insensitive).
+fn is_header(line: &[u8], name: &str) -> bool {
+    line.iter().position(|&b| b == b':').is_some_and(|i| line[..i].trim_ascii().eq_ignore_ascii_case(name.as_bytes()))
+}
+
+fn join_head(lines: &[&[u8]], body: &[u8]) -> Vec<u8> {
+    let mut out = lines.join(&b"\r\n"[..]);
+    out.extend_from_slice(b"\r\n\r\n");
+    out.extend_from_slice(body);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_edits_keep_other_bytes() {
+        let req = RawRequest::from_bytes(
+            b"POST / HTTP/1.1\r\nX-T: X\xffY\r\ncontent-length: 1\r\nContent-Length: 9\r\n\r\nabc".to_vec(),
+        );
+        let out = req.update_content_length().into_bytes();
+        assert_eq!(out, b"POST / HTTP/1.1\r\nX-T: X\xffY\r\nContent-Length: 3\r\n\r\nabc");
+        let out = RawRequest::from_bytes(out).remove_header("x-t").into_bytes();
+        assert_eq!(out, b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc");
+    }
 
     #[test]
     fn normalizes_lf_and_updates_length() {

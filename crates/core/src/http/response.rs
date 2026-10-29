@@ -35,7 +35,14 @@ pub fn parse_response_head(raw: &[u8]) -> Result<ResponseHead> {
     };
     let mut headers = [httparse::EMPTY_HEADER; 256];
     let mut resp = httparse::Response::new(&mut headers);
-    match resp.parse(head) {
+    // Read what browsers and curl read (RFC 9112 5.2: a folded line is part of the value):
+    // `Name : value`, folded lines, and header lines that aren't valid are skipped.
+    let lenient = httparse::ParserConfig::default()
+        .allow_obsolete_multiline_headers_in_responses(true)
+        .allow_spaces_after_header_name_in_responses(true)
+        .ignore_invalid_headers_in_responses(true)
+        .clone();
+    match lenient.parse_response(&mut resp, head) {
         Ok(httparse::Status::Complete(_)) => {}
         // Partial leaves `headers` at its full length of empty slots, so it must not pass.
         Ok(httparse::Status::Partial) => return Err(Error::Protocol("incomplete response head".into())),
@@ -48,7 +55,13 @@ pub fn parse_response_head(raw: &[u8]) -> Result<ResponseHead> {
         headers: resp
             .headers
             .iter()
-            .map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).into_owned()))
+            .map(|h| {
+                let value = String::from_utf8_lossy(h.value);
+                // A folded value's line breaks become spaces.
+                let value =
+                    if value.contains(['\r', '\n']) { value.replace(['\r', '\n'], " ") } else { value.into_owned() };
+                (h.name.to_string(), value)
+            })
             .collect(),
     })
 }
@@ -91,6 +104,20 @@ pub fn dechunk(body: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn odd_header_lines_are_read_not_rejected() {
+        let h = parse_response_head(
+            b"HTTP/1.1 200 OK\r\nX-A: 1\r\n  folded\r\nServer : x\r\nX-Bad: a\x01b\r\nContent-Length: 2\r\n\r\nok",
+        )
+        .unwrap();
+        assert_eq!(
+            h.header("x-a").map(|v| v.split_whitespace().collect::<Vec<_>>().join(" ")),
+            Some("1 folded".into())
+        );
+        assert_eq!(h.header("server"), Some("x"));
+        assert_eq!(h.header("content-length"), Some("2"));
+    }
 
     #[tokio::test]
     async fn reads_content_length() {

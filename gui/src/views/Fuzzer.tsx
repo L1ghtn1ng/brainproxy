@@ -3,10 +3,11 @@
 // `fuzz status` / `fuzz results`, and each result's exchange is read with `history show`.
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, textBytes, withScheme, type HistoryEntry } from "../api";
+import { bodyText, historyRequest, isBinary, MAX_BODY, rawResponse, run, withScheme, type HistoryEntry } from "../api";
 import { originOf, useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
-import { HttpView, normalize } from "../ui/HttpView";
+import { HttpView } from "../ui/HttpView";
+import { markable, normalizeHead, splitRaw, templateBytes, withBody } from "../ui/message";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
@@ -97,14 +98,15 @@ function guessTarget(raw: string): string {
 }
 
 /** Marks query and body parameter values (form, JSON) as positions. */
-export function autoMark(raw: string): string {
-  const text = normalize(raw).split(M).join("");
-  const i = text.indexOf("\n\n");
-  const head = i < 0 ? text : text.slice(0, i);
-  let body = i < 0 ? "" : text.slice(i + 2);
+export function autoMark(raw: string, binary = false): string {
+  // The body keeps its line endings (a multipart body needs its CRLF). In a binary body
+  // "§" is the byte 0xA7, not a marker, and nothing there is marked.
+  const { head: h, sep, body: b } = splitRaw(normalizeHead(raw));
+  const head = h.split(M).join("");
+  let body = binary ? b : b.split(M).join("");
   const nl = head.indexOf("\n");
   const line = (nl < 0 ? head : head.slice(0, nl)).replace(/([?&][^=&#\s]+=)([^&#\s]*)/g, `$1${M}$2${M}`);
-  const t = body.trim();
+  const t = binary ? "" : body.trim();
   if (/^[[{]/.test(t)) {
     body = body.replace(/("(?:[^"\\]|\\.)*"\s*:\s*)(?:"((?:[^"\\]|\\.)*)"|(-?\d[\d.eE+-]*|true|false|null))/g, (_m, key, str, lit) =>
       str !== undefined ? `${key}"${M}${str}${M}"` : `${key}${M}${lit}${M}`,
@@ -112,7 +114,7 @@ export function autoMark(raw: string): string {
   } else if (/^[^=&\s]+=[^&\s]*(&[^=&\s]+=[^&\s]*)*$/.test(t)) {
     body = body.replace(/(^|&)([^=&\s]+=)([^&\s]*)/g, `$1$2${M}$3${M}`);
   }
-  return line + (nl < 0 ? "" : head.slice(nl)) + (i < 0 ? "" : "\n\n" + body);
+  return line + (nl < 0 ? "" : head.slice(nl)) + (sep ? "\n\n" + body : "");
 }
 
 /** Fills an empty Host header (as in the blank template) from the target scheme://host[:port]. */
@@ -196,13 +198,13 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
   useEffect(() => {
     const h = app.fuzzerInput;
     if (!h) return;
-    setRaw(autoMark(h.raw));
+    setRaw(autoMark(h.raw, !!h.binary));
     setBinary(!!h.binary);
     setTarget(h.target);
     onShow();
   }, [app.fuzzerInput]); // onShow only switches the sub-tab
 
-  const positions = positionCount(raw);
+  const positions = positionCount(markable(raw, binary));
   const needed = mode === "pitchfork" || mode === "cluster-bomb" ? Math.max(1, positions) : 1;
   // Keep one payload set per needed slot; extra sets are kept hidden in case the mode flips back.
   useEffect(() => {
@@ -247,7 +249,7 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
     args.push(`--store=${opts.store}`, "-");
     setBusy(true);
     try {
-      const d = await run<{ run: RunInfo }>(args, textBytes(fillHost(raw, to), binary));
+      const d = await run<{ run: RunInfo }>(args, templateBytes(fillHost(raw, to), binary));
       onStarted(d.run.id);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -289,7 +291,7 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
         <button className="btn" onClick={() => setRaw(raw.split(M).join(""))}>
           Clear §
         </button>
-        <button className="btn" onClick={() => setRaw(autoMark(raw))} title="Mark every query and body parameter value">
+        <button className="btn" onClick={() => setRaw(autoMark(raw, binary))} title="Mark every query and body parameter value">
           Auto §
         </button>
         <span className="sep" />
@@ -317,7 +319,7 @@ function Attack({ onStarted, onShow }: { onStarted: (id: number) => void; onShow
               className="code editor"
               spellCheck={false}
               value={raw}
-              onChange={(e) => setRaw(normalize(e.target.value))}
+              onChange={(e) => setRaw(withBody(e.target.value, raw))}
               onScroll={(e) => {
                 if (back.current) back.current.scrollTop = e.currentTarget.scrollTop;
               }}

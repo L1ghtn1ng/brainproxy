@@ -337,7 +337,22 @@ impl Store {
         }
         owner_only(path);
         let conn = Connection::open(path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Switching a new file to WAL needs the other connections out of the way, and
+        // SQLite says "locked" at once there (no busy wait, which could deadlock): retry.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match conn.pragma_update(None, "journal_mode", "WAL") {
+                Ok(()) => break,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         let store = Self::init(conn)?;
         store.migrate()?;
@@ -379,12 +394,23 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
-        let version: i64 = self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > SCHEMA_VERSION {
-            return Err(Error::InvalidInput(format!(
-                "project schema v{version} is newer than this build supports (v{SCHEMA_VERSION})"
-            )));
+        let schema_version = || -> Result<i64> {
+            let version: i64 = self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            if version > SCHEMA_VERSION {
+                return Err(Error::InvalidInput(format!(
+                    "project schema v{version} is newer than this build supports (v{SCHEMA_VERSION})"
+                )));
+            }
+            Ok(version)
+        };
+        if schema_version()? == SCHEMA_VERSION {
+            return Ok(());
         }
+        // One process migrates. Another opening the project at the same time waits for the
+        // write lock (IMMEDIATE takes it under the busy timeout), then finds it done: some
+        // steps (ALTER TABLE) can't run twice.
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        let version = schema_version()?;
         if version < 1 {
             self.conn.execute_batch(SCHEMA)?;
         }
@@ -418,6 +444,7 @@ impl Store {
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1092,6 +1119,32 @@ mod tests {
             duration_ms: 7,
         };
         store.record_exchange("send", &ex).unwrap()
+    }
+
+    #[test]
+    fn a_new_project_opened_by_many_at_once_is_migrated_once() {
+        // Each step ran unlocked: two openers both ran `ALTER TABLE ... ADD COLUMN`
+        // ("duplicate column name"), or the WAL switch failed at once ("database is locked").
+        let dir = std::env::temp_dir().join(format!("bp-store-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        let _ = std::fs::remove_file(&path);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let opens: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&path).map(|_| ()).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for o in opens {
+            o.join().unwrap().unwrap();
+        }
+        let version: i64 =
+            Connection::open(&path).unwrap().pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

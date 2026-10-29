@@ -98,8 +98,12 @@ pub(super) const JAVA_B64: GeneralPurpose = GeneralPurpose::new(
         .with_decode_allow_trailing_bits(true),
 );
 
-/// ZAP's base64Decode: on a dangling last character, retries without it.
+/// ZAP's base64Decode: on a dangling last character, retries without it. Base64 is ASCII,
+/// so other text can't decode (and isn't cut inside a character).
 fn decode(value: &str) -> Option<String> {
+    if !value.is_ascii() {
+        return None;
+    }
     let bytes = JAVA_B64
         .decode(value)
         .ok()
@@ -242,6 +246,12 @@ mod tests {
                <input name="__VIEWSTATE1" value="{b}">"#
         ));
         assert_eq!(refs(&f), ["10032-3", "10032-6"]);
+    }
+
+    #[test]
+    fn non_ascii_viewstate_is_not_cut_inside_a_character() {
+        // 5 bytes, so the retry drops the last byte: that is inside the "é".
+        assert!(page(r#"<input type="hidden" name="__VIEWSTATE" value="/wAé">"#).is_empty());
     }
 
     #[test]

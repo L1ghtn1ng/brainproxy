@@ -273,6 +273,45 @@ fn background_start_errors_are_the_childs_own() {
     assert_eq!(msg.matches("invalid input:").count(), 1, "{msg}");
 }
 
+#[test]
+fn background_jobs_keep_job_id_before_a_separator() {
+    // MCP writes `--` before positionals; the child's --job-id must not land after it.
+    let port = serve_site();
+    let project = tmp_project("bgsep");
+    let site = format!("http://127.0.0.1:{port}/");
+    let (code, v) = run(&["crawl", "--background", "--no-robots", "--no-sitemap", "--", &site], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let id = v["data"]["job"].as_i64().unwrap().to_string();
+    let (_, v) = run(&["job", "wait", &id, "--timeout", "30"], &project, None);
+    assert_eq!(v["data"]["state"], "completed", "{v}");
+}
+
+#[test]
+fn queued_jobs_are_reaped_and_keep_a_stop_request() {
+    use brainproxy_core::store::Store;
+    let project = tmp_project("queued");
+    let store = Store::open(&project).unwrap();
+    // A child that died before it marked the job running: failed, with the error from its log.
+    let id = store.job_create("active-scan", "queued", &[]).unwrap();
+    let mut gone = bin().arg("--version").stdout(Stdio::null()).spawn().unwrap();
+    gone.wait().unwrap();
+    store.job_set_pid(id, gone.id()).unwrap();
+    let log = std::fs::canonicalize(&project).unwrap().with_extension(format!("job-{id}.log"));
+    std::fs::write(&log, "{\"ok\":false,\"error\":{\"kind\":\"timeout\",\"message\":\"timed out: login\"}}\n").unwrap();
+    let (_, v) = run(&["job", "status", &id.to_string()], &project, None);
+    assert_eq!(v["data"]["state"], "failed", "{v}");
+    assert_eq!(v["data"]["error"], "timed out: login", "{v}");
+    // A stop requested while queued isn't overwritten when the job's process starts.
+    let id = store.job_create("active-scan", "queued", &[]).unwrap();
+    let (_, v) = run(&["job", "stop", &id.to_string()], &project, None);
+    assert_eq!(v["data"]["state"], "stopping", "{v}");
+    assert!(!store.job_start(id, std::process::id()).unwrap());
+    assert_eq!(store.job_state(id).unwrap(), "stopping");
+    let id = store.job_create("active-scan", "queued", &[]).unwrap();
+    assert!(store.job_start(id, std::process::id()).unwrap());
+    assert_eq!(store.job_state(id).unwrap(), "running");
+}
+
 /// A two-page site: `/` links to `/item?id=1`. Serves until the test process ends.
 fn serve_site() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -304,6 +343,59 @@ fn serve_site() -> u16 {
         }
     });
     port
+}
+
+/// `/allowed/` answers with a 103 Early Hints, then a page linking `/allowed/next`;
+/// everything else is a plain page. Records the request lines.
+fn serve_early_hints() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let log = log.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 16384];
+                let mut len = 0;
+                while !buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf[len..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => len += n,
+                    }
+                }
+                let line = String::from_utf8_lossy(&buf[..len]).lines().next().unwrap_or("").to_string();
+                log.lock().unwrap().push(line.clone());
+                let body = if line.starts_with("GET /allowed/ ") { "<a href=\"/allowed/next\">next</a>" } else { "ok" };
+                let hints = if line.starts_with("GET /allowed/ ") {
+                    "HTTP/1.1 103 Early Hints\r\nLink: </x.css>; rel=preload\r\n\r\n"
+                } else {
+                    ""
+                };
+                let resp = format!(
+                    "{hints}HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn crawl_filters_its_first_requests_and_reads_past_early_hints() {
+    let (port, seen) = serve_early_hints();
+    let project = tmp_project("crawlfilters");
+    let site = format!("http://127.0.0.1:{port}/allowed/");
+    let (code, v) = run(&["crawl", &site, "--path-prefix", "/allowed", "--exclude", "robots|sitemap"], &project, None);
+    assert_eq!(code, 0, "{v}");
+    let seen = seen.lock().unwrap().clone();
+    assert!(!seen.iter().any(|l| l.contains("robots.txt") || l.contains("sitemap.xml")), "{seen:?}");
+    // The page after the 103 is the one read: its link is followed.
+    assert!(seen.iter().any(|l| l.starts_with("GET /allowed/next ")), "{seen:?}");
+    assert_eq!(v["data"]["by_status"]["200"], 2, "{v}");
 }
 
 /// Like the Supportdesk lab: `/` links to `/login` (sets a device cookie) and to

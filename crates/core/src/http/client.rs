@@ -60,6 +60,9 @@ pub struct Exchange {
 /// Idle connections kept per target, and how long one may sit unused.
 const POOL_PER_TARGET: usize = 64;
 const POOL_IDLE: Duration = Duration::from_secs(30);
+/// Longest idle time of a pooled connection a request that must not be repeated may use:
+/// such a request isn't retried, and servers often close idle connections after 5 s.
+const POOL_IDLE_UNSAFE: Duration = Duration::from_secs(2);
 
 /// An open connection with the reader that holds its unread bytes.
 pub struct Conn {
@@ -129,14 +132,16 @@ impl Client {
         self.pool.opened.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// An idle pooled connection to `target`, or a new one from [`Client::connect`].
-    pub async fn checkout(&self, target: &Target) -> Result<Conn> {
+    /// A pooled connection to `target` idle for less than `max_idle`, or a new one from
+    /// [`Client::connect`].
+    pub async fn checkout(&self, target: &Target, max_idle: Duration) -> Result<Conn> {
         let key = pool_key(target);
         let pooled = {
             let mut idle = self.pool.idle.lock().unwrap();
             let list = idle.entry(key).or_default();
             list.retain(|(_, at)| at.elapsed() < POOL_IDLE);
-            list.pop()
+            // The last one is the most recently used.
+            list.pop_if(|(_, at)| at.elapsed() < max_idle)
         };
         if let Some((stream, _)) = pooled {
             return Ok(Conn { stream, reader: WireReader::new(), reused: true });
@@ -203,12 +208,16 @@ impl Client {
 
     /// Writes `bytes` on a pooled connection when there is one and reads one
     /// response. A reused connection that fails before any response arrives
-    /// was most likely closed by the server while idle, so the request is
-    /// retried once on a new connection. The caller decides whether to
+    /// was most likely closed by the server while idle, so a request that is safe to
+    /// repeat (RFC 9110 9.2.2) is retried once on a new connection. Others (a POST may
+    /// have been processed before the connection dropped) are not, and only take a
+    /// connection that was idle briefly. The caller decides whether to
     /// [`Client::checkin`] the connection afterwards.
     pub async fn exchange(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Conn, Vec<u8>)> {
         let bytes = &*self.fill_auth(bytes, target)?;
-        let mut c = self.checkout(target).await?;
+        let repeatable =
+            ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"].iter().any(|m| method.eq_ignore_ascii_case(m));
+        let mut c = self.checkout(target, if repeatable { POOL_IDLE } else { POOL_IDLE_UNSAFE }).await?;
         loop {
             let result = async {
                 c.stream.write_all(bytes).await?;
@@ -218,7 +227,7 @@ impl Client {
             .await;
             match result {
                 Ok(response) => return Ok((c, response)),
-                Err(e) if c.reused && c.reader.is_empty() && stale(&e) => {
+                Err(e) if repeatable && c.reused && c.reader.is_empty() && stale(&e) => {
                     c = Conn { stream: self.connect(target).await?, reader: WireReader::new(), reused: false };
                 }
                 Err(e) => return Err(e),
@@ -350,15 +359,64 @@ pub fn close_after(request: &[u8], response: &[u8], method: &str) -> bool {
         .head()
         .map(|h| h.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")))
         .unwrap_or(true);
+    // More than one message went out (pipelined or smuggled, or a body longer than its
+    // Content-Length): the server's other answers may still arrive, and the next request
+    // on this connection would read them.
+    if req_close || !one_message(request) {
+        return true;
+    }
     let Ok(h) = parse_response_head(final_response(response)) else { return true };
-    req_close
-        || h.status == 101
+    h.status == 101
         || h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"))
         || (h.version == "HTTP/1.0" && !h.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("keep-alive")))
         || (h.header("content-length").is_none()
             && !h.header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
             && !method.eq_ignore_ascii_case("HEAD")
             && !matches!(h.status, 100..=199 | 204 | 304))
+}
+
+/// Whether `request` is exactly one HTTP/1 message: its body is all its framing says.
+fn one_message(request: &[u8]) -> bool {
+    let (head, body) = crate::http::request::split_head_body(request);
+    if !head.ends_with(b"\r\n\r\n") {
+        return false;
+    }
+    let Ok(h) = RawRequest::from_bytes(head.to_vec()).head() else { return false };
+    let header = |n: &str| h.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.trim());
+    match (header("transfer-encoding"), header("content-length")) {
+        (Some(_), Some(_)) => false,
+        (Some(te), None) => te.to_ascii_lowercase().ends_with("chunked") && chunked_len(body) == Some(body.len()),
+        (None, Some(cl)) => cl.parse::<usize>().is_ok_and(|n| n == body.len()),
+        (None, None) => body.is_empty(),
+    }
+}
+
+/// The length of a complete chunked body (through the last chunk and trailers).
+fn chunked_len(body: &[u8]) -> Option<usize> {
+    let line = |from: usize| body.get(from..)?.windows(2).position(|w| w == b"\r\n").map(|i| from + i);
+    let mut pos = 0;
+    loop {
+        let end = line(pos)?;
+        let size = std::str::from_utf8(&body[pos..end]).ok()?.split(';').next()?.trim();
+        let size = usize::from_str_radix(size, 16).ok()?;
+        pos = end + 2;
+        if size == 0 {
+            // Trailer lines, then the empty line.
+            loop {
+                let end = line(pos)?;
+                let empty = end == pos;
+                pos = end + 2;
+                if empty {
+                    return Some(pos);
+                }
+            }
+        }
+        pos = pos.checked_add(size)?;
+        if body.get(pos..pos + 2)? != b"\r\n" {
+            return None;
+        }
+        pos += 2;
+    }
 }
 
 /// The final response after any interim 1xx responses.
@@ -426,6 +484,18 @@ mod tests {
     use super::*;
     use crate::guard::ScopeSpec;
 
+    #[test]
+    fn connections_that_carried_more_than_one_request_are_not_reused() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let ok = |req: &[u8]| !close_after(req, resp, "GET");
+        assert!(ok(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"));
+        assert!(ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nab"));
+        assert!(ok(b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n"));
+        assert!(!ok(b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n"));
+        assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nabGET / HTTP/1.1\r\n\r\n"));
+        assert!(!ok(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"));
+    }
+
     /// A keep-alive server; with `drop_idle` it closes each connection after one
     /// response without saying so (as servers do with idle connections).
     async fn server(drop_idle: bool) -> (u16, Arc<AtomicU64>) {
@@ -484,6 +554,53 @@ mod tests {
         let c = client();
         send_n(&c, port, "keep-alive", 4).await;
         assert_eq!(accepted.load(Ordering::Relaxed), 4);
+    }
+
+    /// Answers the first request on each connection, then reads the next and closes
+    /// without answering (as if it processed it and then dropped the connection).
+    /// Counts the requests it read.
+    async fn answer_once_server() -> (u16, Arc<AtomicU64>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let read = Arc::new(AtomicU64::new(0));
+        let count = read.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let count = count.clone();
+                tokio::spawn(async move {
+                    let mut reader = WireReader::new();
+                    for n in 0.. {
+                        let Ok(Some(_)) = reader.read_request(&mut s).await else { return };
+                        count.fetch_add(1, Ordering::Relaxed);
+                        if n > 0 {
+                            return;
+                        }
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                    }
+                });
+            }
+        });
+        (port, read)
+    }
+
+    #[tokio::test]
+    async fn only_requests_safe_to_repeat_are_retried() {
+        let (port, read) = answer_once_server().await;
+        let c = client();
+        let target = Target { scheme: "http".into(), host: "127.0.0.1".into(), port };
+        let send = |raw: &str| {
+            let req = RawRequest::from_bytes(raw.as_bytes().to_vec());
+            let (c, target) = (&c, &target);
+            async move { c.send(&req, target).await }
+        };
+        send("GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
+        // The POST reached the server once on the pooled connection; it isn't sent again.
+        assert!(send("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\n\r\nx").await.is_err());
+        assert_eq!(read.load(Ordering::Relaxed), 2);
+        // A GET in the same spot is retried on a new connection.
+        send("GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
+        send("GET / HTTP/1.1\r\nHost: h\r\n\r\n").await.unwrap();
+        assert_eq!(read.load(Ordering::Relaxed), 5);
     }
 
     #[tokio::test]

@@ -710,3 +710,9 @@ fn body_hex_sends_bytes() {
     };
     assert_eq!((br("8f00807b7d03"), br("0f00807b03")), (b"{}".to_vec(), b"{".to_vec()));
 }
+
+#[test]
+fn a_timeout_that_is_not_a_number_is_invalid() {
+    let t = "id: x\ninfo: {severity: low}\nhttp:\n  - raw:\n      - |\n        @timeout: nan\n        GET / HTTP/1.1\n        Host: {{Hostname}}\n    matchers:\n      - type: status\n        status: [200]\n";
+    assert!(invalid_reason(t).contains("@timeout"), "{}", invalid_reason(t));
+}

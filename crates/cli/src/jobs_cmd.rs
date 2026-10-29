@@ -54,14 +54,14 @@ pub fn job(project: &Path, cmd: JobCmd, out: &Out) -> Result<(), Error> {
             });
         }
         JobCmd::Status { id } => {
-            reap(&store, id)?;
+            reap(project, &store, id)?;
             let j = store.job_get(id)?;
             out.ok(j.clone(), || text(&j));
         }
         JobCmd::Wait { id, timeout } => {
             let deadline = Instant::now() + Duration::from_secs_f64(timeout.max(0.0));
             loop {
-                reap(&store, id)?;
+                reap(project, &store, id)?;
                 let state = store.job_state(id)?;
                 if is_finished(&state) || Instant::now() >= deadline {
                     break;
@@ -95,17 +95,38 @@ fn text(j: &Value) -> String {
     )
 }
 
-/// Marks a job whose process died as failed.
-fn reap(store: &Store, id: i64) -> Result<(), Error> {
+/// Marks a job whose process died as failed. One that died while still queued (before
+/// it marked itself running) failed setting up: its error is the last one in its log.
+fn reap(project: &Path, store: &Store, id: i64) -> Result<(), Error> {
     let j = store.job_get(id)?;
-    if matches!(j["state"].as_str(), Some("running" | "stopping")) {
-        if let Some(pid) = j["pid"].as_u64() {
-            if !crate::process::alive(pid as u32) {
-                store.job_set_state(id, "failed", None, Some("job process exited unexpectedly"), true)?;
-            }
-        }
+    let state = j["state"].as_str().unwrap_or("");
+    if !matches!(state, "queued" | "running" | "stopping") {
+        return Ok(());
     }
+    let Some(pid) = j["pid"].as_u64() else { return Ok(()) };
+    if crate::process::alive(pid as u32) {
+        return Ok(());
+    }
+    let logged = || {
+        let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+        let log = std::fs::read_to_string(project.with_extension(format!("job-{id}.log"))).ok()?;
+        logged_error(&log).map(|(_, message)| message)
+    };
+    let error = match state {
+        "queued" => logged().unwrap_or_else(|| "job process exited before it started".into()),
+        _ => "job process exited unexpectedly".into(),
+    };
+    store.job_set_state(id, "failed", None, Some(&error), true)?;
     Ok(())
+}
+
+/// The kind and message of the last error envelope in a child's log.
+fn logged_error(log: &str) -> Option<(String, String)> {
+    log.lines().rev().find_map(|l| {
+        let v: Value = serde_json::from_str(l).ok()?;
+        let e = v.get("error")?;
+        Some((e["kind"].as_str()?.to_string(), e["message"].as_str()?.to_string()))
+    })
 }
 
 /// Re-runs the current command detached (without --background, with --job-id)
@@ -113,12 +134,7 @@ fn reap(store: &Store, id: i64) -> Result<(), Error> {
 /// The error for a background child that exited before it started: the child's own error
 /// envelope (last JSON line of its log) with its kind and message, or the raw log text.
 pub fn child_failure(what: &str, status: std::process::ExitStatus, log: &str) -> Error {
-    let envelope = log.lines().rev().find_map(|l| {
-        let v: Value = serde_json::from_str(l).ok()?;
-        let e = v.get("error")?;
-        Some((e["kind"].as_str()?.to_string(), e["message"].as_str()?.to_string()))
-    });
-    let Some((kind, message)) = envelope else {
+    let Some((kind, message)) = logged_error(log) else {
         return Error::InvalidInput(format!("{what} exited ({status}): {}", log.trim()));
     };
     // The message is the child's Display text; drop its "<kind>: " prefix before re-wrapping.
@@ -138,15 +154,18 @@ pub fn spawn_background(kind: &str, project: &Path, home: &Path, out: &Out) -> R
     let store = Store::open(project)?;
     let argv = child_args();
     let id = store.job_create(kind, "queued", &argv)?;
+    let child_argv = with_options(argv, ["--job-id".into(), id.to_string()]);
     let project = std::fs::canonicalize(project)?;
     let log = project.with_extension(format!("job-{id}.log"));
     let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&argv);
-    cmd.arg("--job-id").arg(id.to_string());
+    cmd.arg("--project").arg(&project).arg("--home").arg(home).args(["--format", "json"]).args(&child_argv);
     crate::process::detach(&mut cmd);
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
+    // Set up work (loading checks, logging in) can outlast the wait below; with the pid
+    // recorded, a child that then fails before starting the job is reaped as failed.
+    store.job_set_pid(id, child.id())?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while store.job_state(id)? == "queued" && Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
@@ -165,6 +184,13 @@ pub fn spawn_background(kind: &str, project: &Path, home: &Path, out: &Out) -> R
     });
     out.ok(data, || format!("{kind} running in the background as job {id}"));
     Ok(())
+}
+
+/// `argv` with `options` added before a `--` separator, where they are still options.
+pub fn with_options(mut argv: Vec<String>, options: impl IntoIterator<Item = String>) -> Vec<String> {
+    let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    argv.splice(at..at, options);
+    argv
 }
 
 /// This process's arguments minus `--background` and the global options the
@@ -197,10 +223,13 @@ pub fn run_job(
     body: impl FnOnce(JobControl) -> Result<Value, Error>,
 ) -> Result<Value, Error> {
     let store = Store::open(project)?;
-    if let Some(id) = job_id {
-        store.job_set_state(id, "running", Some(std::process::id()), None, false)?;
-    }
     let ctl = JobControl::default();
+    if let Some(id) = job_id {
+        // A stop requested while the job was queued stands: the job starts stopped.
+        if !store.job_start(id, std::process::id())? && store.job_state(id)? == "stopping" {
+            ctl.request_stop();
+        }
+    }
     let watcher = ctl.watch(project, job_id);
     let result = body(ctl.clone());
     drop(watcher);
