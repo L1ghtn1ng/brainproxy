@@ -132,6 +132,12 @@ fn browser_crawl_finds_api_calls_made_by_javascript() {
         run(&["browser", "list"], &dir.join("p.bpdb"))
     };
     assert_eq!(code, 0, "{list}");
+    if list["data"]["browser_crawl"] != true {
+        eprintln!(
+            "SKIPPED browser_crawl_finds_api_calls_made_by_javascript: the browser crawl doesn't run on this platform"
+        );
+        return;
+    }
     let chromium = list["data"]["browsers"].as_array().into_iter().flatten().any(|b| b["kind"] == "chromium");
     if !chromium {
         eprintln!(
