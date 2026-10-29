@@ -353,16 +353,17 @@ impl Vault {
         }
     }
 
-    /// Registers a password, encoded for each login body type, for the login origin only.
+    /// Registers a password, encoded for each login body type, for the login origin (and
+    /// the origins of macro steps that use it, which stay allowed).
     pub(crate) fn put_password(&self, p: &AuthProfile, password: &str) {
         let origin = p.login_url.as_deref().and_then(|u| Target::from_url(u).ok()).map(|t| t.origin());
         for enc in [Enc::Raw, Enc::Form, Enc::Json] {
-            self.put(
-                placeholder(&p.name, enc.password_kind()),
-                &encode(password, enc),
-                None,
-                origin.iter().cloned().collect(),
-            );
+            let ph = placeholder(&p.name, enc.password_kind());
+            let mut origins: Vec<String> = origin.iter().cloned().collect();
+            if let Some(old) = self.0.lock().unwrap().entries.get(&ph) {
+                origins.extend(old.origins.iter().filter(|o| Some(*o) != origin.as_ref()).cloned());
+            }
+            self.put(ph, &encode(password, enc), None, origins);
         }
     }
 

@@ -310,7 +310,8 @@ byte, side by side or unified.
     runs a macro on every request, every N requests, or once and again only when its values
     go stale. *Update request* puts macro values into the request: every query, form, JSON
     or multipart parameter, header or cookie with the variable's name (or the names you map,
-    such as `X-CSRF-Token=csrf`); a parameter being fuzzed or attacked keeps its payload.
+    such as `X-CSRF-Token=csrf`; an `Authorization` header keeps its scheme, as in
+    `Bearer …`); a parameter being fuzzed or attacked keeps its payload.
     *Log in* logs in with the profile when the session isn't logged in or a check just
     failed. A response that looks logged out, or matches the rule's *stale-values* regex
     (for example `invalid csrf token`), refreshes the rule's macros (once, however many

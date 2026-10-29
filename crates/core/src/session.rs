@@ -29,7 +29,7 @@ use serde_json::Value;
 use crate::auth::{encode, placeholder, request_cookies, response_text, AuthProfile, AuthSession, Enc};
 use crate::capture::decode_body;
 use crate::error::{Error, Result};
-use crate::http::request::split_head_body;
+use crate::http::request::{find, split_head_body};
 use crate::http::{parse_response_head, RawRequest, Target};
 use crate::scan::active::points::{inject, points, PointKind, PointOptions};
 use crate::scan::message::SetCookie;
@@ -564,19 +564,31 @@ impl AuthSession {
                 let tool_ok = rule.tools.is_empty() || rule.tools.contains(&tool);
                 if tool_ok && c.url.as_ref().is_none_or(|u| u.matches(target, &url)) {
                     rules.push(i);
-                    request = self.run_rule(i, target, request, keep_params, generation, macro_generation).await;
+                    request = self
+                        .run_rule(i, target, request, keep_params, keep_cookies, generation, macro_generation)
+                        .await;
                 }
             }
         }
         // The session goes on last, so it has the cookies the rules' macros just got. A
-        // cookie a rule set from a macro value keeps it.
+        // cookie or header a rule set from a macro value keeps it.
         let mark = placeholder(&self.profile.name, "var:");
         let mark = mark.trim_end_matches('»');
         let set: Vec<String> =
             request_cookies(&request).into_iter().filter(|(_, v)| v.contains(mark)).map(|(k, _)| k).collect();
+        let headers: Vec<(String, String)> = RawRequest::from_bytes(request.clone())
+            .head()
+            .map(|h| h.headers)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(k, v)| !k.eq_ignore_ascii_case("cookie") && v.contains(mark))
+            .collect();
         let mut keep: Vec<&str> = keep_cookies.to_vec();
         keep.extend(set.iter().map(String::as_str));
-        let request = self.apply(&request, &keep);
+        let mut request = self.apply(&request, &keep);
+        for (k, v) in &headers {
+            request = RawRequest::from_bytes(request).set_header(k, v).into_bytes();
+        }
         Prepared { request, generation, macro_generation, rules }
     }
 
@@ -610,12 +622,14 @@ impl AuthSession {
         let _ = self.handling.generation.compare_exchange(seen, seen + 1, Ordering::SeqCst, Ordering::SeqCst);
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_rule(
         &self,
         i: usize,
         target: &Target,
         mut request: Vec<u8>,
         keep_params: &[&str],
+        keep_cookies: &[&str],
         generation: u64,
         macro_generation: u64,
     ) -> Vec<u8> {
@@ -660,7 +674,7 @@ impl AuthSession {
                     }
                 }
                 Action::Update { params } => {
-                    request = self.update_request(&request, target, params, &local, keep_params);
+                    request = self.update_request(&request, target, params, &local, keep_params, keep_cookies);
                 }
                 Action::Login => {
                     if check_failed || !self.state.lock().unwrap().logged_in {
@@ -755,7 +769,7 @@ impl AuthSession {
             // Parameters named like an earlier step's variable get its value too.
             let derived: Vec<(String, String)> = found.iter().map(|v| (v.clone(), v.clone())).collect();
             let runs: HashMap<String, u64> = found.iter().map(|v| (v.clone(), run)).collect();
-            raw = self.update_request(&raw, &target, &derived, &runs, &[]);
+            raw = self.update_request(&raw, &target, &derived, &runs, &[], &[]);
             let head = RawRequest::from_bytes(raw.clone()).head().ok();
             let mut sr = StepRun {
                 step: i + 1,
@@ -807,14 +821,16 @@ impl AuthSession {
     }
 
     /// The request with each mapped parameter, header or cookie set to its variable's
-    /// placeholder (from `runs`, else the session's latest value). Names in `keep` stay.
+    /// placeholder (from `runs`, else the session's latest value). Parameters and headers
+    /// named in `keep_params`, and cookies in `keep_cookies`, stay as they are.
     fn update_request(
         &self,
         raw: &[u8],
         target: &Target,
         params: &[(String, String)],
         runs: &HashMap<String, u64>,
-        keep: &[&str],
+        keep_params: &[&str],
+        keep_cookies: &[&str],
     ) -> Vec<u8> {
         let latest: HashMap<String, u64> =
             self.state.lock().unwrap().vars.iter().map(|v| (v.name.clone(), v.run)).collect();
@@ -830,12 +846,13 @@ impl AuthSession {
         let origin = target.origin();
         let mut out = raw.to_vec();
         for (param, var) in mapping {
-            if keep.iter().any(|k| k == &param) {
+            if keep_params.iter().any(|k| k == &param) {
                 continue;
             }
+            let cookies = !keep_cookies.iter().any(|k| k == &param);
             let Some(run) = runs.get(&var).or_else(|| latest.get(&var)).copied() else { continue };
             let ph = |enc| placeholder(&self.profile.name, &var_kind(&var, Some(run), enc));
-            let updated = set_param(&out, &param, ph);
+            let updated = set_param(&out, &param, cookies, ph);
             if updated != out {
                 out = updated;
                 // The value may go where the rule puts it.
@@ -912,9 +929,9 @@ fn fill_vars(tpl: &str, value: impl Fn(&str, Enc) -> Option<String>) -> String {
 
 /// The request with every query, form, JSON (by last key) and multipart parameter,
 /// header and cookie named `name` set to the placeholder for its context.
-fn set_param(raw: &[u8], name: &str, ph: impl Fn(Enc) -> String) -> Vec<u8> {
+fn set_param(raw: &[u8], name: &str, cookies: bool, ph: impl Fn(Enc) -> String) -> Vec<u8> {
     let mut out = raw.to_vec();
-    let opts = PointOptions { cookies: true, ..Default::default() };
+    let opts = PointOptions { cookies, ..Default::default() };
     // Values change, not positions; re-read the points after each change all the same.
     let mut done = 0;
     loop {
@@ -937,52 +954,78 @@ fn set_param(raw: &[u8], name: &str, ph: impl Fn(Enc) -> String) -> Vec<u8> {
     out = set_multipart(&out, name, &ph(Enc::Raw));
     let req = RawRequest::from_bytes(out);
     let reserved = ["host", "content-length", "transfer-encoding", "cookie", "connection"];
-    let has_header = req.head().is_ok_and(|h| h.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)));
-    if has_header && !reserved.iter().any(|r| r.eq_ignore_ascii_case(name)) {
-        return req.set_header(name, &ph(Enc::Raw)).into_bytes();
+    let old = req.head().ok().and_then(|h| h.headers.into_iter().find(|(k, _)| k.eq_ignore_ascii_case(name)));
+    match old {
+        Some((_, old)) if !reserved.iter().any(|r| r.eq_ignore_ascii_case(name)) => {
+            // An Authorization header keeps its scheme ("Bearer VALUE").
+            let value = match old.trim().split_once(' ') {
+                Some((scheme, _)) if name.eq_ignore_ascii_case("authorization") => format!("{scheme} {}", ph(Enc::Raw)),
+                _ => ph(Enc::Raw),
+            };
+            req.set_header(name, &value).into_bytes()
+        }
+        _ => req.into_bytes(),
     }
-    req.into_bytes()
 }
 
-/// A multipart/form-data body with the (non-file) field `name` set to `value`.
-fn set_multipart(raw: &[u8], name: &str, value: &str) -> Vec<u8> {
-    let req = RawRequest::from_bytes(raw.to_vec());
-    let Some(boundary) = req.head().ok().and_then(|h| {
+/// The non-file fields of a multipart/form-data request: name and the byte range of
+/// its value in `raw`.
+pub(crate) fn multipart_fields(raw: &[u8]) -> Vec<(String, std::ops::Range<usize>)> {
+    let boundary = RawRequest::from_bytes(raw.to_vec()).head().ok().and_then(|h| {
         let ct = h.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-type"))?.1.clone();
         if !ct.to_ascii_lowercase().starts_with("multipart/form-data") {
             return None;
         }
-        let b =
-            ct.split(';').find_map(|p| p.trim().strip_prefix("boundary=").map(|b| b.trim_matches('"').to_string()))?;
-        Some(b)
-    }) else {
-        return raw.to_vec();
-    };
-    let (head, body) = split_head_body(raw);
-    let delim = format!("--{boundary}");
-    let text = String::from_utf8_lossy(body);
-    let wanted = format!("name=\"{name}\"");
-    let mut changed = false;
-    let parts: Vec<String> = text
-        .split(&delim)
-        .map(|part| {
-            let Some(i) = part.find("\r\n\r\n") else { return part.to_string() };
-            let headers = &part[..i];
-            let disposition = headers.lines().find(|l| l.to_ascii_lowercase().starts_with("content-disposition"));
-            let is_field = disposition.is_some_and(|d| d.contains(&wanted) && !d.contains("filename="));
-            if !is_field {
-                return part.to_string();
-            }
-            changed = true;
-            let tail = if part.ends_with("\r\n") { "\r\n" } else { "" };
-            format!("{headers}\r\n\r\n{value}{tail}")
-        })
-        .collect();
-    if !changed {
+        ct.split(';').find_map(|p| p.trim().strip_prefix("boundary=").map(|b| b.trim_matches('"').to_string()))
+    });
+    let Some(boundary) = boundary.filter(|b| !b.is_empty()) else { return vec![] };
+    let body_start = split_head_body(raw).0.len();
+    let delim = format!("--{boundary}").into_bytes();
+    // Where each delimiter starts, in `raw`.
+    let mut marks = Vec::new();
+    let mut at = body_start;
+    while let Some(i) = find(&raw[at..], &delim) {
+        marks.push(at + i);
+        at += i + delim.len();
+    }
+    let mut out = Vec::new();
+    for pair in marks.windows(2) {
+        let (start, end) = (pair[0] + delim.len(), pair[1]);
+        let part = &raw[start..end];
+        let Some(h) = find(part, b"\r\n\r\n") else { continue };
+        let headers = String::from_utf8_lossy(&part[..h]);
+        let Some(disposition) = headers.lines().find(|l| l.to_ascii_lowercase().starts_with("content-disposition"))
+        else {
+            continue;
+        };
+        let params: Vec<(String, String)> = disposition
+            .split(';')
+            .skip(1)
+            .filter_map(|p| p.split_once('='))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().trim_matches('"').to_string()))
+            .collect();
+        if params.iter().any(|(k, _)| k == "filename") {
+            continue;
+        }
+        let Some((_, name)) = params.into_iter().find(|(k, _)| k == "name") else { continue };
+        // The value runs to the CRLF before the next delimiter.
+        let value_end = if part.ends_with(b"\r\n") { end - 2 } else { end };
+        out.push((name, start + h + 4..value_end.max(start + h + 4)));
+    }
+    out
+}
+
+/// A multipart/form-data body with the (non-file) field `name` set to `value`; every
+/// other byte (file parts included) stays as it was.
+fn set_multipart(raw: &[u8], name: &str, value: &str) -> Vec<u8> {
+    let fields: Vec<_> = multipart_fields(raw).into_iter().filter(|(n, _)| n == name).collect();
+    if fields.is_empty() {
         return raw.to_vec();
     }
-    let mut out = head.to_vec();
-    out.extend_from_slice(parts.join(&delim).as_bytes());
+    let mut out = raw.to_vec();
+    for (_, range) in fields.into_iter().rev() {
+        out.splice(range, value.bytes());
+    }
     RawRequest::from_bytes(out).update_content_length().into_bytes()
 }
 
@@ -1114,21 +1157,78 @@ mod tests {
         };
         let form = b"POST /x?csrf=old&a=1 HTTP/1.1\r\nHost: a\r\nCookie: csrf=c; s=1\r\nX-Csrf: h\r\n\
             Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 12\r\n\r\ncsrf=old&b=2";
-        let out = String::from_utf8(set_param(form, "csrf", ph)).unwrap();
+        let out = String::from_utf8(set_param(form, "csrf", true, ph)).unwrap();
         assert!(out.starts_with("POST /x?csrf=F&a=1 HTTP/1.1\r\n"), "{out}");
         assert!(out.contains("Cookie: csrf=R; s=1\r\n") && out.contains("X-Csrf: h\r\n"), "{out}");
         assert!(out.ends_with("Content-Length: 10\r\n\r\ncsrf=F&b=2"), "{out}");
-        let out = String::from_utf8(set_param(form, "X-Csrf", ph)).unwrap();
+        // An attacked cookie keeps its payload; the parameters of that name still update.
+        let out = String::from_utf8(set_param(form, "csrf", false, ph)).unwrap();
+        assert!(out.contains("Cookie: csrf=c; s=1\r\n") && out.contains("?csrf=F&"), "{out}");
+        let out = String::from_utf8(set_param(form, "X-Csrf", true, ph)).unwrap();
         assert!(out.contains("X-Csrf: R\r\n"), "{out}");
+        let auth = b"GET / HTTP/1.1\r\nAuthorization: Bearer old\r\n\r\n";
+        let out = String::from_utf8(set_param(auth, "Authorization", true, ph)).unwrap();
+        assert!(out.contains("Authorization: Bearer R\r\n"), "{out}");
         let json =
             b"POST / HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"meta\":{\"csrf\":\"o\"},\"csrf\":\"p\"}";
-        let out = String::from_utf8(set_param(json, "csrf", ph)).unwrap();
+        let out = String::from_utf8(set_param(json, "csrf", true, ph)).unwrap();
         assert!(out.contains("\"csrf\":\"J\"") && out.contains("{\"csrf\":\"J\"}") && !out.contains("\"o\""), "{out}");
         let mp = b"POST / HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=XX\r\n\r\n--XX\r\n\
             Content-Disposition: form-data; name=\"csrf\"\r\n\r\nold\r\n--XX\r\n\
             Content-Disposition: form-data; name=\"f\"; filename=\"csrf\"\r\n\r\ndata\r\n--XX--\r\n";
-        let out = String::from_utf8(set_param(mp, "csrf", ph)).unwrap();
+        let out = String::from_utf8(set_param(mp, "csrf", true, ph)).unwrap();
         assert!(out.contains("name=\"csrf\"\r\n\r\nR\r\n--XX") && out.contains("\r\n\r\ndata\r\n"), "{out}");
+        // A binary file part stays byte for byte.
+        let mut bin = b"POST / HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=\"XX\"\r\n\r\n--XX\r\n\
+            Content-Disposition: form-data; name=\"f\"; filename=\"a.bin\"\r\n\r\n"
+            .to_vec();
+        bin.extend_from_slice(&[0xff, 0x00, 0xfe, 0xc3]);
+        bin.extend_from_slice(b"\r\n--XX\r\nContent-Disposition: form-data; name=csrf\r\n\r\nold\r\n--XX--\r\n");
+        let out = set_param(&bin, "csrf", true, ph);
+        assert!(find(&out, &[0xff, 0x00, 0xfe, 0xc3, b'\r']).is_some());
+        assert!(find(&out, b"name=csrf\r\n\r\nR\r\n--XX--").is_some(), "{}", String::from_utf8_lossy(&out));
+        assert_eq!(multipart_fields(&bin).iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["csrf"]);
+    }
+
+    #[test]
+    fn rule_updates_win_over_the_profile_but_not_over_an_attack() {
+        let dir = std::env::temp_dir().join(format!("bp-session-unit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scope = crate::guard::ScopeSpec { name: None, include: vec!["a.test".into()], exclude: vec![] };
+        let opts = crate::http::SendOptions {
+            guard: Some(crate::guard::Guard::from_specs(vec![scope]).unwrap()),
+            ..Default::default()
+        };
+        let profile =
+            AuthProfile { name: "t".into(), headers: vec![("X-Csrf".into(), "static".into())], ..Default::default() };
+        let state = crate::auth::SessionState {
+            vars: vec![SessionVar { name: "csrf".into(), value: "v1".into(), run: 1, origins: vec![] }],
+            ..Default::default()
+        };
+        let update = Action::Update { params: vec![("X-Csrf".into(), "csrf".into()), ("csrf".into(), "csrf".into())] };
+        let rule = SessionRule {
+            id: 1,
+            description: String::new(),
+            tools: vec![Tool::Scan],
+            url: None,
+            actions: vec![update],
+            invalid: None,
+        };
+        let s = AuthSession::new(&dir.join("p.bpdb"), profile, state, crate::http::Client::new(opts))
+            .unwrap()
+            .with_handling(Handling { macros: vec![], rules: vec![rule] })
+            .unwrap();
+        let target = Target::from_url("https://a.test").unwrap();
+        let raw = b"GET /?csrf=old HTTP/1.1\r\nHost: a.test\r\nCookie: csrf=PAYLOAD\r\nX-Csrf: x\r\n\r\n";
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let p = rt.block_on(s.prepare(Tool::Scan, &target, raw, &["csrf"], &[]));
+        let out = String::from_utf8(p.request).unwrap();
+        assert!(out.starts_with("GET /?csrf=«auth:t:var:csrf#1:form» HTTP/1.1\r\n"), "{out}");
+        assert!(out.contains("X-Csrf: «auth:t:var:csrf#1»\r\n"), "{out}");
+        assert!(out.contains("Cookie: csrf=PAYLOAD\r\n"), "{out}");
+        // Another tool: no rule, the profile's header.
+        let p = rt.block_on(s.prepare(Tool::Fuzz, &target, raw, &[], &[]));
+        assert!(String::from_utf8(p.request).unwrap().contains("X-Csrf: «auth:t:header:X-Csrf»\r\n"));
     }
 
     #[test]
