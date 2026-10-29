@@ -36,7 +36,7 @@ pub enum AuthzCmd {
         owner is found from the auth placeholders or session values in the request; --owner sets it. Only \
         GET, HEAD and OPTIONS requests that carry credentials are picked from history unless \
         --include-methods or --history-id says otherwise.")]
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Result rows of a run: one per request and identity.
     Results {
         /// Run id (from `authz run` or `authz list`).
@@ -150,7 +150,7 @@ pub struct RunArgs {
 
 pub fn authz(project: &Path, home: &Path, cmd: AuthzCmd, out: &Out) -> Result<(), Error> {
     match cmd {
-        AuthzCmd::Run(args) => run(project, home, args, out),
+        AuthzCmd::Run(args) => run(project, home, *args, out),
         AuthzCmd::Results { run, verdict, identity, limit } => {
             let store = Store::open(project)?;
             require_run(&store, run)?;
