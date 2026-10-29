@@ -114,6 +114,37 @@ pub(crate) fn find() -> Vec<Found> {
         .collect()
 }
 
+/// The Chromium-family browser for a browser crawl: `id` from `browser list`, or the
+/// first one found. The crawl drives it over the DevTools protocol, which Firefox lacks.
+pub(crate) fn chromium(id: Option<&str>) -> Result<PathBuf, Error> {
+    let found = find();
+    let chromium: Vec<&Found> = found.iter().filter(|f| f.kind == Kind::Chromium).collect();
+    match id {
+        Some(id) => match found.iter().find(|f| f.id == id) {
+            Some(f) if f.kind == Kind::Chromium => Ok(f.path.clone()),
+            Some(f) => Err(Error::InvalidInput(format!(
+                "the browser crawl drives Chromium-based browsers (Chrome, Chromium, Edge, Brave), not {}",
+                f.name
+            ))),
+            None => Err(Error::NotFound(format!(
+                "browser {id:?}; Chromium-based browsers found: {}",
+                if chromium.is_empty() {
+                    "none".into()
+                } else {
+                    chromium.iter().map(|f| f.id).collect::<Vec<_>>().join(", ")
+                }
+            ))),
+        },
+        None => chromium.first().map(|f| f.path.clone()).ok_or_else(|| {
+            Error::NotFound(
+                "no Chromium-based browser found for --browser (Chrome, Chromium, Edge or Brave on the PATH or in the \
+                 usual install folders; on Kali: sudo apt install chromium). See `brainproxy browser list`."
+                    .into(),
+            )
+        }),
+    }
+}
+
 fn describe(f: &Found) -> Value {
     json!({"id": f.id, "name": f.name, "kind": if f.kind == Kind::Chromium { "chromium" } else { "firefox" }, "path": f.path})
 }

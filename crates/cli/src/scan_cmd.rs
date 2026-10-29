@@ -38,7 +38,7 @@ pub enum ScanCmd {
     /// ZAP data files the rules read (error patterns, hidden files, sensitive names): status, update, reset.
     #[command(subcommand)]
     Data(DataCmd),
-    /// Show, or with SOURCES replace, which history sources are passively scanned (default: proxy,send,crawl).
+    /// Show, or with SOURCES replace, which history sources are passively scanned (default: proxy,send,crawl,crawl-browser).
     Sources {
         #[arg(value_delimiter = ',')]
         sources: Vec<String>,

@@ -218,8 +218,8 @@ attack type, and pick payloads:
     and URL paths mentioned in page text or scripts (error pages included); placeholder
     values such as `?key=…` or `/users/{id}` are replaced with test values. It keeps the
     cookies the site sets and sends them back, so tick *Inject into cookies* to attack them
-    (the guided Standard and Thorough scans do). It doesn't run JavaScript: for single-page
-    apps, browse the app through the proxy first.
+    (the guided Standard and Thorough scans do). For single-page apps, tick *Run JavaScript
+    (browser)* (see below).
     The crawl stays on the site URLs' origins (scheme, host and port); an `http://` site
     also covers `https://` on port 443 of the same host, since sites redirect there.
   - **Audit everything recorded:** attacks all traffic already in the project.
@@ -231,6 +231,29 @@ attack type, and pick payloads:
   recorded, or listed requests. Checks tagged dos, fuzz, or intrusive, which other scans
   leave out, run when picked here (marked in the list).
 - **New scan › Crawl:** explore only, no attacks.
+- **Run JavaScript (browser)** (Crawl, and Active scan's *Crawl and audit*): also crawls
+  in a hidden Chromium-based browser (Chrome, Chromium, Edge or Brave must be installed;
+  the option is greyed out otherwise). Pages built by JavaScript, single-page apps, are
+  explored the way a person would: it waits for each page to settle, follows links and
+  client-side routes, clicks buttons, menus and other clickable elements, fills fields
+  with test values and submits forms, and records the API calls (XHR, fetch) this
+  triggers. Each distinct page state is explored once. It is slower than the plain crawl.
+  - **What it won't do:** click elements labelled like *log out*, *delete*, *remove*,
+    *reset* or *unsubscribe* (the summary lists them under `not_clicked`), answer *OK*
+    to a confirmation dialog, open pop-ups or downloads, request logout-like URLs, or send
+    DELETE requests (listed under `blocked_requests`). From the CLI, `--allow-destructive`
+    lifts the label and DELETE rules and `--avoid REGEX` adds labels to skip.
+  - **Where its traffic goes:** only through a proxy of the crawl's own, so every request
+    is checked against the engagement scope and recorded in **Traffic** with source
+    `crawl-browser`, and the browser's own background features (updates, sync, safe
+    browsing, WebRTC) are off. It uses a fresh temporary profile, removed afterwards, so
+    nothing from your normal browser is used; with a login profile, the session is added
+    to every request on the site and renewed when lost.
+  - **Limits:** depth, max pages (page loads, clicks and form submissions), rate, path
+    prefix and the site's origin apply as for the plain crawl. Linux and macOS only. If
+    the browser can't start because Chromium's sandbox is unavailable (running as root
+    starts it without one; some containers lack user namespaces), install your
+    distribution's `chromium-sandbox` package or set `BRAINPROXY_BROWSER_NO_SANDBOX=1`.
 - **New scan › PHP2Shell check:** checks the listed sites for PHP2Shell (CVE-2026-109618,
   CVE-2026-109619) with active rule 100002 only, a few requests per site. See
   [ACTIVE_RULES.md](ACTIVE_RULES.md#brainproxys-own-rules).
@@ -512,6 +535,14 @@ Crawl and active-scan scope and safety flags:
   time-based ones get the wait they need. When several templates send the same GET or HEAD
   request, it's sent once and they share the response.
 - The crawler submits at most 200 forms per page.
+- `crawl --max-minutes M`: stop crawling after M minutes (`scan active --max-minutes`
+  bounds its crawl too).
+- `crawl --browser` and `scan active --crawl --browser`: the JavaScript-aware crawl
+  described under [Scans](#scans). `--browser-id ID` picks the browser from
+  `brainproxy browser list`, `--headful` shows its window, `--avoid REGEX` (repeatable)
+  skips more elements, `--allow-destructive` clicks destructive-looking ones and sends
+  DELETE. It tries at most 40 elements per page state and chains of up to 6 clicks, and
+  waits at most 10 s for a page to settle.
 - `scan active --include-methods DELETE,PUT,PATCH` (or `all`): also attack requests with
   these methods. Requests picked with `--history-id` are attacked whatever their method.
 
@@ -674,7 +705,7 @@ The agent works under the same engagement scope; it cannot reach anything outsid
 | `proxy stop` / `oob stop` says it won't send SIGKILL | The saved state comes from an older version and the process ignored SIGTERM, so brainproxy can't tell it is the proxy. Check it with `ps -p PID` (Windows: Task Manager, Details tab) and stop it yourself. |
 | curl or a tool skips the proxy for localhost | Pass `--noproxy ''` (curl), or unset `NO_PROXY`. |
 | "The proxy didn't start: ports … are all in use" | Another program uses ports 8080-8089. Stop it, or start the proxy on another port: `brainproxy proxy start --listen 127.0.0.1:9090`. |
-| A scan finds little | Make sure it covers the site: use *Crawl and audit*, browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |
+| A scan finds little | Make sure it covers the site: use *Crawl and audit* (with *Run JavaScript* for single-page apps), browse the app through the proxy first, or log in with an auth profile. Download the Nuclei templates. |
 | Windows says "Windows protected your PC" | The installer isn't signed yet: More info → Run anyway. |
 | Windows: tools other than the opened browser reject the CA | `brainproxy ca install-system` adds it to your user's Trusted Root store (Windows asks you to confirm). Firefox keeps its own store; import it there. |
 | macOS says the app can't be opened or is damaged | System Settings → Privacy & Security → Open Anyway, or run the `xattr` command in [Install](#install). |

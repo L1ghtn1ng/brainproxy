@@ -133,5 +133,7 @@ No subscriptions or templates.
 ## Typical session
 
 1. `engagement_start` with `targets` (once per project, write-once).
-2. `send`, `crawl`, `import_openapi`, `scan_active` (`background: true`), `job_wait`.
+2. `send`, `crawl`, `import_openapi`, `scan_active` (`background: true`), `job_wait`. For a
+   single-page app, `crawl` or `scan_active` (with `crawl`) take `browser: true`, which needs
+   a Chromium-based browser on the server's machine (`browser_list`).
 3. `findings_list`, `findings_show`, `schema` + `query` over the history, `report`.

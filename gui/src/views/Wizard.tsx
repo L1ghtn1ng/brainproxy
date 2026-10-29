@@ -7,6 +7,7 @@ import { run, withScheme, type Risk } from "../api";
 import { useApp } from "../store";
 import { usePoll } from "../ui/usePoll";
 import { loadSuggestions, type Job, type Suggestions } from "./Scanner";
+import { hasChromium, wizardBrowserArgs, type BrowserInfo } from "./browserCrawl";
 import type { ChecksStatus } from "./Updates";
 
 type Depth = "quick" | "standard" | "thorough";
@@ -80,6 +81,9 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   const [checks] = usePoll<ChecksStatus>(() => run(["checks", "status"]), 30000);
   // brainproxy's feed checks join Standard and Thorough even without the Nuclei templates.
   const nuclei = checks?.nuclei ? NUCLEI[depth] : depth === "quick" ? [] : ["--checks", "brainproxy", "--check-severity", depth === "standard" ? "high" : "medium"];
+  // Thorough also crawls in a browser that runs the site's JavaScript, when one is installed.
+  const [browsers] = usePoll<{ browsers: BrowserInfo[] }>(() => run(["browser", "list"]), 60000);
+  const canBrowse = hasChromium(browsers);
   const [profiles] = usePoll<{ profiles: { name: string; session?: { logged_in?: boolean } }[] }>(() => run(["auth", "list"]), 10000);
 
   useEffect(() => {
@@ -118,7 +122,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
     setBusy(true);
     try {
       const depthArgs = DEPTHS.find((d) => d.id === depth)!.args;
-      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs, ...SPEEDS.find((s) => s.id === speed)!.args, ...nuclei, ...(login ? [`--auth=${login}`] : []), "--background"]);
+      const d = await run<{ job: number }>(["scan", "active", url, "--crawl", ...depthArgs, ...wizardBrowserArgs(depth, canBrowse), ...SPEEDS.find((s) => s.id === speed)!.args, ...nuclei, ...(login ? [`--auth=${login}`] : []), "--background"]);
       p.onStarted(d.job);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -215,6 +219,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
                 <b>{d.title}</b>
                 <span className="wiz-time">{d.time}</span>
                 <span>{d.text}</span>
+                {d.id === "thorough" && canBrowse && <span>Also opens the site in a hidden browser to find pages built by JavaScript.</span>}
               </button>
             ))}
           </div>
@@ -244,6 +249,12 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
             </dd>
             <dt>Speed</dt>
             <dd className={speed === "fast" ? "s5" : ""}>{SPEEDS.find((s) => s.id === speed)!.title}</dd>
+            {wizardBrowserArgs(depth, canBrowse).length > 0 && (
+              <>
+                <dt>JavaScript</dt>
+                <dd>runs in a hidden browser that clicks through the site (logout and delete buttons are left alone)</dd>
+              </>
+            )}
             <dt>Extra checks</dt>
             <dd>
               {!checks?.nuclei

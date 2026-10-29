@@ -261,15 +261,32 @@ brainproxy scan passive --rescan                  # rescan all history
 # Crawl, then actively scan (48 rules ported from ZAP); everything stays inside the engagement scope.
 # The crawler follows links, forms, robots.txt, sitemaps, and URL paths written in page text or
 # scripts (also on 4xx pages; placeholders like ?key=… or /users/{id} get test values), and keeps
-# the cookies the site sets. It doesn't run JavaScript: for single-page apps, browse through the proxy.
+# the cookies the site sets. It doesn't run JavaScript; --browser does (single-page apps, below).
 brainproxy crawl https://app.example.com/ --background         # job id; brainproxy job wait ID
+brainproxy crawl https://app.example.com/ --max-minutes 10     # stop after 10 minutes
 brainproxy scan active                                         # all crawled/proxied/sent endpoints
 brainproxy scan active https://app.example.com --crawl         # crawl and audit: crawl, then attack all found
 brainproxy scan active https://app.example.com --crawl --cookies  # ... and attack the cookies the site sets
+brainproxy scan active https://app.example.com --crawl --browser  # ... and crawl again in a browser that runs JavaScript
 brainproxy scan active https://app.example.com/item?id=1 --strength high
 brainproxy scan active --where "path LIKE '/api/%'" --rules 40018,40012 --background
 brainproxy scan rules --active
 brainproxy findings list --source active
+
+# JavaScript-aware crawl (single-page apps): a headless Chromium-based browser (Chrome, Chromium,
+# Edge, Brave; see `brainproxy browser list`) loads each page, waits for it to settle, follows
+# links and client-side routes (pushState, #/hash), clicks buttons, menus and other clickable
+# elements, fills fields with test values and submits forms, once per distinct page state. It goes
+# only through the crawl's own proxy, so every request, XHR and fetch() included, is scope-checked
+# and recorded as history source crawl-browser. Not clicked: elements labelled like logout, delete,
+# remove (--avoid REGEX adds more, --allow-destructive clicks them); confirm() answers no; logout-like
+# URLs and DELETE requests aren't sent. --depth, --max-pages (page loads, clicks and form submits),
+# --max-per-path, --max-minutes, --rate, -H, --auth, --path-prefix, --exclude and the origin rules
+# apply. Each crawl uses a fresh temporary browser profile. Linux and macOS.
+brainproxy crawl https://app.example.com/ --browser --background
+brainproxy crawl https://app.example.com/ --browser --auth app --max-pages 300
+brainproxy crawl https://app.example.com/ --browser --browser-id chrome --headful   # watch it work
+BRAINPROXY_BROWSER_NO_SANDBOX=1 brainproxy crawl https://app.example.com/ --browser  # where Chromium's sandbox can't run
 
 # API import: one request per operation with example/typed values, sent in scope and recorded as
 # history source 'import', which `scan active` attacks by default. DELETE and GraphQL mutations

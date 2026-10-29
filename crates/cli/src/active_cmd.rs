@@ -36,6 +36,14 @@ pub struct ActiveArgs {
     /// what it finds there), not only the URLs' origins.
     #[arg(long, requires = "crawl")]
     crawl_any_port: bool,
+    /// With --crawl: after the plain crawl, crawl again in a headless Chromium-based browser that
+    /// runs JavaScript (clicks, client-side routes, XHR/fetch calls), so single-page apps are covered.
+    /// Destructive-looking elements aren't clicked; see `crawl --help`.
+    #[arg(long, requires = "crawl")]
+    browser: bool,
+    /// With --browser: the browser to use, an id from `browser list`.
+    #[arg(long, value_name = "ID", requires = "browser")]
+    browser_id: Option<String>,
     /// Also attack requests from history with these methods (comma-separated, or `all`).
     /// By default only GET, HEAD, OPTIONS and POST are replayed; --history-id is always attacked.
     #[arg(long, value_delimiter = ',', value_name = "METHODS")]
@@ -164,6 +172,7 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
     }
     let oob = if args.no_oob { None } else { crate::oob_cmd::running(&Store::open(project)?)?.map(|s| s.endpoint) };
     let (checks, check_summary) = load_checks(home, &args, band, oob.is_some())?;
+    let browser = args.browser.then(|| crate::browser_cmd::chromium(args.browser_id.as_deref())).transpose()?;
     if args.background {
         return crate::jobs_cmd::spawn_background("active-scan", project, home, out);
     }
@@ -234,10 +243,26 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                     robots: true,
                     sitemap: true,
                     auth: auth.clone(),
+                    max_duration: cfg.max_duration,
                 };
-                let c = rt.block_on(brainproxy_core::crawl::crawl(project, crawl_cfg, ctl.clone()))?;
+                let c = rt.block_on(brainproxy_core::crawl::crawl(project, crawl_cfg.clone(), ctl.clone()))?;
                 crawled =
                     json!({"requests": c.requests, "endpoints": c.endpoints.len(), "depth_reached": c.depth_reached});
+                if let (Some(path), false) = (browser, ctl.stopped()) {
+                    let avoid = crate::crawl_cmd::avoid_patterns(&[], false)?;
+                    let b = crate::crawl_cmd::browser_config(home, crawl_cfg, path, true, avoid, false)?;
+                    let b = rt.block_on(brainproxy_core::browser_crawl::crawl(project, b, ctl.clone()))?;
+                    crawled["browser"] = json!({
+                        "requests": b.requests,
+                        "endpoints": b.endpoint_count,
+                        "api_calls": b.api_call_count,
+                        "states": b.states,
+                        "clicks": b.clicks,
+                        "forms_submitted": b.forms_submitted,
+                        "not_clicked": b.not_clicked_count,
+                        "blocked_requests": b.blocked_count,
+                    });
+                }
                 if ctl.stopped() {
                     return Ok(json!({"crawl": crawled, "stopped": true}));
                 }
@@ -387,7 +412,7 @@ impl Selection {
             })
             .collect();
         let site = sites.join(" OR ");
-        let mut where_sql = format!("({site}) AND source IN ('crawl', 'proxy', 'send', 'import')");
+        let mut where_sql = format!("({site}) AND source IN ('crawl', 'crawl-browser', 'proxy', 'send', 'import')");
         if let Some(w) = &args.where_sql {
             where_sql = format!("{where_sql} AND ({w})");
         }
@@ -439,7 +464,7 @@ fn select_targets(
     if args.urls.is_empty() && ids.is_empty() && args.where_sql.is_none() {
         let ro = Store::open_read_only(project)?;
         let r = ro.query(
-            "SELECT id FROM history WHERE source IN ('crawl', 'proxy', 'send', 'import') AND status IS NOT NULL ORDER BY id",
+            "SELECT id FROM history WHERE source IN ('crawl', 'crawl-browser', 'proxy', 'send', 'import') AND status IS NOT NULL ORDER BY id",
             &[],
             100_000,
             50,

@@ -5,6 +5,7 @@ pub mod apiimport;
 pub mod auth;
 pub mod auth_record;
 pub mod authz;
+pub mod browser_crawl;
 pub mod capture;
 pub mod checks;
 pub mod codec;

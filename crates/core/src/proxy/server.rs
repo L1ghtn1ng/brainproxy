@@ -877,7 +877,7 @@ impl Hooks for WsHooks {
 /// Works out the upstream target and rewrites absolute-form requests to origin-form.
 /// With `by_host` (invisible proxying), an origin-form request goes to its Host
 /// header's host and port over http.
-fn resolve_target(raw: Vec<u8>, default_target: Option<&Target>, by_host: bool) -> Result<(Target, Vec<u8>)> {
+pub(crate) fn resolve_target(raw: Vec<u8>, default_target: Option<&Target>, by_host: bool) -> Result<(Target, Vec<u8>)> {
     let req = RawRequest::from_bytes(raw);
     let head = req.head()?;
     if let Some(t) = default_target {
@@ -1068,7 +1068,7 @@ fn capture_bytes(c: &Capture) -> usize {
         + text(&c.resp_body_text)
 }
 
-fn wants_close(version: &str, headers: &[(String, String)]) -> bool {
+pub(crate) fn wants_close(version: &str, headers: &[(String, String)]) -> bool {
     let conn = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("connection")).map(|(_, v)| v.to_ascii_lowercase());
     match conn {
         Some(v) if v.contains("close") => true,
@@ -1077,7 +1077,7 @@ fn wants_close(version: &str, headers: &[(String, String)]) -> bool {
     }
 }
 
-fn error_response(status: u16, kind: &str, message: &str) -> Vec<u8> {
+pub(crate) fn error_response(status: u16, kind: &str, message: &str) -> Vec<u8> {
     let reason = match status {
         400 => "Bad Request",
         403 => "Forbidden",
@@ -1093,18 +1093,18 @@ fn error_response(status: u16, kind: &str, message: &str) -> Vec<u8> {
 }
 
 /// A stream with some already-read bytes put back in front.
-struct Prefixed<S> {
+pub(crate) struct Prefixed<S> {
     prefix: Vec<u8>,
     pos: usize,
     inner: S,
 }
 
 impl<S: AsyncRead + Unpin> Prefixed<S> {
-    fn new(prefix: Vec<u8>, inner: S) -> Self {
+    pub(crate) fn new(prefix: Vec<u8>, inner: S) -> Self {
         Self { prefix, pos: 0, inner }
     }
 
-    async fn peek_byte(&mut self) -> Result<Option<u8>> {
+    pub(crate) async fn peek_byte(&mut self) -> Result<Option<u8>> {
         if self.pos < self.prefix.len() {
             return Ok(Some(self.prefix[self.pos]));
         }
