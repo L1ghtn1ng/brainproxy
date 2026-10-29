@@ -420,9 +420,8 @@ impl Guard {
             ))
         };
         // As for targets, a name no scope could allow isn't looked up (DNS would carry it out).
-        let may_name = |s: &Scope| {
-            s.proxies.iter().any(|e| e.matches_name(&bare, port) || matches!(e.pattern, Pattern::Net(..)))
-        };
+        let may_name =
+            |s: &Scope| s.proxies.iter().any(|e| e.matches_name(&bare, port) || matches!(e.pattern, Pattern::Net(..)));
         let addrs: Vec<IpAddr> = match bare.parse::<IpAddr>() {
             Ok(ip) => vec![ip],
             Err(_) => match self.net.get().host_override(&bare) {
