@@ -288,7 +288,14 @@ fn live_mode_tests_proxied_requests_as_other_identities() {
     assert!(row["source_id"].as_i64().is_some(), "points at the proxied request: {row}");
     assert_eq!(srv.logouts.load(Ordering::SeqCst), 1, "/logout isn't replayed");
 
-    let status = ok(&p, &["--home", home, "proxy", "status"]);
+    // The job's progress is stored every half second, so it may trail the results a little.
+    let status = loop {
+        let status = ok(&p, &["--home", home, "proxy", "status"]);
+        if status["authz"]["progress"]["tested"] == 2 || std::time::Instant::now() > deadline {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
     assert_eq!(status["authz"]["run_id"].as_i64().unwrap().to_string(), run_id, "{status}");
     let progress = &status["authz"]["progress"];
     assert_eq!(progress["tested"], 2, "{status}");
