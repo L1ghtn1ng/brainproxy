@@ -48,6 +48,7 @@ struct Conn {
     closed: AtomicBool,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl Conn {
     fn send(&self, id: u64, method: &str, params: Value, session: Option<&str>) -> std::io::Result<()> {
         let mut msg = json!({"id": id, "method": method, "params": params});
@@ -287,6 +288,8 @@ fn temp_profile() -> Result<PathBuf> {
     getrandom::fill(&mut rnd).map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
     let dir = std::env::temp_dir().join(format!("brainproxy-browser-{}", hex::encode(rnd)));
     let mut b = std::fs::DirBuilder::new();
+    // Not recursive: the temp dir exists, and the profile must be a new folder.
+    b.recursive(false);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
     b.create(&dir)?;
