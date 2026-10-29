@@ -6,6 +6,7 @@ mod auth_cmd;
 mod browser_cmd;
 mod capabilities;
 mod checks_cmd;
+mod connection_cmd;
 mod crawl_cmd;
 mod engagement_cmd;
 mod fuzz_cmd;
@@ -99,6 +100,11 @@ enum Cmd {
     /// Open a locally installed browser through the proxy, in its own profile.
     #[command(subcommand)]
     Browser(browser_cmd::BrowserCmd),
+
+    /// Connection options for every outbound request: upstream proxies (HTTP/SOCKS5), host overrides,
+    /// client TLS certificates, and the proxy's TLS pass-through hosts.
+    #[command(subcommand)]
+    Connection(connection_cmd::ConnectionCmd),
 
     /// Which hosts the proxy intercepts, modifies, and records.
     #[command(subcommand)]
@@ -413,6 +419,15 @@ fn command_name(cmd: &Cmd) -> String {
         Cmd::Findings(_) => "findings",
         Cmd::Report(_) => "report",
         Cmd::Scope(_) => "scope",
+        Cmd::Connection(c) => match c {
+            connection_cmd::ConnectionCmd::Show => "connection show",
+            connection_cmd::ConnectionCmd::Route { .. } => "connection route",
+            connection_cmd::ConnectionCmd::Upstream(_) => "connection upstream",
+            connection_cmd::ConnectionCmd::Hosts(_) => "connection hosts",
+            connection_cmd::ConnectionCmd::Cert(_) => "connection cert",
+            connection_cmd::ConnectionCmd::Passthrough(_) => "connection passthrough",
+            connection_cmd::ConnectionCmd::Clear => "connection clear",
+        },
         Cmd::Rules(_) => "rules",
         Cmd::Intercept(_) => "intercept",
         Cmd::Wordlists(fuzz_cmd::WordlistsCmd::List) => "wordlists list",
@@ -465,6 +480,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Findings(cmd) => scan_cmd::findings(&cli.project, cmd, out)?,
         Cmd::Report(args) => report_cmd::report(&cli.project, args, out)?,
         Cmd::Scope(cmd) => proxy_cmd::scope(&cli.project, cmd, out)?,
+        Cmd::Connection(cmd) => connection_cmd::connection(&cli.project, cmd, out)?,
         Cmd::Rules(cmd) => proxy_cmd::rules(&cli.project, cmd, out)?,
         Cmd::Intercept(cmd) => proxy_cmd::intercept(&cli.project, cmd, out)?,
         Cmd::Wordlists(cmd) => fuzz_cmd::wordlists(cmd, out)?,

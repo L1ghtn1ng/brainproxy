@@ -15,6 +15,7 @@ pub fn describe(cmd: &Command) -> Value {
             "stdin": "Commands that take a FILE or INPUT read stdin when it is '-' or omitted.",
             "project": "History is stored in the SQLite project file from --project or BRAINPROXY_PROJECT, created on first use.",
             "scope": "Nothing is sent until a scope exists. `engagement start --target ...` sets it once per project and it can never be changed; /etc/brainproxy/scope.json (Windows: C:\\ProgramData\\brainproxy\\scope.json), if present, is enforced too. Every outbound request must match.",
+            "connection": "`connection *` sets upstream proxies (HTTP CONNECT/SOCKS5, asked for the scope-checked address), host overrides (checked like DNS answers), client TLS certificates, and the proxy's TLS pass-through hosts for every outbound request; `auth add --platform` adds Basic/Digest/NTLM for some hosts. Passwords come from environment variables named in the settings, never stored. A running proxy applies changes within a second.",
         },
         "exit_codes": {
             "0": "success",

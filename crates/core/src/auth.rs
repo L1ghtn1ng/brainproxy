@@ -45,7 +45,7 @@ pub enum Secret {
 }
 
 impl Secret {
-    fn resolve(&self) -> Result<String> {
+    pub(crate) fn resolve(&self) -> Result<String> {
         match self {
             Secret::Literal(s) => Ok(s.clone()),
             Secret::Env(var) => std::env::var(var)
@@ -103,6 +103,10 @@ pub struct AuthProfile {
     /// Maximum automatic re-logins per command run.
     #[serde(default = "twenty")]
     pub max_relogins: u32,
+    /// HTTP Basic, Digest, or NTLM credentials (the username and password above) for
+    /// some hosts, answered on every command (see [`crate::connection::platform`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<crate::connection::PlatformAuth>,
 }
 
 fn post() -> String {
@@ -122,8 +126,11 @@ impl AuthProfile {
 
     /// Checks regexes and required fields.
     pub fn validate(&self) -> Result<()> {
-        if !self.has_login() && self.headers.is_empty() {
-            return Err(Error::InvalidInput("profile needs --login-url or at least one --header".into()));
+        if !self.has_login() && self.headers.is_empty() && self.platform.is_none() {
+            return Err(Error::InvalidInput("profile needs --login-url, --platform, or at least one --header".into()));
+        }
+        if let Some(p) = &self.platform {
+            p.validate()?;
         }
         for (what, re) in [
             ("csrf", &self.csrf_regex),
@@ -183,7 +190,8 @@ impl Store {
                 updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             params![p.name, json],
         )?;
-        Ok(())
+        // Running proxies reload platform credentials with the settings.
+        self.bump_settings_version()
     }
 
     pub fn auth_profile(&self, name: &str) -> Result<(AuthProfile, SessionState)> {
@@ -225,7 +233,7 @@ impl Store {
         if self.conn.execute("DELETE FROM auth_profiles WHERE name = ?1", [name])? == 0 {
             return Err(Error::NotFound(format!("auth profile {name:?}")));
         }
-        Ok(())
+        self.bump_settings_version()
     }
 }
 

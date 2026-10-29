@@ -108,7 +108,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles, match & replace, intercept options, proxy (status, start, setup for browsers/curl/shell), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *`, `rules *`, `intercept *`, `proxy status/start`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
+| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM), match & replace, intercept options, proxy (status, start, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *`, `rules *`, `intercept *`, `proxy status/start`, `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
 
 ### Guided scan
 
