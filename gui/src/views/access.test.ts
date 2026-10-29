@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cellKind, grid, hostOf, liveValue, runArgs, runLabel, type Matrix, type RunForm } from "./access.ts";
+import { cellKind, grid, hostOf, liveArgs, proxyOptions, runArgs, runLabel, type Matrix, type RunForm } from "./access.ts";
 
 const cell = (verdict: string, status: number | null, history_id: number, confidence: string | null = null) => ({ verdict, confidence, status, history_id });
 
@@ -99,8 +99,18 @@ test("a run's arguments come from the form", () => {
   assert.deepEqual(runArgs({ ...form, select: "where", where: "path LIKE '/api/%'" }).at(-1), "--where=path LIKE '/api/%'");
   assert.throws(() => runArgs({ ...form, identities: [], anonymous: false }), /at least one identity/);
   assert.throws(() => runArgs({ ...form, select: "host", host: " " }), /host/);
-  assert.equal(liveValue(form), "anonymous,bob,carol");
-  assert.equal(liveValue({ identities: ["bob"], anonymous: false }), "bob");
+  assert.throws(() => runArgs({ ...form, rate: "oops" }), /Rate/);
+});
+
+test("live testing options, and the running proxy's options kept on a restart", () => {
+  assert.deepEqual(liveArgs(form), ["--authz=anonymous,bob,carol"]);
+  assert.deepEqual(liveArgs({ ...form, anonymous: false, identities: ["bob"], keepCookies: "lang, theme", rate: "2.5" }), ["--authz=bob", "--authz-keep-cookie=lang,theme", "--authz-rate=2.5"]);
+  assert.throws(() => liveArgs({ ...form, rate: "oops" }), /Rate/);
+  assert.throws(() => liveArgs({ ...form, rate: "-1" }), /Rate/);
+  const args = ["proxy", "run", "--listen", "127.0.0.1:8080", "--timeout", "30", "--log", "/p.proxy.log", "--verify-tls", "--auth", "alice", "--authz", "bob", "--authz-rate=5", "--no-http2"];
+  assert.deepEqual(proxyOptions(args), ["--timeout=30", "--verify-tls", "--auth=alice", "--authz=bob", "--authz-rate=5", "--no-http2"]);
+  assert.deepEqual(proxyOptions(args, false), ["--timeout=30", "--verify-tls", "--auth=alice", "--no-http2"]);
+  assert.deepEqual(proxyOptions([]), []);
 });
 
 test("hosts and run labels", () => {

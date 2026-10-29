@@ -597,7 +597,8 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
         if stored.enabled {
             store.set_setting(AUTHZ_KEY, &LiveAuthz { enabled: false, ..stored })?;
         }
-        return serve(project, &args, ca, info, upstream, None, out).map(|_| ());
+        let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &upstream)?;
+        return serve(project, &args, ca, info, upstream, auth, None, out).map(|_| ());
     }
     let profiles = crate::authz_cmd::require_profiles(project, &live.identities)?;
     let exclude = regex::Regex::new(&live.exclude).map_err(|e| Error::InvalidInput(format!("--authz-exclude: {e}")))?;
@@ -606,8 +607,12 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
     // The run lasts as long as the proxy: it completes when the proxy stops, or stops
     // early on `job stop RUN` while the proxy carries on.
     crate::jobs_cmd::run_job(project, Some(run_id), |ctl| {
-        let known = crate::authz_cmd::load_sessions(project, &profiles, &live.identities, &upstream)?;
+        // The --auth profile logs in too: the proxy and the tests share its session, so a
+        // re-login by either is the other's as well.
+        let needed: Vec<String> = live.identities.iter().chain(&args.auth).cloned().collect();
+        let known = crate::authz_cmd::load_sessions(project, &profiles, &needed, &upstream)?;
         let find = |n: &String| known.iter().find(|s| &s.profile.name == n).cloned().expect("loaded above");
+        let auth = args.auth.as_ref().map(find);
         let cfg = AuthzConfig {
             identities: live.identities.iter().map(find).collect(),
             anonymous: live.anonymous,
@@ -619,9 +624,11 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
             rate: live.rate,
         };
         let opts = LiveOptions { queue: live.queue, concurrency: 2, exclude };
-        let summary = serve(project, &args, ca, info, upstream.clone(), Some(LiveRun { run_id, cfg, opts, ctl }), out);
+        let summary =
+            serve(project, &args, ca, info, upstream.clone(), auth, Some(LiveRun { run_id, cfg, opts, ctl }), out);
+        // serve saved the --auth session.
         for s in &known {
-            if live.identities.contains(&s.profile.name) {
+            if live.identities.contains(&s.profile.name) && args.auth.as_ref() != Some(&s.profile.name) {
                 s.save()?;
             }
         }
@@ -631,17 +638,18 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
 }
 
 /// Runs the proxy until it is asked to stop. Returns the live testing summary, if on.
+#[allow(clippy::too_many_arguments)]
 fn serve(
     project: &Path,
     args: &ProxyRunArgs,
     ca: CertAuthority,
     info: brainproxy_core::proxy::CaInfo,
     upstream: SendOptions,
+    auth: Option<std::sync::Arc<brainproxy_core::auth::AuthSession>>,
     live: Option<LiveRun>,
     out: &Out,
 ) -> Result<Value, Error> {
     let store = Store::open(project)?;
-    let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &upstream)?;
     let redirect = args.redirect.as_deref().map(Target::from_url).transpose()?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
@@ -664,6 +672,7 @@ fn serve(
             ca_cert: info.cert_path.clone(),
             log: args.log.clone(),
             authz_run: authz.as_ref().map(|l| l.run_id()),
+            args: crate::jobs_cmd::child_args(),
         };
         let saved = Saved { state, start_time: process::start_time(std::process::id()) };
         store.meta_set(STATE_KEY, Some(&serde_json::to_string(&saved).unwrap_or_default()))?;

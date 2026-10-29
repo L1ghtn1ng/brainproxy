@@ -231,9 +231,11 @@ Access control across users: does the app let bob read alice's data? See
   request unless you pick one. Choose which requests to test: all recorded requests that
   carry credentials, one site, a tag, or a SQL condition on history. Only GET, HEAD and
   OPTIONS requests are replayed, and logout paths never are.
-- **Test live while browsing:** restarts the proxy on the same address so each in-scope
-  request you browse is also tried as those identities in the background (like Burp's
-  Autorize). Its results fill the grid as you go; stopping the proxy ends the run.
+- **Test live while browsing:** restarts the proxy on the same address, with the options it
+  had (such as its login profile), so each in-scope request you browse is also tried as
+  those identities in the background (like Burp's Autorize). If it doesn't start, the
+  previous proxy is started again. Results fill the grid as you go; stopping the proxy ends
+  the run.
 - **Grid:** one row per request, one column per identity. Cells are coloured by verdict:
   red for a high-confidence bypass, orange medium, yellow low, blue public, grey different,
   green enforced. Rows with nothing to compare (the owner didn't get a 2xx) are marked

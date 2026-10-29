@@ -318,3 +318,37 @@ fn live_mode_needs_known_profiles() {
         run(&p, &["--home", home.to_str().unwrap(), "proxy", "start", "--listen", "127.0.0.1:0", "--authz", "carol"]);
     assert_eq!(code, 4, "{v}");
 }
+
+#[test]
+fn live_mode_shares_the_proxys_auth_session() {
+    let srv = Server::start();
+    let p = tmp_project("live-auth");
+    let home = p.with_file_name("home");
+    let home = home.to_str().unwrap();
+    let args = ["--home", home, "proxy", "start", "--listen", "127.0.0.1:0", "--auth", "alice", "--authz", "bob"];
+    let started = ok(&p, &args);
+    let run_id = started["authz_run"].as_i64().unwrap().to_string();
+    let proxy = started["usage"]["proxy_url"].as_str().unwrap().to_string();
+    // The proxy adds alice's session; the request itself carries none.
+    let out = Command::new("curl")
+        .args(["-sS", "--noproxy", "", "-x", &proxy, "-o", if cfg!(windows) { "NUL" } else { "/dev/null" }])
+        .args(["-w", "%{http_code}", &srv.url("/api/orders/1")])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "200");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let m = loop {
+        let m = ok(&p, &["authz", "matrix", &run_id]);
+        if !m["requests"].as_array().unwrap().is_empty() || std::time::Instant::now() > deadline {
+            break m;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert_eq!(cell(&m, "/api/orders/1", "bob")["verdict"], "bypass", "{m}");
+    assert_eq!(m["requests"][0]["owner"], "alice", "{m}");
+    // The options it was started with, for starting it again alike.
+    let status = ok(&p, &["--home", home, "proxy", "status"]);
+    let started_with = status["proxy"]["args"].to_string();
+    assert!(started_with.contains("\"--auth\",\"alice\"") && started_with.contains("\"--authz\",\"bob\""), "{status}");
+    ok(&p, &["--home", home, "proxy", "stop"]);
+}

@@ -8,7 +8,7 @@ import { useApp } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { grid, KIND_LABEL, KINDS, liveValue, runArgs, runLabel, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./access";
+import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./access";
 import { stateClass, type Job } from "./Scanner";
 
 const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", keepCookies: "", rate: "" };
@@ -185,11 +185,11 @@ export function AccessView({ active }: { active: boolean }) {
     </div>
   );
 
-  if (!picked || runId == null) return top;
+  // Always a Split, so opening a comparison doesn't remount the grid and the form.
   return (
-    <Split id="access" dir="col" initial={0.5}>
+    <Split id="access" dir="col" initial={0.5} solo={!picked || runId == null}>
       {top}
-      <Compare runId={runId} picked={picked} onClose={() => setPicked(null)} />
+      {picked && runId != null ? <Compare runId={runId} picked={picked} onClose={() => setPicked(null)} /> : null}
     </Split>
   );
 }
@@ -279,7 +279,7 @@ function Compare({ runId, picked, onClose }: { runId: number; picked: Picked; on
 
 interface ProxyStatus {
   running: boolean;
-  proxy: { listen?: string; authz_run?: number } | null;
+  proxy: { listen?: string; authz_run?: number; args?: string[] } | null;
 }
 
 function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
@@ -314,17 +314,25 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
     }
   };
 
-  // Restarts the proxy on the same address with live testing on.
+  // Restarts the proxy on the same address and with the same options, plus live testing. If it
+  // doesn't come up, the previous proxy is started again.
   const startLive = async () => {
     try {
-      const value = liveValue(f);
+      const live = liveArgs(f);
       setBusy(true);
       const s = await run<ProxyStatus>(["proxy", "status"]);
-      const listen = s.proxy?.listen ?? "127.0.0.1:8080";
+      const listen = `--listen=${s.proxy?.listen ?? "127.0.0.1:8080"}`;
+      const before = proxyOptions(s.proxy?.args ?? []);
       if (s.running) await run(["proxy", "stop"]);
-      const extra = [...(f.keepCookies.trim() ? [`--authz-keep-cookie=${f.keepCookies.trim()}`] : []), ...(f.rate.trim() ? [`--authz-rate=${f.rate.trim()}`] : [])];
-      const d = await run<{ authz_run?: number }>(["proxy", "start", `--listen=${listen}`, `--authz=${value}`, ...extra]);
-      app.toast(`Proxy restarted on ${listen}: requests you browse are now also tried as ${value.replace(/,/g, ", ")}`);
+      let d: { authz_run?: number };
+      try {
+        d = await run<{ authz_run?: number }>(["proxy", "start", listen, ...proxyOptions(before, false), ...live]);
+      } catch (e) {
+        if (s.running) await run(["proxy", "start", listen, ...before]).catch(() => {});
+        throw e;
+      }
+      const who = [...(f.anonymous ? ["anonymous"] : []), ...f.identities].join(", ");
+      app.toast(`Proxy restarted on ${listen.slice(9)}: requests you browse are now also tried as ${who}`);
       if (d.authz_run != null) onStarted(d.authz_run);
     } catch (e: any) {
       app.toast(e.message, "error");
@@ -421,7 +429,7 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
         <button className="btn" disabled={busy || f.owner !== "" || f.select !== "all"} onClick={startLive} title="Restart the proxy so each request you browse is also tried as these identities (like Autorize)">
           Test live while browsing
         </button>
-        <span className="muted small">Live testing restarts the proxy on the same address and tests in-scope GET, HEAD and OPTIONS requests as they are recorded.</span>
+        <span className="muted small">Live testing restarts the proxy (same address and options) and tests in-scope GET, HEAD and OPTIONS requests as they are recorded.</span>
       </div>
     </div>
   );

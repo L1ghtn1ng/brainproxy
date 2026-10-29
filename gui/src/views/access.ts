@@ -148,6 +148,17 @@ export interface RunForm {
 
 const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
 
+const cookieNames = (s: string) => s.split(",").map((c) => c.trim()).filter(Boolean);
+
+/** The rate as typed, or null for none; throws unless it is a number of 0 or more. */
+function rateOf(s: string): string | null {
+  const t = s.trim();
+  if (!t) return null;
+  const n = Number(t);
+  if (!Number.isFinite(n) || n < 0) throw new Error("Rate must be a number of requests per second (0 or more)");
+  return t;
+}
+
 /** A host from what was typed: a bare host, host:port, or a URL. */
 export function hostOf(text: string): string {
   const t = text.trim();
@@ -177,14 +188,42 @@ export function runArgs(f: RunForm): string[] {
     if (!f.where.trim()) throw new Error("Enter a SQL condition on history");
     args.push(`--where=${f.where.trim()}`);
   }
-  const cookies = f.keepCookies.split(",").map((c) => c.trim()).filter(Boolean);
+  const cookies = cookieNames(f.keepCookies);
   if (cookies.length) args.push(`--keep-cookie=${cookies.join(",")}`);
-  if (f.rate.trim()) args.push(`--rate=${f.rate.trim()}`);
+  const rate = rateOf(f.rate);
+  if (rate != null) args.push(`--rate=${rate}`);
   return args;
 }
 
-/** `proxy start --authz` value for live testing with the same identities. */
-export function liveValue(f: Pick<RunForm, "identities" | "anonymous">): string {
+/** `proxy start` options for live testing with the form's identities, cookies and rate. Throws like `runArgs`. */
+export function liveArgs(f: Pick<RunForm, "identities" | "anonymous" | "keepCookies" | "rate">): string[] {
   if (!f.identities.length && !f.anonymous) throw new Error("Pick at least one identity, or keep the anonymous control on");
-  return [...(f.anonymous ? ["anonymous"] : []), ...f.identities].join(",");
+  const args = [`--authz=${[...(f.anonymous ? ["anonymous"] : []), ...f.identities].join(",")}`];
+  const cookies = cookieNames(f.keepCookies);
+  if (cookies.length) args.push(`--authz-keep-cookie=${cookies.join(",")}`);
+  const rate = rateOf(f.rate);
+  if (rate != null) args.push(`--authz-rate=${rate}`);
+  return args;
+}
+
+/** `proxy run` options that take a value; the others (--verify-tls, --no-http2) are flags. */
+const VALUE_OPTIONS = ["--listen", "--timeout", "--wait", "--log", "--auth", "--authz", "--authz-rate", "--authz-queue", "--authz-exclude", "--authz-keep-cookie"];
+
+/**
+ * The options a running proxy was started with (its `proxy run` arguments, from `proxy status`), as
+ * `--name=value`, to start it again with them: without the address and log, which the restart sets,
+ * and without live testing when `live` is false.
+ */
+export function proxyOptions(args: string[], live = true): string[] {
+  const rest = args[0] === "proxy" ? args.slice(2) : args;
+  const out: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    const eq = a.startsWith("--") ? a.indexOf("=") : -1;
+    const name = eq > 0 ? a.slice(0, eq) : a;
+    const value = eq > 0 ? a.slice(eq + 1) : VALUE_OPTIONS.includes(a) ? (rest[++i] ?? "") : null;
+    if (name === "--listen" || name === "--log" || name === "--wait" || (!live && name.startsWith("--authz"))) continue;
+    out.push(value == null ? name : `${name}=${value}`);
+  }
+  return out;
 }

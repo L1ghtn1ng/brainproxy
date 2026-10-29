@@ -22,4 +22,7 @@ pub struct ProxyState {
     /// The live access-control testing run (`--authz`), a job of kind `authz`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authz_run: Option<i64>,
+    /// The `proxy run` arguments it was started with, so it can be started again alike.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }

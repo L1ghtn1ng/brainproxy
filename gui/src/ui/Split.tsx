@@ -1,8 +1,9 @@
-// Two panes with a draggable divider. The split is a fraction, remembered per `id`.
+// Two panes with a draggable divider. The split is a fraction, remembered per `id`. With
+// `solo` only the first pane shows, still mounted where it was, so its state survives.
 
 import { useRef, useState, type ReactNode } from "react";
 
-export function Split(p: { id: string; dir: "row" | "col"; initial?: number; children: [ReactNode, ReactNode] }) {
+export function Split(p: { id: string; dir: "row" | "col"; initial?: number; solo?: boolean; children: [ReactNode, ReactNode] }) {
   const storeKey = `split:${p.id}`;
   const [frac, setFrac] = useState(() => {
     try {
@@ -37,11 +38,11 @@ export function Split(p: { id: string; dir: "row" | "col"; initial?: number; chi
 
   return (
     <div className={`split split-${p.dir}`} ref={box}>
-      <div className="pane" style={{ flexBasis: `${frac * 100}%` }}>
+      <div className="pane" style={{ flexBasis: p.solo ? "100%" : `${frac * 100}%` }}>
         {p.children[0]}
       </div>
-      <div className="divider" onMouseDown={drag} />
-      <div className="pane" style={{ flexBasis: `${(1 - frac) * 100}%` }}>
+      <div className="divider" onMouseDown={drag} style={p.solo ? { display: "none" } : undefined} />
+      <div className="pane" style={p.solo ? { display: "none" } : { flexBasis: `${(1 - frac) * 100}%` }}>
         {p.children[1]}
       </div>
     </div>
