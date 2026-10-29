@@ -736,14 +736,14 @@ impl AuthSession {
         };
 
         // The token may come with any response of the login: the first one (often a
-        // redirect) or one after it.
+        // redirect) or one after it. When several have it, the last one wins (as before,
+        // when only the final page was searched).
         let mut token = None;
         let mut find_token = |response: &[u8]| {
-            if let (None, Some(re)) = (&token, &self.re.token) {
-                token = re
-                    .captures(&response_text(response))
-                    .and_then(|c| c.get(1).or_else(|| c.get(0)))
-                    .map(|m| m.as_str().to_string());
+            if let Some(re) = &self.re.token {
+                if let Some(m) = re.captures(&response_text(response)).and_then(|c| c.get(1).or_else(|| c.get(0))) {
+                    token = Some(m.as_str().to_string());
+                }
             }
         };
         // Send, following redirects (with cookies) like a browser would.
@@ -763,12 +763,8 @@ impl AuthSession {
             // body); the others continue with a GET, as browsers do.
             let (r, t) = match req.head() {
                 Ok(h) if matches!(head.status, 307 | 308) => {
-                    let framing = ["host", "content-length", "transfer-encoding"];
-                    let headers: Vec<(String, String)> = h
-                        .headers
-                        .into_iter()
-                        .filter(|(k, _)| !framing.iter().any(|f| k.eq_ignore_ascii_case(f)))
-                        .collect();
+                    let same_origin = Target::from_url(current.as_str()).is_ok_and(|t| t.origin() == target.origin());
+                    let headers = replayed_headers(h.headers, same_origin);
                     RawRequest::build(&h.method, current.as_str(), &headers, req.body())?
                 }
                 _ => RawRequest::build("GET", current.as_str(), &[], b"")?,
@@ -869,6 +865,17 @@ fn encode(v: &str, enc: Enc) -> String {
         }
         Enc::Raw => v.to_string(),
     }
+}
+
+/// The headers a 307/308 login redirect repeats: not the framing ones, and not the
+/// template's credentials on another origin (browsers drop Authorization there).
+fn replayed_headers(headers: Vec<(String, String)>, same_origin: bool) -> Vec<(String, String)> {
+    let dropped: &[&str] = if same_origin {
+        &["host", "content-length", "transfer-encoding"]
+    } else {
+        &["host", "content-length", "transfer-encoding", "authorization", "cookie"]
+    };
+    headers.into_iter().filter(|(k, _)| !dropped.iter().any(|f| k.eq_ignore_ascii_case(f))).collect()
 }
 
 /// The cookies of a profile's static Cookie header.
@@ -1009,6 +1016,23 @@ mod tests {
         assert_eq!(substitute("u={{username}}&p={{password}}", "a b", "PW", "", Enc::Form), "u=a+b&p=PW");
         assert_eq!(encode("p&w", Enc::Form), "p%26w");
         assert_eq!(encode("q\"x", Enc::Json), r#"q\"x"#);
+    }
+
+    #[test]
+    fn a_login_redirect_to_another_origin_drops_template_credentials() {
+        let h = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let sent = h(&[
+            ("Host", "a.test"),
+            ("Content-Length", "2"),
+            ("Authorization", "Basic x"),
+            ("Cookie", "a=1"),
+            ("Content-Type", "application/json"),
+        ]);
+        assert_eq!(
+            replayed_headers(sent.clone(), true),
+            h(&[("Authorization", "Basic x"), ("Cookie", "a=1"), ("Content-Type", "application/json")])
+        );
+        assert_eq!(replayed_headers(sent, false), h(&[("Content-Type", "application/json")]));
     }
 
     #[test]

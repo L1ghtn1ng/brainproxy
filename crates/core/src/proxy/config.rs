@@ -174,17 +174,24 @@ pub fn apply_request_rules(rules: &[CompiledRule], req: Vec<u8>) -> Vec<u8> {
         return join(&first, &headers, if chunked && has_body_rule { raw_body } else { &body });
     }
     if chunked {
-        reframe(&mut headers, body.len());
+        // Only the chunks were taken off: a Content-Encoding still applies to the body.
+        reframe(&mut headers, body.len(), false);
         return join(&first, &headers, &body);
     }
     RawRequest::from_bytes(join(&first, &headers, &body)).update_content_length().into_bytes()
 }
 
-/// Drops the framing and coding headers of a decoded body and gives its length.
-fn reframe(headers: &mut Vec<String>, len: usize) {
+/// Drops the framing headers of a de-chunked body (and with `decoded`, its coding header)
+/// and gives its length.
+fn reframe(headers: &mut Vec<String>, len: usize, decoded: bool) {
+    let drop: &[&str] = if decoded {
+        &["content-length", "transfer-encoding", "content-encoding"]
+    } else {
+        &["content-length", "transfer-encoding"]
+    };
     headers.retain(|h| {
         let name = h.split(':').next().unwrap_or("").trim();
-        !["content-length", "transfer-encoding", "content-encoding"].iter().any(|n| name.eq_ignore_ascii_case(n))
+        !drop.iter().any(|n| name.eq_ignore_ascii_case(n))
     });
     headers.push(format!("Content-Length: {len}"));
 }
@@ -224,7 +231,7 @@ pub fn apply_response_rules(rules: &[CompiledRule], resp: Vec<u8>) -> Vec<u8> {
     }
     let body = match decoded.flatten().filter(|_| body_changed) {
         Some(b) => {
-            reframe(&mut headers, b.len());
+            reframe(&mut headers, b.len(), true);
             b
         }
         None => raw_body.to_vec(),
@@ -426,6 +433,12 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nrole=admin"
+        );
+        // A coded body is only de-chunked, so it keeps its Content-Encoding.
+        let coded = b"POST /p HTTP/1.1\r\nContent-Encoding: x-test\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nrole=user\r\n0\r\n\r\n";
+        assert_eq!(
+            String::from_utf8(apply_request_rules(&rules, coded.to_vec())).unwrap(),
+            "POST /p HTTP/1.1\r\nContent-Encoding: x-test\r\nContent-Length: 10\r\n\r\nrole=admin"
         );
         // No match: sent as it came, chunks and all.
         let rules = compile_rules(&[rule(1, RuleLocation::RequestBody, "nothing", "x")]).unwrap();
