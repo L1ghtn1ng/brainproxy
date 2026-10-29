@@ -1,6 +1,7 @@
 //! The intercepting proxy: HTTP/1.x forward proxy with CONNECT, TLS
 //! interception for in-scope hosts (HTTP/2 to clients that offer it), match-and-replace rules, an intercept queue
-//! resolved through the project database, and capture recording.
+//! resolved through the project database, capture recording, and live access-control
+//! testing of recorded requests.
 //!
 //! Connection options: TLS pass-through hosts are tunnelled without being
 //! decrypted (still scope-checked, and recorded as a connection), and with
@@ -22,6 +23,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::auth::AuthSession;
+use crate::authz::live::Live as LiveAuthz;
 use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::client::{close_after, final_response, Conn};
@@ -50,6 +52,14 @@ pub struct ProxyOptions {
     pub invisible: bool,
     /// Send every request from this listener to this origin (implies `invisible`).
     pub redirect: Option<Target>,
+    /// Live access-control testing: in-scope requests are offered to it once recorded.
+    pub authz: Option<Arc<LiveAuthz>>,
+}
+
+/// A capture for the writer, with the request to offer for live access-control testing.
+struct Recorded {
+    capture: Capture,
+    authz: Option<(Target, Vec<u8>)>,
 }
 
 /// Settings in effect, reloaded whenever the project's settings version changes.
@@ -68,7 +78,8 @@ struct Ctx {
     client: Client,
     control: Mutex<Store>,
     live: RwLock<Arc<Live>>,
-    recorder: Mutex<mpsc::Sender<Capture>>,
+    recorder: Mutex<mpsc::Sender<Recorded>>,
+    authz: Option<Arc<LiveAuthz>>,
     stats: Stats,
     http2: bool,
     /// Whether each https origin negotiated HTTP/2 (tried for HTTP/2 clients).
@@ -92,8 +103,9 @@ pub async fn run(
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
     let control = Store::open(&opts.project)?;
-    let (tx, rx) = mpsc::channel::<Capture>();
+    let (tx, rx) = mpsc::channel::<Recorded>();
     let mut writer_store = Store::open(&opts.project)?;
+    let authz = opts.authz.clone();
     let writer = std::thread::spawn(move || {
         while let Ok(first) = rx.recv() {
             let mut batch = vec![first];
@@ -103,8 +115,18 @@ pub async fn run(
                     break;
                 }
             }
-            if let Err(e) = writer_store.record_batch(&batch) {
-                eprintln!("brainproxy: failed to record {} captures: {e}", batch.len());
+            let (captures, offers): (Vec<Capture>, Vec<_>) = batch.into_iter().map(|r| (r.capture, r.authz)).unzip();
+            match writer_store.record_batch(&captures) {
+                Ok(ids) => {
+                    // Offered once recorded, so results point at the history entry.
+                    if let Some(live) = &authz {
+                        for (id, (target, request)) in ids.into_iter().zip(offers).filter_map(|(id, o)| Some((id, o?)))
+                        {
+                            live.offer(id, &target, &request);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("brainproxy: failed to record {} captures: {e}", captures.len()),
             }
             if let Err(e) = crate::scan::passive::scan_pending(&mut writer_store) {
                 eprintln!("brainproxy: passive scan failed: {e}");
@@ -120,6 +142,7 @@ pub async fn run(
         control: Mutex::new(control),
         live: RwLock::new(Arc::new(Live { version: -1, ..Default::default() })),
         recorder: Mutex::new(tx),
+        authz: opts.authz,
         stats: Stats::default(),
         http2: opts.http2,
         h2_origins: Mutex::default(),
@@ -293,7 +316,7 @@ async fn pass_through<S: AsyncRead + AsyncWrite + Unpin>(ctx: &Arc<Ctx>, mut cli
     };
     let https = Target { scheme: "https".into(), ..target.clone() };
     let duration = Some(started.elapsed().as_millis() as i64);
-    send_capture(ctx, Capture::new("proxy", &https, request.as_bytes(), None, duration, Some(&note)));
+    send_capture(ctx, Capture::new("proxy", &https, request.as_bytes(), None, duration, Some(&note)), None);
     result.map(|_| ())
 }
 
@@ -615,7 +638,7 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         Err(e) => {
             ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
             if record {
-                send_capture(ctx, Capture::new("proxy", target, &request, None, None, Some(&e.to_string())));
+                send_capture(ctx, Capture::new("proxy", target, &request, None, None, Some(&e.to_string())), None);
             }
             let status = if matches!(e, Error::OutOfScope(_)) { 403 } else { 502 };
             return Ok(Reply::Error(error_response(status, e.kind(), &e.to_string()), false));
@@ -624,7 +647,9 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     let duration = started.elapsed().as_millis() as i64;
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
     if record {
-        send_capture(ctx, Capture::new("proxy", target, &sent, Some(&response), Some(duration), None));
+        // Live access-control testing gets the in-scope requests, as sent.
+        let authz = (in_scope && ctx.authz.is_some()).then(|| (target.clone(), sent.clone()));
+        send_capture(ctx, Capture::new("proxy", target, &sent, Some(&response), Some(duration), None), authz);
     }
     if status == Some(101) {
         return Ok(Reply::Response(response, conn));
@@ -791,8 +816,8 @@ async fn hold(
     }
 }
 
-fn send_capture(ctx: &Ctx, capture: Capture) {
-    let _ = ctx.recorder.lock().unwrap().send(capture);
+fn send_capture(ctx: &Ctx, capture: Capture, authz: Option<(Target, Vec<u8>)>) {
+    let _ = ctx.recorder.lock().unwrap().send(Recorded { capture, authz });
 }
 
 fn wants_close(version: &str, headers: &[(String, String)]) -> bool {

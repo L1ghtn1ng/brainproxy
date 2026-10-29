@@ -236,3 +236,85 @@ fn empty_and_head_responses_are_not_bypasses() {
     // A refusal is still a refusal.
     assert_eq!(cell(&m, "/api/orders/9", "anonymous")["verdict"], "enforced", "{m}");
 }
+
+/// curl through the proxy as alice; returns the status.
+fn curl_as_alice(proxy: &str, url: &str, extra: &[&str]) -> u16 {
+    let out = Command::new("curl")
+        .args(["-sS", "--noproxy", "", "--max-time", "20", "-x", proxy, "-H", "Cookie: sid=alice-session"])
+        .args(extra)
+        .args(["-o", if cfg!(windows) { "NUL" } else { "/dev/null" }, "-w", "%{http_code}", url])
+        .output()
+        .expect("curl must be installed");
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+}
+
+#[test]
+fn live_mode_tests_proxied_requests_as_other_identities() {
+    let srv = Server::start();
+    let p = tmp_project("live");
+    let home = p.with_file_name("home");
+    let home = home.to_str().unwrap();
+    let started = ok(&p, &["--home", home, "proxy", "start", "--listen", "127.0.0.1:0", "--authz", "bob,anonymous"]);
+    let run_id = started["authz_run"].as_i64().unwrap_or_else(|| panic!("no authz_run: {started}")).to_string();
+    let proxy = started["usage"]["proxy_url"].as_str().unwrap().to_string();
+
+    for path in ["/api/orders/1", "/api/orders/3", "/api/orders/1", "/logout"] {
+        assert_eq!(curl_as_alice(&proxy, &srv.url(path), &[]), 200, "{path}");
+    }
+    assert_eq!(curl_as_alice(&proxy, &srv.url("/api/me"), &["-X", "POST", "-d", "x=1"]), 200);
+    // Requests without credentials aren't tested.
+    let out = Command::new("curl")
+        .args(["-sS", "--noproxy", "", "-x", &proxy, "-o", if cfg!(windows) { "NUL" } else { "/dev/null" }])
+        .arg(srv.url("/public/info"))
+        .status()
+        .unwrap();
+    assert!(out.success());
+
+    // Tested in the background: wait for both orders to have results.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let m = loop {
+        let m = ok(&p, &["authz", "matrix", &run_id]);
+        if m["requests"].as_array().unwrap().len() >= 2 || std::time::Instant::now() > deadline {
+            break m;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert_eq!(m["requests"].as_array().unwrap().len(), 2, "{m}");
+    assert_eq!(cell(&m, "/api/orders/1", "bob")["verdict"], "bypass", "{m}");
+    assert_eq!(cell(&m, "/api/orders/1", "anonymous")["verdict"], "enforced", "{m}");
+    assert_eq!(cell(&m, "/api/orders/3", "bob")["verdict"], "enforced", "{m}");
+    let row = m["requests"].as_array().unwrap().iter().find(|r| r["url"].as_str().unwrap().ends_with("/1")).unwrap();
+    assert_eq!(row["owner"], "alice", "owner from the session value: {row}");
+    assert!(row["source_id"].as_i64().is_some(), "points at the proxied request: {row}");
+    assert_eq!(srv.logouts.load(Ordering::SeqCst), 1, "/logout isn't replayed");
+
+    let status = ok(&p, &["--home", home, "proxy", "status"]);
+    assert_eq!(status["authz"]["run_id"].as_i64().unwrap().to_string(), run_id, "{status}");
+    let progress = &status["authz"]["progress"];
+    assert_eq!(progress["tested"], 2, "{status}");
+    assert_eq!(progress["duplicates"], 1, "{status}");
+    assert_eq!(progress["skipped_excluded_paths"], 1, "{status}");
+    assert_eq!(progress["skipped_methods"], 1, "{status}");
+    assert_eq!(progress["skipped_no_credentials"], 1, "{status}");
+    assert_eq!(progress["dropped_queue_full"], 0, "{status}");
+
+    let f = ok(&p, &["findings", "list", "--source", "authz"]);
+    assert!(f.to_string().contains("Access Control Bypass"), "{f}");
+
+    // Stopping the proxy ends the run.
+    ok(&p, &["--home", home, "proxy", "stop"]);
+    let runs = ok(&p, &["authz", "list"]);
+    let run = runs["runs"].as_array().unwrap().iter().find(|r| r["run_id"].as_i64().unwrap().to_string() == run_id);
+    assert_eq!(run.unwrap()["state"], "completed", "{runs}");
+    let job = ok(&p, &["job", "status", &run_id]);
+    assert_eq!(job["result"]["verdicts"]["bypass"], 1, "{job}");
+}
+
+#[test]
+fn live_mode_needs_known_profiles() {
+    let p = tmp_project("live-args");
+    let home = p.with_file_name("home");
+    let (code, v) =
+        run(&p, &["--home", home.to_str().unwrap(), "proxy", "start", "--listen", "127.0.0.1:0", "--authz", "carol"]);
+    assert_eq!(code, 4, "{v}");
+}

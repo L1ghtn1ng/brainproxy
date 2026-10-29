@@ -540,6 +540,29 @@ engagement scope and is recorded in history with source `authz`.
 `authz run --background` returns a run id; `job wait|status|stop` work on it, and
 `authz list` shows recent runs. The rows are also in the `authz_results` table for `query`.
 
+**Live mode.** `proxy start --authz bob,anonymous` tests requests while you browse, the
+way Burp users use the Autorize extension. Each in-scope request the proxy records that
+carries credentials, uses GET, HEAD or OPTIONS and doesn't match `--authz-exclude`
+(default: logout and sign-off) is also sent, in the background, as each listed profile
+and/or with no credentials (`anonymous`), exactly as `authz run` does. All of it goes
+under one authz run, created when the proxy starts; `proxy start` and `proxy status` print
+its id, and `authz matrix|results|list` and the desktop app's **Access** view work on it
+while it fills up.
+
+```sh
+brainproxy proxy start --auth alice --authz bob,anonymous   # browse as alice
+brainproxy proxy status        # authz.run_id, and counts: tested, waiting, duplicates, dropped
+brainproxy authz matrix 12     # the live run's id
+```
+
+Proxied traffic never waits for the tests. Each method, URL and body is tested once; the
+requests wait in a queue of `--authz-queue` (default 100), and when it is full new ones are
+dropped and counted (`dropped_queue_full` in `proxy status`). `--authz-rate` caps the
+requests per second the tests send (default 5, 0 for no limit); `--authz-keep-cookie`
+keeps a cookie that isn't a credential. The settings in use are stored in the project
+(setting `authz`). `proxy stop` and `project stop` end the run (state `completed`);
+`job stop RUN` stops testing while the proxy carries on (`stopped` once the proxy stops).
+
 More detail: [README](../README.md), [MCP](MCP.md), [checks](CHECKS.md),
 [rule updates](RULE_UPDATES.md), [out-of-band](OOB.md), [desktop app](GUI.md).
 
