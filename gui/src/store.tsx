@@ -10,6 +10,7 @@ export type Tab =
   | "repeater"
   | "fuzzer"
   | "scanner"
+  | "access"
   | "findings"
   | "oob"
   | "decoder"

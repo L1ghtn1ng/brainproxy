@@ -223,6 +223,26 @@ By default an active scan only replays GET, HEAD, OPTIONS and POST requests from
 DELETE, PUT, PATCH and other methods are skipped (and counted as `skipped_methods`) unless
 you include them.
 
+### Access
+Access control across users: does the app let bob read alice's data? See
+[Access control across users](#access-control-across-users-authz) for how it works.
+- **New run:** tick the identities to send each request as (your auth profiles, one per
+  user) and keep *anonymous* on to also send with no session. *Owner* is worked out per
+  request unless you pick one. Choose which requests to test: all recorded requests that
+  carry credentials, one site, a tag, or a SQL condition on history. Only GET, HEAD and
+  OPTIONS requests are replayed, and logout paths never are.
+- **Test live while browsing:** restarts the proxy on the same address so each in-scope
+  request you browse is also tried as those identities in the background (like Burp's
+  Autorize). Its results fill the grid as you go; stopping the proxy ends the run.
+- **Grid:** one row per request, one column per identity. Cells are coloured by verdict:
+  red for a high-confidence bypass, orange medium, yellow low, blue public, grey different,
+  green enforced. Rows with nothing to compare (the owner didn't get a 2xx) are marked
+  skipped. Click a verdict chip above the grid to show only those rows; *Worst first* puts
+  bypasses at the top.
+- **Compare:** click a cell to see the owner's response (the baseline) and that identity's
+  side by side, with the evidence for the verdict. *Requests* shows what was sent, so you
+  can check the owner's credentials were removed; *Diff* opens both in Diff.
+
 ### Findings
 - **Layout:** issues grouped by type, filterable by risk, with false positives hidden by
   default.
