@@ -9,6 +9,7 @@ use brainproxy_core::checks;
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
 use brainproxy_core::scan::active::{self, points, ActiveConfig, PointOptions, ScanTarget, Strength};
 use brainproxy_core::scan::findings_db::FindingFilter;
+use brainproxy_core::session::Tool;
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
 use clap::ValueEnum;
@@ -422,7 +423,7 @@ fn select_targets(
         for u in &args.urls {
             let (req, target) = RawRequest::build("GET", u, &[], b"")?;
             let ex = match auth {
-                Some(a) => rt.block_on(a.send(&req, &target))?,
+                Some(a) => rt.block_on(a.send_as(Tool::Scan, &req, &target))?,
                 None => rt.block_on(client.send(&req, &target))?,
             };
             let id = store.record_exchange("scan", &ex)?;

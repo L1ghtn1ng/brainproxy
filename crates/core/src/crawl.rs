@@ -370,7 +370,7 @@ async fn fetch(
         }
     };
     let sent = match auth {
-        Some(a) => a.send(&raw, &target).await,
+        Some(a) => a.send_as(crate::session::Tool::Crawl, &raw, &target).await,
         None => client.send(&raw, &target).await,
     };
     match sent {

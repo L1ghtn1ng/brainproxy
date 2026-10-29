@@ -80,6 +80,16 @@ const HINTS: &[(&str, Hints)] = &[
     // Starts a browser on the machine running the server.
     ("auth record start", ADD),
     ("auth record finish", REPLACE),
+    // Adds or replaces a macro of that name.
+    ("auth macro add", REPLACE),
+    ("auth macro list", READ),
+    ("auth macro show", READ),
+    // Sends the macro's requests to the target and stores the values it extracts.
+    ("auth macro run", NET),
+    ("auth macro remove", REPLACE),
+    ("auth rule add", ADD),
+    ("auth rule list", READ),
+    ("auth rule remove", REPLACE),
     ("project init", SET),
     ("project info", READ),
     // Stops the proxy, OOB listener and background work; deletes nothing.

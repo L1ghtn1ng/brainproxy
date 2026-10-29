@@ -293,6 +293,34 @@ byte, side by side or unified.
     so history keeps the request without it. A request that brings its own Authorization
     header is left alone. NTLM works over HTTP/1.1 only: the proxy sends those hosts'
     requests upstream over HTTP/1.1 even when the browser speaks HTTP/2 to it.
+  - **Macros:** requests that run in order with the profile's session, like Burp's macros.
+    *New macro from Traffic* lists recent requests; click them in the order they should run
+    (move them up or down), then say what to take from each response into a variable: an
+    HTML input by name (or a `<meta name=… content=…>`), a JSON path such as `data.token`, a
+    regex (group 1), a response header, or a cookie the response sets. Later steps use a
+    value as `{{name}}` (also `{{username}}` and `{{password}}`), and their parameters with
+    the same name get it automatically; cookies carry through the steps into the session.
+    *Run* shows each step's request, status and history entry, and the values found, masked
+    (first four characters and the length). The values become the session's latest.
+  - **Session rules:** what to do before a request goes out with this profile, for the
+    tools you tick (proxy, send, fuzz, crawl including API import requests, scan, checks;
+    none ticked means all) and a URL: a host pattern like `*.app.test` or a URL prefix like
+    `https://app.test/api/`. Actions run in order: *Check session* fetches the check URL
+    (every N requests); if it's still valid the rest of the rule is skipped. *Run macro*
+    runs a macro on every request, every N requests, or once and again only when its values
+    go stale. *Update request* puts macro values into the request: every query, form, JSON
+    or multipart parameter, header or cookie with the variable's name (or the names you map,
+    such as `X-CSRF-Token=csrf`); a parameter being fuzzed or attacked keeps its payload.
+    *Log in* logs in with the profile when the session isn't logged in or a check just
+    failed. A response that looks logged out, or matches the rule's *stale-values* regex
+    (for example `invalid csrf token`), refreshes the rule's macros (once, however many
+    requests notice at the same time), logs in again if it can, and sends the request once
+    more. A profile needs no login or headers of its own when its rules do the work.
+    Extracted values are stored like the session cookies and recorded as placeholders such
+    as `«auth:NAME:var:csrf#7»`: each macro run has its own, so requests prepared at the
+    same time each send their own token, and a request re-sent later gets the latest value.
+    A value only goes to the origins of its macro's steps and of the requests a rule put it
+    in. Macro requests are checked against the engagement scope like any other request.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
@@ -376,6 +404,13 @@ brainproxy findings show 12
 brainproxy query "SELECT url, status FROM history WHERE status >= 500"
 brainproxy report html -o acme-report.html
 
+# Session handling: a macro that fetches a fresh CSRF token (history #42 is the form page),
+# and a rule that puts one into every request of active scans and fuzz runs
+brainproxy auth macro add app csrf --step 42 --extract '1:csrf=input:csrf_token'
+brainproxy auth macro run app csrf
+brainproxy auth rule add app --tool scan,checks,fuzz --action macro:csrf:each --action update:csrf
+brainproxy scan active https://app.acme.test/account --auth app
+
 brainproxy project save --output ~/work/acme-copy.bpdb   # consistent copy, safe while in use; never overwrites
 brainproxy project stop     # stop the project's proxy, OOB listener, jobs and fuzz runs (deletes nothing)
 ```
@@ -422,6 +457,24 @@ Crawl and active-scan scope and safety flags:
 - The crawler submits at most 200 forms per page.
 - `scan active --include-methods DELETE,PUT,PATCH` (or `all`): also attack requests with
   these methods. Requests picked with `--history-id` are attacked whatever their method.
+
+Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles above):
+
+- `auth macro add PROFILE NAME --step ID|FILE|ORIGIN=FILE ... --extract STEP:VAR=KIND:EXPR ...`
+  adds or replaces a macro. KIND is `regex`, `json`, `header`, `cookie` or `input`. A FILE
+  step is sent to its `Host` over `--scheme` (default https) unless the request line has a
+  full URL or ORIGIN is given. `auth macro list/show/run/remove`; a macro a rule runs
+  can't be removed until the rule is.
+- `auth macro run` fails (exit code 2) when a step gets no response or a value isn't
+  found, and says which, with each step's status and history id.
+- `auth rule add PROFILE --action SPEC ... [--tool T,...] [--url PATTERN] [--invalid REGEX]`,
+  SPEC being `check[:N]`, `macro:NAME[:each|:N]`, `update[:PARAM[=VAR],...]` or `login`.
+  `auth rule list/remove`. `auth show` lists the macros and rules too.
+- `macro:NAME` alone runs the macro once per command and again when a response shows its
+  values went stale; the cache isn't shared between commands, so each `send` runs it once.
+  `:each` runs it for every request, which a scan or fuzz run with `-c 10` does ten at a
+  time: use it when tokens are single-use, and lower `-c` if the site keeps only the
+  latest token per session.
 
 More detail: [README](../README.md), [MCP](MCP.md), [checks](CHECKS.md),
 [rule updates](RULE_UPDATES.md), [out-of-band](OOB.md), [desktop app](GUI.md).

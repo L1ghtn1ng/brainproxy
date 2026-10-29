@@ -26,6 +26,8 @@ import {
   type PlatformForm,
   type UpstreamForm,
 } from "./connection";
+import { SessionHandling } from "./SessionHandling";
+import type { MacroSummary, SessionRule } from "./sessionHandling";
 import NOTICE from "../../../NOTICE?raw";
 
 type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "data" | "project" | "licenses";
@@ -125,6 +127,8 @@ interface Session {
   token: boolean;
   last_login: string | null;
   last_error: string | null;
+  /** Names of the values its macros extracted. */
+  vars?: string[];
 }
 
 interface Profile {
@@ -274,12 +278,19 @@ function SessionState({ s }: { s: Session }) {
   );
 }
 
+interface Shown {
+  profile: Profile;
+  session: Session;
+  macros: MacroSummary[];
+  rules: SessionRule[];
+}
+
 function Auth() {
   const app = useApp();
   const exec = useRunner();
   const [list, setList] = useState<ProfileItem[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [shown, setShown] = useState<{ profile: Profile; session: Session } | null>(null);
+  const [shown, setShown] = useState<Shown | null>(null);
   const [check, setCheck] = useState<{ url: string; status: number | null; logged_in: boolean } | null>(null);
   const [form, setForm] = useState<Form | null>(null);
   const [editing, setEditing] = useState(false);
@@ -291,7 +302,7 @@ function Auth() {
     if (d) setList(d.profiles);
   };
   const show = async (name: string) => {
-    const d = await exec<{ profile: Profile; session: Session }>(["auth", "show", "--", name]);
+    const d = await exec<Shown>(["auth", "show", "--", name]);
     if (d) setShown(d);
   };
   useEffect(() => {
@@ -404,7 +415,8 @@ function Auth() {
           </div>
           <p className="muted small">
             A profile logs in (form, JSON, or a raw request), keeps the session, and re-logs in when it sees a 401, a
-            redirect to the login page, or the logged-out pattern. Without a login URL it only adds the headers below.
+            redirect to the login page, or the logged-out pattern. Without a login URL it only adds the headers below (and
+            what its macros and session rules do).
           </p>
           <h3>Profile</h3>
           <div className="form">
@@ -562,6 +574,12 @@ function Auth() {
             <dd className="mono">{shown.session.cookies.join(", ") || "none"}</dd>
             <dt>Token</dt>
             <dd>{shown.session.token ? "captured" : "none"}</dd>
+            {!!shown.session.vars?.length && (
+              <>
+                <dt>Macro values</dt>
+                <dd className="mono">{shown.session.vars.join(", ")}</dd>
+              </>
+            )}
             <dt>Last login</dt>
             <dd>{shown.session.last_login ?? "never"}</dd>
             {shown.session.last_error && (
@@ -607,6 +625,14 @@ function Auth() {
                 </Fragment>
               ))}
           </dl>
+          <SessionHandling
+            profile={shown.profile.name}
+            macros={shown.macros ?? []}
+            rules={shown.rules ?? []}
+            hasCheckUrl={!!shown.profile.check_url}
+            hasLogin={!!shown.profile.login_url}
+            onChange={() => show(shown.profile.name)}
+          />
           <p className="muted small">
             Use it with <span className="mono">--auth {shown.profile.name}</span> on send, fuzz, crawl, scan active, and proxy start.
           </p>

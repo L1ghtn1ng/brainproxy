@@ -126,9 +126,6 @@ impl AuthProfile {
 
     /// Checks regexes and required fields.
     pub fn validate(&self) -> Result<()> {
-        if !self.has_login() && self.headers.is_empty() && self.platform.is_none() {
-            return Err(Error::InvalidInput("profile needs --login-url, --platform, or at least one --header".into()));
-        }
         if let Some(p) = &self.platform {
             p.validate(self.username.as_deref(), self.password.as_ref())?;
         }
@@ -177,6 +174,16 @@ pub struct SessionState {
     pub last_error: Option<String>,
     #[serde(default)]
     pub logged_in: bool,
+    /// Latest values extracted by the profile's macros.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vars: Vec<crate::session::SessionVar>,
+    /// Macro runs so far, so placeholders of different runs differ across commands.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub macro_runs: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Store {
@@ -233,6 +240,7 @@ impl Store {
         if self.conn.execute("DELETE FROM auth_profiles WHERE name = ?1", [name])? == 0 {
             return Err(Error::NotFound(format!("auth profile {name:?}")));
         }
+        self.auth_save_handling(name, &Default::default())?;
         self.bump_settings_version()
     }
 }
@@ -248,10 +256,22 @@ const MARK: &str = "«auth:";
 #[derive(Clone)]
 struct VaultEntry {
     value: String,
-    /// Lowercase header the value may be filled into; None for a password.
+    /// Lowercase header the value may be filled into; None for a value that may go
+    /// anywhere in a request to one of `origins` (a password, a macro value).
     header: Option<String>,
-    /// Origin a password may be sent to (the login URL's).
-    origin: Option<String>,
+    /// Origins an anywhere value may be sent to.
+    origins: Vec<String>,
+}
+
+/// Values of per-run macro placeholders kept at most; older ones fall back to the
+/// variable's latest value.
+const RUN_ENTRIES: usize = 4096;
+
+#[derive(Clone, Default)]
+struct VaultInner {
+    entries: HashMap<String, VaultEntry>,
+    /// Per-run placeholders in the order they were added, for pruning.
+    runs: std::collections::VecDeque<String>,
 }
 
 /// Current values behind auth placeholders. The auth layer writes placeholders into
@@ -260,7 +280,7 @@ struct VaultEntry {
 /// on the wire. It lives in the project's [`crate::guard::Guard`], which every client
 /// of a command shares.
 #[derive(Default)]
-pub struct Vault(Mutex<HashMap<String, VaultEntry>>);
+pub struct Vault(Mutex<VaultInner>);
 
 impl Clone for Vault {
     fn clone(&self) -> Self {
@@ -270,56 +290,94 @@ impl Clone for Vault {
 
 impl std::fmt::Debug for Vault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Vault({} values)", self.0.lock().unwrap().len())
+        write!(f, "Vault({} values)", self.0.lock().unwrap().entries.len())
     }
 }
 
 impl Vault {
-    fn put(&self, ph: String, value: &str, header: Option<&str>, origin: Option<String>) {
+    fn put(&self, ph: String, value: &str, header: Option<&str>, origins: Vec<String>) {
         let entry =
-            VaultEntry { value: value.to_string(), header: header.map(|h| h.trim().to_ascii_lowercase()), origin };
-        self.0.lock().unwrap().insert(ph, entry);
+            VaultEntry { value: value.to_string(), header: header.map(|h| h.trim().to_ascii_lowercase()), origins };
+        self.0.lock().unwrap().entries.insert(ph, entry);
     }
 
-    /// Registers a profile's session values: cookies, token, static headers.
+    /// Lets an anywhere value (password, macro value) also go to `origin`.
+    pub(crate) fn allow(&self, ph: &str, origin: &str) {
+        if let Some(e) = self.0.lock().unwrap().entries.get_mut(ph) {
+            if e.header.is_none() && !e.origins.iter().any(|o| o == origin) {
+                e.origins.push(origin.to_string());
+            }
+        }
+    }
+
+    /// Registers a macro value: its per-run placeholders and the variable's latest
+    /// value (which history replays of an older run fall back to), each encoded for
+    /// the raw, form and JSON contexts.
+    pub(crate) fn put_var(&self, profile: &str, var: &crate::session::SessionVar) {
+        let mut inner = self.0.lock().unwrap();
+        for enc in [Enc::Raw, Enc::Form, Enc::Json] {
+            let value = encode(&var.value, enc);
+            let entry = VaultEntry { value, header: None, origins: var.origins.clone() };
+            let run = placeholder(profile, &crate::session::var_kind(&var.name, Some(var.run), enc));
+            if inner.entries.insert(run.clone(), entry.clone()).is_none() {
+                inner.runs.push_back(run);
+            }
+            inner.entries.insert(placeholder(profile, &crate::session::var_kind(&var.name, None, enc)), entry);
+        }
+        while inner.runs.len() > RUN_ENTRIES {
+            if let Some(old) = inner.runs.pop_front() {
+                inner.entries.remove(&old);
+            }
+        }
+    }
+
+    /// Registers a profile's session values: cookies, token, static headers, macro values.
     fn put_session(&self, p: &AuthProfile, st: &SessionState) {
         // A static Cookie header's cookies first, so a learned cookie of the same name wins.
         for (k, v) in static_cookies(p) {
-            self.put(placeholder(&p.name, &format!("cookie:{k}")), &v, Some("cookie"), None);
+            self.put(placeholder(&p.name, &format!("cookie:{k}")), &v, Some("cookie"), vec![]);
         }
         for (k, v) in &st.cookies {
-            self.put(placeholder(&p.name, &format!("cookie:{k}")), v, Some("cookie"), None);
+            self.put(placeholder(&p.name, &format!("cookie:{k}")), v, Some("cookie"), vec![]);
         }
         if let (Some(tpl), Some(tok)) = (&p.token_header, &st.token) {
             if let Some((k, _)) = tpl.split_once(':') {
-                self.put(placeholder(&p.name, "token"), tok, Some(k), None);
+                self.put(placeholder(&p.name, "token"), tok, Some(k), vec![]);
             }
         }
         for (k, v) in p.headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("cookie")) {
-            self.put(placeholder(&p.name, &format!("header:{k}")), v, Some(k), None);
+            self.put(placeholder(&p.name, &format!("header:{k}")), v, Some(k), vec![]);
+        }
+        for var in &st.vars {
+            self.put_var(&p.name, var);
         }
     }
 
     /// Registers a password, encoded for each login body type, for the login origin only.
-    fn put_password(&self, p: &AuthProfile, password: &str) {
+    pub(crate) fn put_password(&self, p: &AuthProfile, password: &str) {
         let origin = p.login_url.as_deref().and_then(|u| Target::from_url(u).ok()).map(|t| t.origin());
         for enc in [Enc::Raw, Enc::Form, Enc::Json] {
-            self.put(placeholder(&p.name, enc.password_kind()), &encode(password, enc), None, origin.clone());
+            self.put(
+                placeholder(&p.name, enc.password_kind()),
+                &encode(password, enc),
+                None,
+                origin.iter().cloned().collect(),
+            );
         }
     }
 
     /// The request with placeholders replaced by their values. A header value is only
-    /// filled into its own header and a password only into requests to the login
-    /// origin, so a placeholder can't be moved somewhere that reflects it back. Fails
-    /// on a placeholder left over (profile removed, never logged in, password variable
-    /// unset, or the placeholder moved out of its header).
+    /// filled into its own header, and a password or macro value only into requests to
+    /// the origins it belongs to, so a placeholder can't be moved somewhere that
+    /// reflects it back. Fails on a placeholder left over (profile removed, never logged
+    /// in, password variable unset, or the placeholder moved out of its header).
     pub fn resolve<'a>(&self, raw: &'a [u8], target: &Target) -> Result<Cow<'a, [u8]>> {
         if find(raw, MARK.as_bytes()).is_none() {
             return Ok(Cow::Borrowed(raw));
         }
-        let entries = self.0.lock().unwrap().clone();
+        let inner = self.0.lock().unwrap();
         let origin = target.origin();
-        let anywhere = |e: &VaultEntry| e.header.is_none() && e.origin.as_deref() == Some(origin.as_str());
+        let anywhere = |e: &VaultEntry| e.header.is_none() && e.origins.iter().any(|o| o == &origin);
         let (head, body) = split_head_body(raw);
         let mut out = Vec::with_capacity(raw.len());
         for line in head.split_inclusive(|&b| b == b'\n') {
@@ -327,28 +385,12 @@ impl Vault {
                 .iter()
                 .position(|&b| b == b':')
                 .map(|i| String::from_utf8_lossy(&line[..i]).trim().to_ascii_lowercase());
-            let mut line = line.to_vec();
-            for (ph, e) in &entries {
-                if anywhere(e) || (e.header.is_some() && e.header == name) {
-                    line = replace(&line, ph.as_bytes(), e.value.as_bytes());
-                }
-            }
-            out.extend(line);
+            let allowed = |e: &VaultEntry| anywhere(e) || (e.header.is_some() && e.header == name);
+            out.extend(fill(&inner.entries, line, allowed)?);
         }
-        let mut new_body = body.to_vec();
-        for (ph, e) in entries.iter().filter(|(_, e)| anywhere(e)) {
-            new_body = replace(&new_body, ph.as_bytes(), e.value.as_bytes());
-        }
+        let new_body = fill(&inner.entries, body, anywhere)?;
         let body_changed = new_body != body;
         out.extend(new_body);
-        if let Some(i) = find(&out, MARK.as_bytes()) {
-            let rest = String::from_utf8_lossy(&out[i..]);
-            let ph: String = rest.chars().take(120).take_while(|&c| c != '»').chain(Some('»')).collect();
-            return Err(Error::InvalidInput(format!(
-                "no value for {ph} in this request: the auth profile was removed, has not logged in \
-                 (`auth login`), its password variable is unset, or the placeholder is outside its header"
-            )));
-        }
         if body_changed {
             out = RawRequest::from_bytes(out).update_content_length().into_bytes();
         }
@@ -356,16 +398,41 @@ impl Vault {
     }
 }
 
-fn replace(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(hay.len());
-    let mut rest = hay;
-    while let Some(i) = find(rest, from) {
+/// `text` with each placeholder replaced by its value, where `allowed` lets it go.
+/// A per-run macro placeholder no longer kept falls back to the variable's latest value.
+fn fill(entries: &HashMap<String, VaultEntry>, text: &[u8], allowed: impl Fn(&VaultEntry) -> bool) -> Result<Vec<u8>> {
+    const END: &[u8] = "»".as_bytes();
+    let mut out = Vec::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = find(rest, MARK.as_bytes()) {
         out.extend_from_slice(&rest[..i]);
-        out.extend_from_slice(to);
-        rest = &rest[i + from.len()..];
+        rest = &rest[i..];
+        let end = find(&rest[..rest.len().min(400)], END).map(|j| j + END.len());
+        let ph = end.map(|j| String::from_utf8_lossy(&rest[..j]).into_owned());
+        let entry = ph
+            .as_deref()
+            .and_then(|ph| entries.get(ph).or_else(|| entries.get(&crate::session::latest_placeholder(ph)?)));
+        match (entry.filter(|e| allowed(e)), end) {
+            (Some(e), Some(j)) => {
+                out.extend_from_slice(e.value.as_bytes());
+                rest = &rest[j..];
+            }
+            _ => {
+                let shown: String = String::from_utf8_lossy(rest)
+                    .chars()
+                    .take(120)
+                    .take_while(|&c| c != '»')
+                    .chain(Some('»'))
+                    .collect();
+                return Err(Error::InvalidInput(format!(
+                    "no value for {shown} in this request: the auth profile was removed, has not logged in \
+                     (`auth login`), its password variable is unset, or the placeholder is outside its header"
+                )));
+            }
+        }
     }
     out.extend_from_slice(rest);
-    out
+    Ok(out)
 }
 
 impl Store {
@@ -431,14 +498,16 @@ struct Compiled {
 pub struct AuthSession {
     pub profile: AuthProfile,
     re: Compiled,
-    client: Client,
+    pub(crate) client: Client,
     project: PathBuf,
-    state: Mutex<SessionState>,
+    pub(crate) state: Mutex<SessionState>,
     /// Bumped on every login, so concurrent workers re-login only once.
     generation: AtomicU64,
     relogins: AtomicU32,
     last_login: Mutex<Option<Instant>>,
     login_lock: tokio::sync::Mutex<()>,
+    /// Macros and session rules (see [`crate::session`]).
+    pub(crate) handling: crate::session::Runtime,
 }
 
 impl std::fmt::Debug for AuthSession {
@@ -449,8 +518,10 @@ impl std::fmt::Debug for AuthSession {
 
 impl AuthSession {
     pub fn load(project: &Path, name: &str, client: Client) -> Result<Self> {
-        let (profile, state) = Store::open(project)?.auth_profile(name)?;
-        Self::new(project, profile, state, client)
+        let store = Store::open(project)?;
+        let (profile, state) = store.auth_profile(name)?;
+        let handling = store.auth_handling(name)?;
+        Self::new(project, profile, state, client)?.with_handling(handling)
     }
 
     pub fn new(project: &Path, profile: AuthProfile, state: SessionState, client: Client) -> Result<Self> {
@@ -473,6 +544,7 @@ impl AuthSession {
             relogins: AtomicU32::new(0),
             last_login: Mutex::new(None),
             login_lock: tokio::sync::Mutex::new(()),
+            handling: Default::default(),
         })
     }
 
@@ -620,7 +692,7 @@ impl AuthSession {
     /// Whether a response shows the session was lost: 401, a logged-out pattern,
     /// or a redirect to the login page.
     pub fn is_logged_out(&self, response: &[u8]) -> bool {
-        if !self.profile.has_login() {
+        if !self.profile.has_login() && !self.handling.active() {
             return false;
         }
         let Ok(head) = parse_response_head(response) else { return false };
@@ -640,15 +712,19 @@ impl AuthSession {
     }
 
     /// Sends a request with the session applied, learning cookies, and logs in
-    /// again (once) if the response shows the session was lost.
+    /// again (once) if the response shows the session was lost. Session rules for
+    /// the `send` tool apply.
     pub async fn send(&self, req: &RawRequest, target: &Target) -> Result<Exchange> {
-        let gen = self.generation();
-        let prepared = RawRequest::from_bytes(self.apply(req.as_bytes(), &[]));
-        let ex = self.client.send(&prepared, target).await?;
-        self.observe(&ex.response);
-        if self.is_logged_out(&ex.response) && self.relogin(gen).await {
-            let again = RawRequest::from_bytes(self.apply(req.as_bytes(), &[]));
-            let ex = self.client.send(&again, target).await?;
+        self.send_as(crate::session::Tool::Send, req, target).await
+    }
+
+    /// [`AuthSession::send`] for requests of `tool`, whose session rules apply.
+    pub async fn send_as(&self, tool: crate::session::Tool, req: &RawRequest, target: &Target) -> Result<Exchange> {
+        let prepared = self.prepare(tool, target, req.as_bytes(), &[], &[]).await;
+        let ex = self.client.send(&RawRequest::from_bytes(prepared.request.clone()), target).await?;
+        if self.after_response(&prepared, &ex.response).await {
+            let again = self.prepare(tool, target, req.as_bytes(), &[], &[]).await;
+            let ex = self.client.send(&RawRequest::from_bytes(again.request), target).await?;
             self.observe(&ex.response);
             return Ok(ex);
         }
@@ -832,7 +908,7 @@ impl AuthSession {
         })
     }
 
-    fn record(&self, ex: &Exchange) -> Option<i64> {
+    pub(crate) fn record(&self, ex: &Exchange) -> Option<i64> {
         let store = Store::open(&self.project).ok()?;
         store
             .record(&Capture::new(
@@ -848,14 +924,14 @@ impl AuthSession {
 }
 
 #[derive(Clone, Copy)]
-enum Enc {
+pub(crate) enum Enc {
     Form,
     Json,
     Raw,
 }
 
 impl Enc {
-    fn password_kind(self) -> &'static str {
+    pub(crate) fn password_kind(self) -> &'static str {
         match self {
             Enc::Raw => "password",
             Enc::Form => "password:form",
@@ -864,7 +940,7 @@ impl Enc {
     }
 }
 
-fn encode(v: &str, enc: Enc) -> String {
+pub(crate) fn encode(v: &str, enc: Enc) -> String {
     match enc {
         Enc::Form => url::form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>(),
         Enc::Json => {
@@ -942,7 +1018,7 @@ fn substitute(tpl: &str, user: &str, pass: &str, csrf: &str, enc: Enc) -> String
         .replace("{{csrf}}", &encode(csrf, enc))
 }
 
-fn response_text(response: &[u8]) -> String {
+pub(crate) fn response_text(response: &[u8]) -> String {
     let Ok(head) = parse_response_head(response) else { return String::from_utf8_lossy(response).into_owned() };
     let (h, b) = split_head_body(response);
     let mut s = String::from_utf8_lossy(h).into_owned();
@@ -1091,7 +1167,8 @@ mod tests {
 
     #[test]
     fn validation_and_redaction() {
-        assert!(AuthProfile { name: "x".into(), ..Default::default() }.validate().is_err());
+        // No login and no headers: a session made by macros and session rules only.
+        assert!(AuthProfile { name: "x".into(), ..Default::default() }.validate().is_ok());
         let p = AuthProfile {
             name: "x".into(),
             login_url: Some("https://a.test/l".into()),

@@ -33,6 +33,7 @@ use crate::proxy::config::{
     InterceptSettings, Rule, Scope, TimeoutAction, INTERCEPT_KEY, RULES_KEY, SCOPE_KEY,
 };
 use crate::proxy::h2 as h2p;
+use crate::session::Tool;
 use crate::store::Store;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -575,10 +576,13 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         live.scope.allows(&target.host) && ctx.guard.as_ref().is_some_and(|g| g.may_allow(&target.host, target.port));
 
     let auth = ctx.auth.as_ref().filter(|_| in_scope);
+    let mut prepared = None;
     if in_scope {
         request = apply_request_rules(&live.rules, request);
         if let Some(a) = auth {
-            request = a.apply(&request, &[]);
+            let p = a.prepare(Tool::Proxy, target, &request, &[], &[]).await;
+            request = p.request.clone();
+            prepared = Some(p);
         }
         if live.intercept.matches(false, &method, &target.host, &path) {
             match hold(ctx, &live.intercept, "request", &method, &url, None, request.clone()).await? {
@@ -593,14 +597,13 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     // A rule or an edit may have changed the method (GET to HEAD): the response is framed
     // by the one sent.
     let method = RawRequest::from_bytes(request.clone()).head().map(|h| h.method).unwrap_or(method);
-    let generation = auth.map(|a| a.generation()).unwrap_or(0);
     let started = Instant::now();
     let mut upstream = forward(ctx, target, &request, &method, h2).await;
-    if let (Some(a), Ok(up)) = (auth, &upstream) {
-        a.observe(&up.response);
-        // Session lost: log in again and replay the request with the new session.
-        if a.is_logged_out(&up.response) && a.relogin(generation).await {
-            request = a.apply(&request, &[]);
+    if let (Some(a), Some(p), Ok(up)) = (auth, &prepared, &upstream) {
+        // Session lost or stale session values: log in again or refresh them, and
+        // replay the request with the new session.
+        if a.after_response(p, &up.response).await {
+            request = a.prepare(Tool::Proxy, target, &request, &[], &[]).await.request;
             upstream = forward(ctx, target, &request, &method, h2).await;
             if let Ok(up) = &upstream {
                 a.observe(&up.response);

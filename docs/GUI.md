@@ -108,7 +108,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
 | Tools | Codec | Stacked encode/decode/hash steps | `encode`, `decode`, `hash` |
 | Tools | Diff | Items sent from other tools or pasted; line/word/byte diff side by side or unified | client-side diff; `diff A B` for two history entries |
-| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM), match & replace, intercept options, proxy (status, start, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *`, `rules *`, `intercept *`, `proxy status/start`, `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
+| | Settings | Auth profiles (including platform auth: Basic, Digest, NTLM; with macros built from Traffic and session rules), match & replace, intercept options, proxy (status, start, setup for browsers/curl/shell), connections (upstream proxies, host overrides, client certificates, TLS pass-through, check a target's route), TLS/CA, rule data, project, open source licenses (credits and NOTICE) | `auth *` (incl. `auth macro add/run/remove`, `auth rule add/remove`, `query` for the Traffic picker), `rules *`, `intercept *`, `proxy status/start`, `connection *`, `ca init/export`, `checks *`, `scan data *`, `project info`, `project save` (temporary engagements), `engagement show` |
 
 ### Guided scan
 
@@ -200,4 +200,8 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   typed again; `--login-request` only takes a file.
 - A literal auth password goes to `auth add` in `BRAINPROXY_SECRET_PASSWORD`, not argv. The
   login body is a template (`{{password}}` is filled at login), so it stays an argument.
+- Macros are built from Traffic entries only (the 500 most recent); a step from a raw
+  request file, or a step whose request should be edited (to add `{{name}}`), needs
+  `auth macro add` on the command line. A macro or rule is replaced or removed, not edited
+  in place.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).

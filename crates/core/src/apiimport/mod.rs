@@ -264,7 +264,8 @@ pub async fn run(project: &Path, requests: Vec<ApiRequest>, cfg: RunConfig, ctl:
                 return None;
             }
             let sent = match auth.as_deref() {
-                Some(a) => a.send(&raw, &target).await,
+                // Requests made from a spec count as crawl traffic for session rules.
+                Some(a) => a.send_as(crate::session::Tool::Crawl, &raw, &target).await,
                 None => client.send(&raw, &target).await,
             };
             Some((req, raw, target, sent))
