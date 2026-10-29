@@ -985,7 +985,7 @@ mod tests {
         let key = session("key", AuthProfile { headers: vec![("X-Api-Key".into(), "k".into())], ..Default::default() });
         let req = "GET /a HTTP/1.1\r\nHost: a.test\r\nAuthorization: Bearer x\r\nX-Api-Key: k\r\n\
                    X-Other: «auth:app:header:X-Other»\r\nCookie: sid=1; lang=en\r\nAccept: */*\r\n\r\n";
-        let out = String::from_utf8(strip_auth(req.as_bytes(), &[key.clone()], &["lang".into()])).unwrap();
+        let out = String::from_utf8(strip_auth(req.as_bytes(), std::slice::from_ref(&key), &["lang".into()])).unwrap();
         assert_eq!(out, "GET /a HTTP/1.1\r\nHost: a.test\r\nCookie: lang=en\r\nAccept: */*\r\n\r\n");
         let out = String::from_utf8(strip_auth(req.as_bytes(), &[key], &[])).unwrap();
         assert_eq!(out, "GET /a HTTP/1.1\r\nHost: a.test\r\nAccept: */*\r\n\r\n");

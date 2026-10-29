@@ -132,7 +132,7 @@ pub(crate) fn similarity(a: &Body, b: &Body, noise: &Noise) -> f64 {
             if keys.is_empty() {
                 return 1.0;
             }
-            let same = keys.iter().filter(|k| ma.get(*k).is_some() && ma.get(*k) == mb.get(*k)).count();
+            let same = keys.iter().filter(|k| ma.contains_key(*k) && ma.get(*k) == mb.get(*k)).count();
             same as f64 / keys.len() as f64
         }
         (None, None) => {
@@ -205,7 +205,7 @@ pub(crate) fn references_object(target: &str, body: &str) -> bool {
         s.split(|c: char| {
             matches!(c, '/' | '?' | '&' | '=' | ',' | ';' | ':' | '"' | '\'' | ' ' | '{' | '}' | '[' | ']')
         })
-        .map(|t| crate::scan::message::url_decode(t))
+        .map(crate::scan::message::url_decode)
         .collect::<Vec<_>>()
     };
     // Version segments such as /v2/ or /api/1.0/ aren't objects.
