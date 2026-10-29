@@ -364,6 +364,16 @@ impl Guard {
 
     /// Resolves `host` and returns the socket addresses every scope allows.
     pub async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        self.resolve_with(host, port, &self.net.get()).await
+    }
+
+    /// [`Guard::resolve`] with the host overrides of this snapshot of the connection options.
+    pub async fn resolve_with(
+        &self,
+        host: &str,
+        port: u16,
+        net: &crate::connection::Compiled,
+    ) -> Result<Vec<SocketAddr>> {
         // Look the name up as given (a trailing dot stops search-domain expansion),
         // but check it in canonical form.
         let lookup = host.trim_start_matches('[').trim_end_matches(']');
@@ -375,7 +385,7 @@ impl Guard {
                 self.precheck_name(bare, port)?;
                 let named = self.scopes.iter().all(|sc| sc.include.iter().any(|e| e.matches_name(bare, port)));
                 // A host override stands in for DNS; its address is checked below like an answer.
-                if let Some(ip) = self.net.get().host_override(bare) {
+                if let Some(ip) = net.host_override(bare) {
                     return self.check(bare, port, vec![ip]);
                 }
                 match tokio::net::lookup_host((lookup, port)).await {
@@ -412,6 +422,16 @@ impl Guard {
     /// A proxy anywhere else could read what goes through it (TLS isn't verified by
     /// default), so the scopes, not the changeable connection settings, decide.
     pub async fn resolve_proxy(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        self.resolve_proxy_with(host, port, &self.net.get()).await
+    }
+
+    /// [`Guard::resolve_proxy`] with the host overrides of this snapshot of the connection options.
+    pub async fn resolve_proxy_with(
+        &self,
+        host: &str,
+        port: u16,
+        net: &crate::connection::Compiled,
+    ) -> Result<Vec<SocketAddr>> {
         let bare = norm_host(host);
         let refused = || {
             Error::OutOfScope(format!(
@@ -424,7 +444,7 @@ impl Guard {
             |s: &Scope| s.proxies.iter().any(|e| e.matches_name(&bare, port) || matches!(e.pattern, Pattern::Net(..)));
         let addrs: Vec<IpAddr> = match bare.parse::<IpAddr>() {
             Ok(ip) => vec![ip],
-            Err(_) => match self.net.get().host_override(&bare) {
+            Err(_) => match net.host_override(&bare) {
                 Some(ip) => vec![ip],
                 None if bare != "localhost" && !self.scopes.iter().all(may_name) => return Err(refused()),
                 None => tokio::net::lookup_host((host.trim_start_matches('[').trim_end_matches(']'), port))

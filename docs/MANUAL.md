@@ -291,7 +291,8 @@ byte, side by side or unified.
     `DOMAIN\user`). brainproxy answers those hosts' 401 challenges on every command and
     through the proxy, without choosing the profile; the header is added on the wire only,
     so history keeps the request without it. A request that brings its own Authorization
-    header is left alone. NTLM works over HTTP/1.1 only.
+    header is left alone. NTLM works over HTTP/1.1 only: the proxy sends those hosts'
+    requests upstream over HTTP/1.1 even when the browser speaks HTTP/2 to it.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,

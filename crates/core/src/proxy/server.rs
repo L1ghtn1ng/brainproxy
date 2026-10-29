@@ -299,8 +299,8 @@ async fn pass_through<S: AsyncRead + AsyncWrite + Unpin>(ctx: &Arc<Ctx>, mut cli
 /// A client that sent TLS straight to the listener (invisible proxying): the host
 /// comes from the ClientHello's SNI (or the redirect target), port 443.
 async fn serve_invisible_tls(ctx: &Arc<Ctx>, mut tcp: TcpStream) -> Result<()> {
-    let hello = read_client_hello(&mut tcp).await?;
-    let sni = sni_from_client_hello(&hello);
+    let (hello, handshake) = read_client_hello(&mut tcp).await?;
+    let sni = sni_from_client_hello(&handshake);
     let target = match (&ctx.redirect, &sni) {
         (Some(r), _) => r.clone(),
         (None, Some(name)) => Target::from_url(&format!("https://{name}:443"))
@@ -332,21 +332,41 @@ async fn serve_invisible_tls(ctx: &Arc<Ctx>, mut tcp: TcpStream) -> Result<()> {
     serve_http(ctx, tls, WireReader::new(), Some(named)).await
 }
 
-/// The first TLS record (the ClientHello), read whole so it can be parsed and
-/// then replayed to the acceptor or the pass-through tunnel.
-async fn read_client_hello(tcp: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut head = [0u8; 5];
-    tcp.read_exact(&mut head).await?;
-    let len = u16::from_be_bytes([head[3], head[4]]) as usize;
-    let mut record = head.to_vec();
-    record.resize(5 + len, 0);
-    tcp.read_exact(&mut record[5..]).await?;
-    Ok(record)
+/// Longest ClientHello read to find the SNI.
+const MAX_CLIENT_HELLO: usize = 64 * 1024;
+
+/// The ClientHello: the raw records (replayed to the acceptor or the pass-through
+/// tunnel) and the handshake message they carry, which may span several records.
+async fn read_client_hello(tcp: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (mut raw, mut handshake) = (Vec::new(), Vec::new());
+    loop {
+        let mut head = [0u8; 5];
+        tcp.read_exact(&mut head).await?;
+        if head[0] != 0x16 {
+            return Err(Error::Protocol("invisible proxy: expected a TLS handshake record".into()));
+        }
+        let len = u16::from_be_bytes([head[3], head[4]]) as usize;
+        let mut body = vec![0u8; len];
+        tcp.read_exact(&mut body).await?;
+        raw.extend_from_slice(&head);
+        raw.extend_from_slice(&body);
+        handshake.extend_from_slice(&body);
+        // Type (1 byte), length (3), then the message.
+        if handshake.len() >= 4 {
+            let want = 4 + u32::from_be_bytes([0, handshake[1], handshake[2], handshake[3]]) as usize;
+            if handshake.len() >= want || want > MAX_CLIENT_HELLO {
+                return Ok((raw, handshake));
+            }
+        }
+        if raw.len() > MAX_CLIENT_HELLO {
+            return Ok((raw, handshake));
+        }
+    }
 }
 
-/// The server_name extension of a ClientHello record, if any.
-fn sni_from_client_hello(record: &[u8]) -> Option<String> {
-    let mut p = Parser(record.get(5..)?);
+/// The server_name extension of a ClientHello handshake message, if any.
+fn sni_from_client_hello(handshake: &[u8]) -> Option<String> {
+    let mut p = Parser(handshake);
     if p.u8()? != 1 {
         return None; // not a ClientHello
     }
@@ -665,7 +685,11 @@ struct Upstream {
 async fn forward(ctx: &Arc<Ctx>, target: &Target, request: &[u8], method: &str, h2: bool) -> Result<Upstream> {
     // HTTP/2 client requests use HTTP/2 upstream unless the origin is known not to.
     let origin = target.origin();
-    let try_h2 = h2 && target.is_tls() && ctx.h2_origins.lock().unwrap().get(&origin) != Some(&false);
+    // NTLM authenticates a connection, which HTTP/2 doesn't allow: such origins go over HTTP/1.1.
+    let try_h2 = h2
+        && target.is_tls()
+        && !ctx.client.needs_http1(target)
+        && ctx.h2_origins.lock().unwrap().get(&origin) != Some(&false);
     if try_h2 {
         // `Client::send` goes over HTTP/2 because the request line says `HTTP/2`.
         match ctx.client.send(&RawRequest::from_bytes(request.to_vec()), target).await {
@@ -857,10 +881,24 @@ mod tests {
         body.extend_from_slice(&sni);
         let mut hs = vec![1, 0, 0, body.len() as u8];
         hs.extend_from_slice(&body);
-        let mut record = vec![0x16, 3, 1];
-        record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
-        record.extend_from_slice(&hs);
-        assert_eq!(sni_from_client_hello(&record).as_deref(), Some("app.test"));
-        assert_eq!(sni_from_client_hello(&record[..20]), None);
+        assert_eq!(sni_from_client_hello(&hs).as_deref(), Some("app.test"));
+        assert_eq!(sni_from_client_hello(&hs[..15]), None);
+        // Split over two records, as TLS allows: both are read before parsing.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut records = Vec::new();
+            for part in [&hs[..10], &hs[10..]] {
+                records.extend_from_slice(&[0x16, 3, 1]);
+                records.extend_from_slice(&(part.len() as u16).to_be_bytes());
+                records.extend_from_slice(part);
+            }
+            let sent = records.clone();
+            tokio::spawn(async move { TcpStream::connect(addr).await.unwrap().write_all(&sent).await.unwrap() });
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let (raw, handshake) = read_client_hello(&mut tcp).await.unwrap();
+            assert_eq!((raw, sni_from_client_hello(&handshake).as_deref()), (records, Some("app.test")));
+        });
     }
 }

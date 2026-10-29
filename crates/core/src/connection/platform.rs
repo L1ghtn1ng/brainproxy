@@ -200,6 +200,15 @@ fn is_param(s: &str) -> bool {
 
 pub(crate) fn parse_challenges(v: &str, out: &mut Vec<Challenge>) {
     for item in split_items(v) {
+        // `name=value` or `name = value`: a parameter of the current challenge.
+        let name_len =
+            item.find(|c: char| !(c.is_ascii_alphanumeric() || "!#$%&'*+.^_`|~-".contains(c))).unwrap_or(item.len());
+        if name_len > 0 && item[name_len..].trim_start().starts_with('=') {
+            if let Some(ch) = out.last_mut() {
+                add_param(ch, &item);
+            }
+            continue;
+        }
         let (first, rest) = match item.split_once(char::is_whitespace) {
             Some((a, b)) => (a, b.trim()),
             None => (item.as_str(), ""),
@@ -526,6 +535,11 @@ mod tests {
         assert_eq!(out[2].params["realm"], "a, b");
         assert_eq!(out[2].params["nonce"], "n\"1");
         assert_eq!(out[2].params["qop"], "auth,auth-int");
+        // Whitespace around '=' is allowed.
+        let mut out = Vec::new();
+        parse_challenges("Digest realm=\"lab\", nonce = \"abc\", qop = \"auth\"", &mut out);
+        assert_eq!((out.len(), out[0].params["nonce"].as_str(), out[0].params["qop"].as_str()), (1, "abc", "auth"));
+        assert!(DigestChallenge::pick(&out).is_some());
         let mut out = Vec::new();
         parse_challenges("NTLM TlRMTVNTUAACAAAAAAA=", &mut out);
         assert_eq!(out[0].token68.as_deref(), Some("TlRMTVNTUAACAAAAAAA="));

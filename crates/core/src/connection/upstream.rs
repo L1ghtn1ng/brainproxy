@@ -57,10 +57,8 @@ impl UpstreamProxy {
         }
         let host =
             u.host_str().ok_or_else(|| bad("no host"))?.trim_start_matches('[').trim_end_matches(']').to_string();
-        let port = u.port().unwrap_or(match kind {
-            ProxyKind::Http => 8080,
-            ProxyKind::Socks5 => 1080,
-        });
+        // `url` drops a default port (http://x:80 has no port), so http defaults to 80.
+        let port = u.port_or_known_default().unwrap_or(1080);
         if password_env.is_some() && username.is_none() {
             return Err(bad("a password needs a --username"));
         }
@@ -231,6 +229,8 @@ mod tests {
     fn parses_proxy_urls() {
         let p = UpstreamProxy::parse("socks5://127.0.0.1", None, None).unwrap();
         assert_eq!((p.kind, p.port), (ProxyKind::Socks5, 1080));
+        assert_eq!(UpstreamProxy::parse("http://127.0.0.1:80", None, None).unwrap().port, 80);
+        assert_eq!(UpstreamProxy::parse("socks5://127.0.0.1:80", None, None).unwrap().port, 80);
         let p = UpstreamProxy::parse("http://[::1]:3128", Some("u".into()), Some("V".into())).unwrap();
         assert_eq!((p.kind, p.host.as_str(), p.url()), (ProxyKind::Http, "::1", "http://[::1]:3128".to_string()));
         for bad in ["socks5h://x:1", "ftp://x", "http://u:p@x:1", "http://x:1/path", "nonsense"] {

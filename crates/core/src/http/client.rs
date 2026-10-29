@@ -77,6 +77,9 @@ pub struct Conn {
     /// Whether it came from the pool (so a failure may just mean the server
     /// closed it while idle).
     pub reused: bool,
+    /// The generation of the connection options it was opened with; it isn't
+    /// pooled again once they change.
+    pub generation: u64,
 }
 
 /// Sockets belong to the runtime that opened them (auth logs in on a short-lived
@@ -102,6 +105,8 @@ struct Pool {
     cert_tls: Mutex<HashMap<(u64, usize, bool), TlsConnector>>,
     /// Keyed by generation and origin.
     learned: Mutex<HashMap<(u64, String), Learned>>,
+    /// The latest generation seen; entries of older ones are dropped when it changes.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -144,14 +149,31 @@ impl Client {
         }
     }
 
-    /// The connection options in force (none without a guard).
+    /// The connection options in force (none without a guard). When they have
+    /// changed, pooled connections, TLS configurations, and learned platform auth
+    /// of older generations are dropped.
     fn net(&self) -> Arc<Compiled> {
-        self.opts.guard.as_ref().map(|g| g.net.get()).unwrap_or_default()
+        let net = self.opts.guard.as_ref().map(|g| g.net.get()).unwrap_or_default();
+        let gen = net.generation;
+        if self.pool.generation.swap(gen, std::sync::atomic::Ordering::Relaxed) != gen {
+            self.pool.idle.lock().unwrap().retain(|k, _| k.1 == gen);
+            self.pool.h2.lock().unwrap().retain(|k, _| k.1 == gen);
+            self.pool.cert_tls.lock().unwrap().retain(|k, _| k.0 == gen);
+            self.pool.learned.lock().unwrap().retain(|k, _| k.0 == gen);
+        }
+        net
     }
 
-    fn pool_key(&self, target: &Target) -> PoolKey {
+    fn pool_key(&self, target: &Target, generation: u64) -> PoolKey {
         let rt = tokio::runtime::Handle::current().id();
-        (rt, self.net().generation, target.scheme.to_ascii_lowercase(), target.host.to_ascii_lowercase(), target.port)
+        (rt, generation, target.scheme.to_ascii_lowercase(), target.host.to_ascii_lowercase(), target.port)
+    }
+
+    /// A new connection, opened with the options in force now.
+    async fn fresh(&self, target: &Target) -> Result<Conn> {
+        let net = self.net();
+        let stream = self.connect_with(target, &net).await?;
+        Ok(Conn { stream, reader: WireReader::new(), reused: false, generation: net.generation })
     }
 
     pub fn options(&self) -> &SendOptions {
@@ -166,7 +188,8 @@ impl Client {
     /// A pooled connection to `target` idle for less than `max_idle`, or a new one from
     /// [`Client::connect`].
     pub async fn checkout(&self, target: &Target, max_idle: Duration) -> Result<Conn> {
-        let key = self.pool_key(target);
+        let generation = self.net().generation;
+        let key = self.pool_key(target, generation);
         let pooled = {
             let mut idle = self.pool.idle.lock().unwrap();
             let list = idle.entry(key).or_default();
@@ -175,19 +198,20 @@ impl Client {
             list.pop_if(|(_, at)| at.elapsed() < max_idle)
         };
         if let Some((stream, _)) = pooled {
-            return Ok(Conn { stream, reader: WireReader::new(), reused: true });
+            return Ok(Conn { stream, reader: WireReader::new(), reused: true, generation });
         }
-        Ok(Conn { stream: self.connect(target).await?, reader: WireReader::new(), reused: false })
+        self.fresh(target).await
     }
 
     /// Returns a connection to the pool after a complete exchange. Connections
     /// with unread bytes (a desynchronised server) are dropped.
+    /// Connections opened with connection options that have since changed are dropped too.
     pub fn checkin(&self, target: &Target, conn: Conn) {
-        if !conn.reader.is_empty() {
+        if !conn.reader.is_empty() || conn.generation != self.net().generation {
             return;
         }
         let mut idle = self.pool.idle.lock().unwrap();
-        let list = idle.entry(self.pool_key(target)).or_default();
+        let list = idle.entry(self.pool_key(target, conn.generation)).or_default();
         if list.len() < POOL_PER_TARGET {
             list.push((conn.stream, Instant::now()));
         }
@@ -270,7 +294,7 @@ impl Client {
             match result {
                 Ok(response) => return Ok((c, response)),
                 Err(e) if repeatable && c.reused && c.reader.is_empty() && stale(&e) => {
-                    c = Conn { stream: self.connect(target).await?, reader: WireReader::new(), reused: false };
+                    c = self.fresh(target).await?;
                 }
                 Err(e) => return Err(e),
             }
@@ -283,6 +307,11 @@ impl Client {
         c.stream.flush().await?;
         let response = c.reader.read_response(&mut c.stream, method).await?;
         Ok((c, response))
+    }
+
+    /// Whether requests to `target` must use HTTP/1.1: its platform auth is NTLM.
+    pub fn needs_http1(&self, target: &Target) -> bool {
+        self.net().platform(&target.host, target.port).is_some_and(|c| c.scheme == PlatformScheme::Ntlm)
     }
 
     /// The platform credentials to use for this request: the target has some, and
@@ -367,7 +396,7 @@ impl Client {
                     self.on_conn(conn, &req, method).await
                 } else {
                     drop(conn);
-                    let c = Conn { stream: self.connect(target).await?, reader: WireReader::new(), reused: false };
+                    let c = self.fresh(target).await?;
                     self.on_conn(c, &req, method).await
                 }
             }
@@ -425,7 +454,7 @@ impl Client {
     /// is none. If the pooled connection has gone away (checked before anything
     /// is sent), a new one is opened.
     async fn round_trip_h2(&self, req: &H2Request, target: &Target) -> Result<Vec<u8>> {
-        let key = self.pool_key(target);
+        let key = self.pool_key(target, self.net().generation);
         let mut fresh = false;
         let sender = match self.h2_pooled(&key).await {
             Some(s) => s,
@@ -463,12 +492,14 @@ impl Client {
 
     /// Opens an HTTP/2 connection, runs its driver task, and pools the sender.
     async fn h2_handshake(&self, target: &Target) -> Result<h2::client::SendRequest<bytes::Bytes>> {
-        let stream = self.connect_h2(target).await?;
+        let net = self.net();
+        let stream = self.connect_h2_with(target, &net).await?;
         let (sender, conn) = h2::client::handshake(stream).await.map_err(crate::http::h2::h2_error)?;
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        self.pool.h2.lock().unwrap().insert(self.pool_key(target), sender.clone());
+        // Pooled under the generation it was opened with: a newer one won't find it.
+        self.pool.h2.lock().unwrap().insert(self.pool_key(target, net.generation), sender.clone());
         Ok(sender)
     }
 
@@ -476,11 +507,16 @@ impl Client {
     /// for https (an error if the server picks anything else), plain TCP for
     /// http (prior knowledge). Goes through the scope guard like [`Client::connect`].
     pub async fn connect_h2(&self, target: &Target) -> Result<Stream> {
+        self.connect_h2_with(target, &self.net()).await
+    }
+
+    /// [`Client::connect_h2`] with one snapshot of the connection options throughout.
+    async fn connect_h2_with(&self, target: &Target, net: &Compiled) -> Result<Stream> {
         if !target.is_tls() {
-            return Ok(Box::new(self.connect_tcp(target).await?));
+            return Ok(Box::new(self.connect_tcp(target, net).await?));
         }
-        let connector = self.connector(true, target)?;
-        let tcp = self.connect_tcp(target).await?;
+        let connector = self.connector(true, target, net)?;
+        let tcp = self.connect_tcp(target, net).await?;
         let refused = || Error::Protocol(format!("{}:{} did not negotiate HTTP/2 (ALPN h2)", target.host, target.port));
         let tls = self.tls_handshake(&connector, tcp, target).await.map_err(|e| match e {
             Error::Tls(m) if m.contains("NoApplicationProtocol") => refused(),
@@ -496,19 +532,24 @@ impl Client {
     /// must pass the scope guard; the connection goes to an address the guard
     /// checked.
     pub async fn connect(&self, target: &Target) -> Result<Stream> {
+        self.connect_with(target, &self.net()).await
+    }
+
+    /// [`Client::connect`] with one snapshot of the connection options throughout
+    /// (address, route, and certificate all from the same generation).
+    async fn connect_with(&self, target: &Target, net: &Compiled) -> Result<Stream> {
         if !target.is_tls() {
-            return Ok(Box::new(self.connect_tcp(target).await?));
+            return Ok(Box::new(self.connect_tcp(target, net).await?));
         }
         // A client certificate that can't be loaded fails before any connection.
-        let connector = self.connector(false, target)?;
-        let tcp = self.connect_tcp(target).await?;
+        let connector = self.connector(false, target, net)?;
+        let tcp = self.connect_tcp(target, net).await?;
         Ok(Box::new(self.tls_handshake(&connector, tcp, target).await?))
     }
 
     /// The TLS configuration for `target`: with the client certificate its host
     /// pattern asks for, if any.
-    fn connector(&self, h2: bool, target: &Target) -> Result<TlsConnector> {
-        let net = self.net();
+    fn connector(&self, h2: bool, target: &Target, net: &Compiled) -> Result<TlsConnector> {
         let Some((index, identity)) = net.client_cert(&target.host, target.port) else {
             return Ok(if h2 { self.tls_h2.clone() } else { self.tls.clone() });
         };
@@ -541,17 +582,17 @@ impl Client {
     /// guard and connects only to the addresses it checked, directly or through
     /// the upstream proxy the connection options pick (asked for the checked
     /// address, never the name).
-    async fn connect_tcp(&self, target: &Target) -> Result<TcpStream> {
+    async fn connect_tcp(&self, target: &Target, net: &Compiled) -> Result<TcpStream> {
         let guard = self.opts.guard.as_ref().ok_or_else(|| {
             Error::OutOfScope("no engagement scope: run `brainproxy engagement start --target HOST ...` first".into())
         })?;
-        let addrs = guard.resolve(&target.host, target.port).await?;
-        let tcp = match self.net().route(&target.host, target.port) {
+        let addrs = guard.resolve_with(&target.host, target.port, net).await?;
+        let tcp = match net.route(&target.host, target.port) {
             Route::Direct => TcpStream::connect(&addrs[..])
                 .await
                 .map_err(|e| Error::Connect(format!("{}:{}: {e}", target.host, target.port)))?,
             Route::Proxy(proxy) => {
-                let proxy_addrs = guard.resolve_proxy(&proxy.host, proxy.port).await?;
+                let proxy_addrs = guard.resolve_proxy_with(&proxy.host, proxy.port, net).await?;
                 let mut last = None;
                 let mut opened = None;
                 for addr in &addrs {

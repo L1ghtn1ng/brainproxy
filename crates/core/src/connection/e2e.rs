@@ -213,6 +213,23 @@ async fn new_settings_do_not_reuse_connections_opened_with_old_ones() {
 }
 
 #[tokio::test]
+async fn a_connection_in_flight_when_settings_change_is_not_pooled() {
+    let server = echo_server().await;
+    let g = Guard::from_specs(vec![spec(&["127.0.0.1"])]).unwrap();
+    let c = client(&g);
+    let target = Target { scheme: "http".into(), host: "127.0.0.1".into(), port: server };
+    let conn = c.checkout(&target, std::time::Duration::from_secs(30)).await.unwrap();
+    // The settings change while it is out (a running proxy reloading them).
+    g.net.set(ConnectionSettings::default().compile(vec![]).unwrap());
+    c.checkin(&target, conn);
+    let req = RawRequest::from_bytes(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec());
+    c.send(&req, &target).await.unwrap();
+    assert_eq!(c.connections_opened(), 2, "the old connection was not reused");
+    c.send(&req, &target).await.unwrap();
+    assert_eq!(c.connections_opened(), 2, "connections of the current settings still are");
+}
+
+#[tokio::test]
 async fn proxies_off_this_machine_need_every_scope_to_list_them() {
     let g = Guard::from_specs(vec![spec(&["127.0.0.1", "192.0.2.0/24"])]).unwrap();
     // In the target scope is not enough: a proxy can read what goes through it.
