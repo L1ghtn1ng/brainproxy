@@ -238,9 +238,10 @@ attack type, and pick payloads:
   client-side routes, clicks buttons, menus and other clickable elements, fills fields
   with test values and submits forms, and records the API calls (XHR, fetch) this
   triggers. Each distinct page state is explored once. It is slower than the plain crawl.
-  - **What it won't do:** click elements labelled like *log out*, *delete*, *remove*,
-    *reset* or *unsubscribe* (the summary lists them under `not_clicked`), answer *OK*
-    to a confirmation dialog, open pop-ups or downloads, request logout-like URLs, or send
+  - **What it won't do:** click elements or follow links labelled like *log out*,
+    *delete*, *remove*, *reset* or *unsubscribe* (the summary lists them under
+    `not_clicked`), answer *OK* to a confirmation dialog, open pop-ups or downloads,
+    request logout-like URLs, load pages outside the crawl's sites or path prefix, or send
     DELETE requests (listed under `blocked_requests`). From the CLI, `--allow-destructive`
     lifts the label and DELETE rules and `--avoid REGEX` adds labels to skip.
   - **Where its traffic goes:** only through a proxy of the crawl's own, so every request
@@ -249,7 +250,8 @@ attack type, and pick payloads:
     browsing, WebRTC) are off. It uses a fresh temporary profile, removed afterwards, so
     nothing from your normal browser is used; with a login profile, the session is added
     to every request on the site and renewed when lost.
-  - **Limits:** depth, max pages (page loads, clicks and form submissions), rate, path
+  - **Limits:** depth, max pages (page loads, clicks and form submissions, counting the
+    reloads and clicks needed to get back to a page state), rate, path
     prefix and the site's origin apply as for the plain crawl. Linux and macOS only. If
     the browser can't start because Chromium's sandbox is unavailable (running as root
     starts it without one; some containers lack user namespaces), install your

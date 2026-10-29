@@ -114,9 +114,19 @@ pub(crate) fn find() -> Vec<Found> {
         .collect()
 }
 
+/// Whether `crawl --browser` can run on this platform (it passes pipes the Unix way).
+const BROWSER_CRAWL: bool = cfg!(unix);
+
 /// The Chromium-family browser for a browser crawl: `id` from `browser list`, or the
 /// first one found. The crawl drives it over the DevTools protocol, which Firefox lacks.
 pub(crate) fn chromium(id: Option<&str>) -> Result<PathBuf, Error> {
+    if !BROWSER_CRAWL {
+        return Err(Error::InvalidInput(
+            "the browser crawl (--browser) runs on Linux and macOS; on Windows, browse the site through the proxy \
+             (brainproxy browser open)"
+                .into(),
+        ));
+    }
     let found = find();
     let chromium: Vec<&Found> = found.iter().filter(|f| f.kind == Kind::Chromium).collect();
     match id {
@@ -154,7 +164,9 @@ pub fn browser(project: &Path, home: &Path, cmd: BrowserCmd, out: &Out) -> Resul
     match cmd {
         BrowserCmd::List => {
             let list: Vec<Value> = found.iter().map(describe).collect();
-            out.ok(json!({"browsers": list, "default": found.first().map(|f| f.id)}), || {
+            let data =
+                json!({"browsers": list, "default": found.first().map(|f| f.id), "browser_crawl": BROWSER_CRAWL});
+            out.ok(data, || {
                 if found.is_empty() {
                     return "no supported browser found (Chrome, Chromium, Edge, Brave, Firefox)".into();
                 }

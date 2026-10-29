@@ -278,9 +278,10 @@ brainproxy findings list --source active
 # links and client-side routes (pushState, #/hash), clicks buttons, menus and other clickable
 # elements, fills fields with test values and submits forms, once per distinct page state. It goes
 # only through the crawl's own proxy, so every request, XHR and fetch() included, is scope-checked
-# and recorded as history source crawl-browser. Not clicked: elements labelled like logout, delete,
-# remove (--avoid REGEX adds more, --allow-destructive clicks them); confirm() answers no; logout-like
-# URLs and DELETE requests aren't sent. --depth, --max-pages (page loads, clicks and form submits),
+# and recorded as history source crawl-browser. Not clicked or followed: elements and links labelled
+# like logout, delete, remove (--avoid REGEX adds more, --allow-destructive clicks them); confirm()
+# answers no; logout-like URLs, DELETE requests and page loads off the crawl's sites aren't sent.
+# --depth, --max-pages (page loads, clicks and form submits, replays included),
 # --max-per-path, --max-minutes, --rate, -H, --auth, --path-prefix, --exclude and the origin rules
 # apply. Each crawl uses a fresh temporary browser profile. Linux and macOS.
 brainproxy crawl https://app.example.com/ --browser --background

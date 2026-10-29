@@ -96,7 +96,7 @@ pub struct BrowserCrawlSummary {
     /// XHR and fetch() calls.
     pub api_calls: Vec<Endpoint>,
     pub api_call_count: usize,
-    /// Elements not clicked because they look destructive (logout, delete, ...).
+    /// Elements not clicked and links not followed because they look destructive (logout, delete, ...).
     pub not_clicked: Vec<String>,
     pub not_clicked_count: usize,
     /// Requests the browser tried that weren't sent (logout URLs, DELETE).
@@ -118,7 +118,8 @@ pub struct BrowserCrawlSummary {
 pub(crate) struct Snapshot {
     pub url: String,
     pub title: String,
-    pub links: Vec<String>,
+    /// Links with their labels (`href` is absolute).
+    pub links: Vec<Clickable>,
     /// Addresses set by history.pushState/replaceState or hash changes since the last snapshot.
     pub routes: Vec<String>,
     /// URLs passed to window.open.
@@ -260,10 +261,12 @@ struct Explorer<'a> {
     queue: VecDeque<Action>,
     seen_urls: HashSet<String>,
     seen_states: HashSet<u64>,
-    /// (state address shape, element key) pairs already queued.
+    /// (state key, element key) pairs already queued.
     tried: HashSet<String>,
     per_element: HashMap<String, usize>,
     per_path: HashMap<String, usize>,
+    /// Page loads, clicks and form submissions so far, replays included (--max-pages).
+    ops: usize,
     out_of_scope: BTreeSet<String>,
     not_clicked: BTreeSet<String>,
     not_clicked_count: usize,
@@ -295,6 +298,7 @@ impl<'a> Explorer<'a> {
             tried: HashSet::new(),
             per_element: HashMap::new(),
             per_path: HashMap::new(),
+            ops: 0,
             out_of_scope: BTreeSet::new(),
             not_clicked: BTreeSet::new(),
             not_clicked_count: 0,
@@ -308,17 +312,15 @@ impl<'a> Explorer<'a> {
         for s in seeds {
             self.enqueue_url(s.as_str(), 0);
         }
-        let mut actions = 0;
         while let Some(a) = self.queue.pop_front() {
             if self.ctl.stopped() {
                 break;
             }
             let timed_out = self.cfg.crawl.max_duration.is_some_and(|d| self.started.elapsed() >= d);
-            if actions >= self.cfg.crawl.max_pages || timed_out {
+            if self.ops >= self.cfg.crawl.max_pages || timed_out {
                 self.summary.limit_reached = true;
                 break;
             }
-            actions += 1;
             self.summary.depth_reached = self.summary.depth_reached.max(a.depth);
             self.progress();
             match self.perform(&a).await {
@@ -424,8 +426,21 @@ impl<'a> Explorer<'a> {
         }
     }
 
+    /// Takes one operation from the --max-pages budget; false when it is spent.
+    fn spend(&mut self) -> bool {
+        if self.ops >= self.cfg.crawl.max_pages {
+            self.summary.limit_reached = true;
+            return false;
+        }
+        self.ops += 1;
+        true
+    }
+
     /// Loads `url` afresh (through about:blank, so a change of fragment alone reloads too).
     async fn navigate(&mut self, url: &str) -> Result<bool> {
+        if !self.spend() {
+            return Ok(false);
+        }
         let s = Some(self.session.as_str());
         self.chrome.call("Page.navigate", json!({"url": "about:blank"}), s).await?;
         let r = self.chrome.call("Page.navigate", json!({"url": url}), s).await?;
@@ -469,6 +484,9 @@ impl<'a> Explorer<'a> {
 
     /// Fills the visible fields, then clicks or submits. False when the element is gone.
     async fn step(&mut self, step: &Step) -> Result<bool> {
+        if !self.spend() {
+            return Ok(false);
+        }
         self.fill().await?;
         match step {
             Step::Click(key) => {
@@ -547,9 +565,12 @@ impl<'a> Explorer<'a> {
 
     /// Queues what a state offers: its links and routes, and its clickable elements and forms.
     fn expand(&mut self, a: &Action, snap: &Snapshot) {
+        let deeper = a.depth < self.cfg.crawl.max_depth;
         // Routes and pop-ups the last step produced are crawled wherever the page ended up.
-        for u in snap.routes.iter().chain(&snap.opened) {
-            self.enqueue_url(u, a.depth + 1);
+        if deeper {
+            for u in snap.routes.iter().chain(&snap.opened) {
+                self.enqueue_url(u, a.depth + 1);
+            }
         }
         let here = Url::parse(&snap.url).ok();
         if !here.as_ref().is_some_and(|u| self.scope.allows(u)) {
@@ -562,7 +583,7 @@ impl<'a> Explorer<'a> {
             return;
         }
         // A click that changed the address: loading that address is crawled too.
-        if !a.path.is_empty() {
+        if !a.path.is_empty() && deeper {
             self.enqueue_url(&snap.url, a.depth + 1);
         }
         let key = state_key(snap);
@@ -574,16 +595,23 @@ impl<'a> Explorer<'a> {
             return;
         }
         self.summary.states += 1;
-        if a.depth >= self.cfg.crawl.max_depth {
+        if !deeper {
             return;
         }
         for l in &snap.links {
-            self.enqueue_url(l, a.depth + 1);
+            // A link labelled "Delete account" or "Log out" isn't followed either.
+            if avoided(l, &self.cfg.avoid, &self.cfg.crawl.exclude) {
+                self.not_clicked_count += 1;
+                if self.not_clicked.len() < MAX_LISTED {
+                    self.not_clicked.insert(describe(l));
+                }
+                continue;
+            }
+            self.enqueue_url(&l.href, a.depth + 1);
         }
         if a.path.len() >= MAX_CHAIN {
             return;
         }
-        let route = route_shape(&snap.url);
         let mut queued = 0;
         let next = |explorer: &mut Self, step: Step, submits: bool| {
             let mut path = a.path.clone();
@@ -610,7 +638,8 @@ impl<'a> Explorer<'a> {
                 }
                 continue;
             }
-            if !self.tried.insert(format!("{route} {}", c.key)) {
+            // Once per state; the same element in other states counts towards MAX_PER_ELEMENT.
+            if !self.tried.insert(format!("{key:x} {}", c.key)) {
                 continue;
             }
             let n = self.per_element.entry(c.key.clone()).or_default();
@@ -625,7 +654,7 @@ impl<'a> Explorer<'a> {
             // Forms without a submit button (those with one are submitted by clicking it).
             for f in snap.forms.iter().filter(|f| !f.has_submit) {
                 if self.cfg.crawl.exclude.iter().any(|r| r.is_match(&f.action))
-                    || !self.tried.insert(format!("{route} {} {}", f.key, f.action))
+                    || !self.tried.insert(format!("{key:x} {} {}", f.key, f.action))
                 {
                     continue;
                 }
@@ -716,7 +745,7 @@ pub(crate) fn state_key(s: &Snapshot) -> u64 {
         parts.insert(format!("click {}|{}|{}|{}|{}", c.tag, c.role, c.kind, shape_text(&c.text), c.id));
     }
     for l in &s.links {
-        parts.insert(format!("link {}", route_shape(l)));
+        parts.insert(format!("link {}", route_shape(&l.href)));
     }
     for f in &s.forms {
         parts.insert(format!("form {} {}", f.method, route_shape(&f.action)));
@@ -755,8 +784,11 @@ pub(crate) fn avoided(c: &Clickable, avoid: &[Regex], exclude: &[Regex]) -> bool
 
 /// A short description of an element for the summary.
 fn describe(c: &Clickable) -> String {
-    let label =
-        [&c.text, &c.title, &c.id, &c.name, &c.class].into_iter().find(|s| !s.is_empty()).cloned().unwrap_or_default();
+    let label = [&c.text, &c.title, &c.id, &c.name, &c.class, &c.href]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_default();
     format!("<{}> {}", c.tag, label.chars().take(60).collect::<String>())
 }
 
@@ -772,7 +804,10 @@ mod tests {
         Snapshot {
             url: url.into(),
             clickables: clicks.iter().map(|(t, x)| click(t, x)).collect(),
-            links: links.iter().map(|s| s.to_string()).collect(),
+            links: links
+                .iter()
+                .map(|s| Clickable { tag: "a".into(), href: s.to_string(), ..Default::default() })
+                .collect(),
             ..Default::default()
         }
     }
@@ -858,6 +893,21 @@ mod tests {
         }
         let link = Clickable { tag: "a".into(), href: "/session/logout?next=/".into(), ..Default::default() };
         assert!(no(&link));
+        // Links are judged by their labels too, not only their URL.
+        let delete = Clickable {
+            tag: "a".into(),
+            text: "Delete account".into(),
+            href: "https://a.test/account/7".into(),
+            ..Default::default()
+        };
+        assert!(no(&delete));
+        let profile = Clickable {
+            tag: "a".into(),
+            text: "Profile".into(),
+            href: "https://a.test/account/7".into(),
+            ..Default::default()
+        };
+        assert!(!no(&profile));
         let submit = Clickable {
             tag: "button".into(),
             text: "Go".into(),

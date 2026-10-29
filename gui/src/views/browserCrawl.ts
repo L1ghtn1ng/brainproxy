@@ -8,9 +8,15 @@ export interface BrowserInfo {
   path: string;
 }
 
-/** Whether `browser list` found a Chromium-based browser the crawl can drive. */
-export const hasChromium = (list: { browsers: BrowserInfo[] } | null | undefined): boolean =>
-  !!list?.browsers?.some((b) => b.kind === "chromium");
+export interface BrowserList {
+  browsers: BrowserInfo[];
+  /** Whether this platform can run the browser crawl (not on Windows). */
+  browser_crawl?: boolean;
+}
+
+/** Whether `browser list` found a Chromium-based browser the crawl can drive, on a platform that can run it. */
+export const hasChromium = (list: BrowserList | null | undefined): boolean =>
+  !!list && list.browser_crawl !== false && !!list.browsers?.some((b) => b.kind === "chromium");
 
 /** `--browser` when it is asked for and a browser can run it. */
 export const browserFlag = (wanted: boolean, available: boolean): string[] => (wanted && available ? ["--browser"] : []);

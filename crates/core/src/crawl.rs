@@ -141,10 +141,14 @@ impl Scope {
         })
     }
 
+    /// On the crawl's sites: a seed host (or subdomain with `subdomains`) and, unless
+    /// `any_port`, a seed origin. Path prefix and exclusions aside.
+    pub(crate) fn on_site(&self, u: &Url) -> bool {
+        self.host_allowed(u) && (self.any_port || self.origin_allowed(u)) && matches!(u.scheme(), "http" | "https")
+    }
+
     pub(crate) fn allows(&self, u: &Url) -> bool {
-        self.host_allowed(u)
-            && (self.any_port || self.origin_allowed(u))
-            && matches!(u.scheme(), "http" | "https")
+        self.on_site(u)
             && self.path_prefix.as_deref().is_none_or(|p| u.path().starts_with(p))
             && !self.exclude.iter().any(|r| r.is_match(u.as_str()))
     }

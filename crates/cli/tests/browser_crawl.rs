@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 const INDEX: &str = r##"<!doctype html><html><head><title>SPA</title></head><body>
-<nav><span data-route="/reports">Reports</span> <a href="#/settings">Settings</a> <button id="logout">Log out</button></nav>
+<nav><span data-route="/reports">Reports</span> <a href="#/settings">Settings</a> <a href="/account/7">Delete account</a> <button id="logout">Log out</button></nav>
 <div id="view"></div><script src="/app.js"></script></body></html>"##;
 
 const APP: &str = r#"
@@ -164,10 +164,12 @@ fn browser_crawl_finds_api_calls_made_by_javascript() {
     assert!(saw("GET /reports "), "the pushState route is loaded directly too: {lines:?}");
     // Nothing destructive reached the site.
     assert!(!lines.iter().any(|l| l.starts_with("DELETE ") || l.contains("logout")), "{lines:?}");
+    assert!(!saw("GET /account/7 "), "a link labelled Delete account isn't followed: {lines:?}");
 
     let not_clicked: Vec<&str> = data["not_clicked"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
     assert!(not_clicked.iter().any(|l| l.contains("Log out")), "{v}");
     assert!(not_clicked.iter().any(|l| l.contains("Delete report")), "{v}");
+    assert!(not_clicked.iter().any(|l| l.contains("Delete account")), "{v}");
     let api: Vec<String> = data["api_calls"]
         .as_array()
         .unwrap()

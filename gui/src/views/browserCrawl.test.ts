@@ -6,7 +6,11 @@ test("the browser crawl needs a Chromium-based browser", () => {
   assert.equal(hasChromium(null), false);
   assert.equal(hasChromium({ browsers: [] }), false);
   assert.equal(hasChromium({ browsers: [{ id: "firefox", name: "Firefox", kind: "firefox", path: "/usr/bin/firefox" }] }), false);
-  assert.equal(hasChromium({ browsers: [{ id: "chromium", name: "Chromium", kind: "chromium", path: "/usr/bin/chromium" }] }), true);
+  const chromium = { id: "chromium", name: "Chromium", kind: "chromium" as const, path: "/usr/bin/chromium" };
+  assert.equal(hasChromium({ browsers: [chromium] }), true);
+  assert.equal(hasChromium({ browsers: [chromium], browser_crawl: true }), true);
+  // Windows: browsers are found but the crawl can't drive them.
+  assert.equal(hasChromium({ browsers: [chromium], browser_crawl: false }), false);
 });
 
 test("--browser only when asked for and available", () => {

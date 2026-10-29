@@ -19,9 +19,10 @@ use crate::output::Out;
     clicks buttons, menus and other clickable elements, fills fields with test values and submits forms, once per \
     distinct page state. The browser goes only through the crawl's own proxy, so every request (XHR and fetch \
     included) is checked against the engagement scope and recorded as history source crawl-browser. Elements \
-    labelled like logout, delete or remove are not clicked, confirm() dialogs answer no, logout-like URLs and DELETE \
+    and links labelled like logout, delete or remove are not clicked, page loads that would leave the crawl's sites or \
+    --path-prefix are not sent, confirm() dialogs answer no, logout-like URLs and DELETE \
     requests are not sent (--allow-destructive and --no-default-exclude lift that). --max-pages counts page loads, \
-    clicks and form submissions; robots.txt, sitemaps, --concurrency and --http2 apply to the plain crawl only. \
+    clicks and form submissions, including those that return to a page state; robots.txt, sitemaps, --concurrency and --http2 apply to the plain crawl only. \
     Linux and macOS; a temporary browser profile is used and removed. Without Chromium's sandbox (as root, or where \
     user namespaces are off) set BRAINPROXY_BROWSER_NO_SANDBOX=1.")]
 pub struct CrawlArgs {

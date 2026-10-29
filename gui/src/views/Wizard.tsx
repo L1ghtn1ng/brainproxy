@@ -7,7 +7,7 @@ import { run, withScheme, type Risk } from "../api";
 import { useApp } from "../store";
 import { usePoll } from "../ui/usePoll";
 import { loadSuggestions, type Job, type Suggestions } from "./Scanner";
-import { hasChromium, wizardBrowserArgs, type BrowserInfo } from "./browserCrawl";
+import { hasChromium, wizardBrowserArgs, type BrowserList } from "./browserCrawl";
 import type { ChecksStatus } from "./Updates";
 
 type Depth = "quick" | "standard" | "thorough";
@@ -82,7 +82,7 @@ export function ScanWizard(p: { jobId: number | null; onStarted: (id: number) =>
   // brainproxy's feed checks join Standard and Thorough even without the Nuclei templates.
   const nuclei = checks?.nuclei ? NUCLEI[depth] : depth === "quick" ? [] : ["--checks", "brainproxy", "--check-severity", depth === "standard" ? "high" : "medium"];
   // Thorough also crawls in a browser that runs the site's JavaScript, when one is installed.
-  const [browsers] = usePoll<{ browsers: BrowserInfo[] }>(() => run(["browser", "list"]), 60000);
+  const [browsers] = usePoll<BrowserList>(() => run(["browser", "list"]), 60000);
   const canBrowse = hasChromium(browsers);
   const [profiles] = usePoll<{ profiles: { name: string; session?: { logged_in?: boolean } }[] }>(() => run(["auth", "list"]), 10000);
 

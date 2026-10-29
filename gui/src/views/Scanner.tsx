@@ -5,7 +5,7 @@ import { useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { browserFlag, browserProgress, hasChromium, type BrowserInfo } from "./browserCrawl";
+import { browserFlag, browserProgress, hasChromium, type BrowserList } from "./browserCrawl";
 
 export interface Job {
   id: number;
@@ -517,7 +517,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
   }, []);
   const [auth] = usePoll<{ profiles: { name: string }[] }>(() => run(["auth", "list"]), 30000);
   // The JavaScript crawl needs a Chromium-based browser on this machine.
-  const [browsers] = usePoll<{ browsers: BrowserInfo[] }>(() => run(["browser", "list"]), 60000);
+  const [browsers] = usePoll<BrowserList>(() => run(["browser", "list"]), 60000);
   const canBrowse = hasChromium(browsers);
   const set = (patch: Partial<typeof SCAN_DEFAULTS>) => setF((x) => ({ ...x, ...patch }));
 

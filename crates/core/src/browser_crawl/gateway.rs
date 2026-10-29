@@ -264,9 +264,16 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
     let method = head.method.clone();
     let url = format!("{}{}", target.origin(), head.target);
     let parsed = Url::parse(&url).ok();
-    let ours = parsed.as_ref().is_some_and(|u| s.opts.scope.host_allowed(u));
+    // The crawl's own sites (seed origins): only they get its headers and session.
+    let ours = parsed.as_ref().is_some_and(|u| s.opts.scope.on_site(u));
+    // A page load (a link, form, redirect or script navigating the tab or a frame) must stay
+    // inside the crawl scope; the page's own API and asset requests may go elsewhere in the engagement.
+    let navigation = header(&head.headers, "sec-fetch-mode") == Some("navigate");
+    let leaves_scope = navigation && !parsed.as_ref().is_some_and(|u| s.opts.scope.allows(u));
 
-    if let Some(reason) = blocked_reason(&url, &method, &s.opts.exclude, s.opts.block_delete) {
+    if let Some(reason) = blocked_reason(&url, &method, &s.opts.exclude, s.opts.block_delete)
+        .or(leaves_scope.then_some("the page would leave the crawl's sites or path prefix"))
+    {
         let msg = format!("not sent by the browser crawl: {reason}");
         send_capture(s, Capture::new("crawl-browser", target, &request, None, None, Some(&msg)));
         let mut st = s.stats.lock().unwrap();
@@ -277,7 +284,6 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         return (error_response(403, "blocked", &msg), None);
     }
 
-    // The crawl's headers and logged-in session go only to the crawl's own hosts.
     let auth = s.opts.auth.as_deref().filter(|_| ours);
     if ours {
         let mut req = RawRequest::from_bytes(request);
@@ -289,10 +295,11 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
             request = a.apply(&request, &[]);
         }
     }
+    // In flight while it waits for its turn too, so the page isn't taken as settled.
+    let _busy = InFlight::new(s);
     if let Some(l) = &s.limiter {
         l.wait().await;
     }
-    let _busy = InFlight::new(s);
     let generation = auth.map(|a| a.generation()).unwrap_or(0);
     let started = Instant::now();
     let mut sent = forward(s, target, &request, &method).await;

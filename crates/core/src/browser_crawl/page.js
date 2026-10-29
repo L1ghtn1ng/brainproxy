@@ -83,18 +83,28 @@
 
   bp.quiet = () => [document.readyState, now() - bp.lastMutation];
 
+  // Each link with its labels, so destructive ones ("Delete account") can be left alone.
   bp.links = () => {
-    const out = new Set();
-    const put = (v) => {
+    const out = new Map();
+    const put = (el, v) => {
       if (!v || /^\s*(javascript:|mailto:|tel:|data:|blob:)/i.test(v)) return;
-      const a = abs(v.trim());
-      if (a) out.add(a);
+      const href = abs(v.trim());
+      if (!href || out.has(href)) return;
+      out.set(href, {
+        tag: el.tagName.toLowerCase(),
+        text: el.tagName === "IFRAME" || el.tagName === "FRAME" ? "" : label(el),
+        id: el.id || "",
+        name: el.getAttribute("name") || "",
+        class: clean(typeof el.className === "string" ? el.className : ""),
+        title: clean(el.getAttribute("title")),
+        href,
+      });
     };
-    for (const el of document.querySelectorAll("a[href],area[href]")) put(el.getAttribute("href"));
+    for (const el of document.querySelectorAll("a[href],area[href]")) put(el, el.getAttribute("href"));
     for (const el of document.querySelectorAll("[data-href],[data-url],[routerlink],[ng-href]"))
-      put(el.getAttribute("data-href") || el.getAttribute("data-url") || el.getAttribute("routerlink") || el.getAttribute("ng-href"));
-    for (const el of document.querySelectorAll("iframe[src],frame[src]")) put(el.getAttribute("src"));
-    return [...out].slice(0, 500);
+      put(el, el.getAttribute("data-href") || el.getAttribute("data-url") || el.getAttribute("routerlink") || el.getAttribute("ng-href"));
+    for (const el of document.querySelectorAll("iframe[src],frame[src]")) put(el, el.getAttribute("src"));
+    return [...out.values()].slice(0, 500);
   };
 
   const CLICKY =
