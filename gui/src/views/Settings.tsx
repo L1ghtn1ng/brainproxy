@@ -27,7 +27,7 @@ import {
   type UpstreamForm,
 } from "./connection";
 import { MacroBuilder, SessionHandling } from "./SessionHandling";
-import type { MacroSummary, SessionRule } from "./sessionHandling";
+import type { MacroSummary, SessionRule } from "./sessionRules";
 import NOTICE from "../../../NOTICE?raw";
 
 type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "data" | "project" | "licenses";

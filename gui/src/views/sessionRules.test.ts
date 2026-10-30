@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { actionLabel, actionSpec, macroAddArgs, parseParams, ruleAddArgs, ruleProblems, type Action } from "./sessionHandling.ts";
+import { actionLabel, actionSpec, macroAddArgs, parseParams, ruleAddArgs, ruleProblems, type Action } from "./sessionRules.ts";
 
 test("actions turn into --action specs the CLI parses", () => {
   const cases: [Action, string][] = [

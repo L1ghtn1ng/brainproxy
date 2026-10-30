@@ -21,7 +21,7 @@ import {
   type RuleForm,
   type SessionRule,
   type Tool,
-} from "./sessionHandling";
+} from "./sessionRules";
 
 interface Props {
   profile: string;
