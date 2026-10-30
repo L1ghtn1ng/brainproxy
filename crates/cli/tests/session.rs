@@ -223,8 +223,6 @@ fn tmp_project(name: &str) -> PathBuf {
     let p = dir.join("p.bpdb");
     let _ = std::fs::remove_file(&p);
     ok(&p, &["engagement", "start", "--target", "127.0.0.1"]);
-    // A profile with no login: the session is what its macros and rules make it.
-    ok(&p, &["auth", "add", "app", "--username", "alice"]);
     p
 }
 
@@ -287,6 +285,8 @@ fn macro_chains_values_and_cookies_and_keeps_them_out_of_history() {
             "3:me=json:user",
         ],
     );
+    // The macro made the profile; `auth add` sets its options and keeps the macro.
+    ok(&p, &["auth", "add", "app", "--username", "alice"]);
     let shown = ok(&p, &["auth", "show", "app"]);
     assert_eq!(shown["macros"][0]["vars"], serde_json::json!(["csrf", "api", "me"]), "{shown}");
 
@@ -477,10 +477,105 @@ fn cached_values_refresh_when_rejected_and_rules_are_scoped_by_url() {
     assert_eq!(r["response"]["status"], 200, "{r}");
     assert_eq!(srv.forms(), 4);
 
-    // A macro a rule runs can't be removed; the rule can, then the macro.
+    // A macro a rule runs can't be removed; the rule can, then the macro (once the
+    // profile has something else to do).
     let (code, _) = run(&p, &["auth", "macro", "remove", "app", "csrf"]);
     assert_ne!(code, 0);
     ok(&p, &["auth", "rule", "remove", "app", "1"]);
+    ok(&p, &["auth", "add", "app", "-H", "X-Client: test"]);
     ok(&p, &["auth", "macro", "remove", "app", "csrf"]);
     assert_eq!(ok(&p, &["auth", "macro", "list", "app"])["macros"], serde_json::json!([]));
+}
+
+#[test]
+fn a_profile_needs_a_login_a_header_a_macro_or_a_rule() {
+    let srv = Server::start();
+    let p = tmp_project("empty");
+    let (code, v) = run(&p, &["auth", "add", "app", "--username", "alice"]);
+    assert_ne!(code, 0);
+    assert!(v["error"]["message"].as_str().unwrap().contains("auth macro add app"), "{v}");
+    // A rule has nothing to attach to yet.
+    let (code, _) = run(&p, &["auth", "rule", "add", "app", "--action", "update:csrf"]);
+    assert_ne!(code, 0);
+    // A login or a header is enough to add a profile first, then macros and rules.
+    ok(&p, &["auth", "add", "key", "-H", "X-Client: test"]);
+    let form = request_file(&p, "form.txt", &format!("GET /form HTTP/1.1\nHost: 127.0.0.1:{}\n\n", srv.port));
+    let step = format!("{}={form}", srv.origin());
+    let added = ok(&p, &["auth", "macro", "add", "key", "csrf", "--step", &step]);
+    assert_eq!(added["profile_created"], false);
+    ok(&p, &["auth", "rule", "add", "key", "--action", "update:csrf"]);
+    // No login at all: the first macro makes the profile.
+    let added = ok(&p, &["auth", "macro", "add", "app", "csrf", "--step", &step]);
+    assert_eq!(added["profile_created"], true);
+    ok(&p, &["auth", "add", "app", "--username", "alice"]);
+    // Its last macro can't go, leaving a profile with nothing to do; the profile can.
+    let (code, v) = run(&p, &["auth", "macro", "remove", "app", "csrf"]);
+    assert_ne!(code, 0);
+    assert!(v["error"]["message"].as_str().unwrap().contains("auth remove app"), "{v}");
+    ok(&p, &["auth", "remove", "app"]);
+    let (code, _) = run(&p, &["auth", "macro", "list", "app"]);
+    assert_ne!(code, 0);
+    // Nothing of it is left to come back with a new profile of that name.
+    ok(&p, &["auth", "add", "app", "-H", "X-Client: test"]);
+    assert_eq!(ok(&p, &["auth", "macro", "list", "app"])["macros"], serde_json::json!([]));
+}
+
+#[test]
+fn update_stays_within_the_rules_macros_and_their_origins() {
+    let (a, b, c) = (Server::start(), Server::start(), Server::start());
+    let p = tmp_project("origins");
+    add_csrf_macro(&p, &a, 100);
+    // Another macro's variable, named like a parameter of the requests below.
+    let form = request_file(&p, "other.txt", &format!("GET /form HTTP/1.1\nHost: 127.0.0.1:{}\n\n", a.port));
+    let step = format!("{}={form}", a.origin());
+    ok(&p, &["auth", "macro", "add", "app", "other", "--step", &step, "--extract", "1:amount=input:csrf"]);
+    ok(&p, &["auth", "macro", "run", "app", "other"]);
+    let last_body = |srv: &Server| srv.app.lock().unwrap().log.last().unwrap().clone();
+    let post = |srv: &Server, auth: bool, body: &str| {
+        let url = srv.url("/transfer");
+        let mut args = vec!["send", "--url", &url, "-X", "POST", "-H", FORM, "-d", body];
+        if auth {
+            args.extend(["--auth", "app"]);
+        }
+        run(&p, &args)
+    };
+    // What a value's placeholder may reach, as a request re-sent from history would.
+    let reaches = |srv: &Server| post(srv, false, "csrf=«auth:app:var:csrf:form»").0 == 0;
+
+    // No mapping: this rule's macro only, not every variable the session holds.
+    ok(&p, &["auth", "rule", "add", "app", "--action", "macro:csrf", "--action", "update"]);
+    let (code, r) = post(&a, true, "amount=5&csrf=stale");
+    assert_eq!((code, &r["data"]["response"]["status"]), (0, &serde_json::json!(200)), "{r}");
+    let sent = last_body(&a);
+    assert!(sent.contains("amount=5&csrf=csrf-tok-"), "{sent}");
+    let rows = query(&p, "SELECT req_body_text FROM history WHERE source = 'send' ORDER BY id DESC LIMIT 1");
+    let body = rows[0][0].as_str().unwrap();
+    assert!(body.starts_with("amount=5&csrf=«auth:app:var:csrf#") && !body.contains("var:amount"), "{body}");
+
+    // No URL on the rule: another origin's requests stay as they are, and the value can't
+    // reach that origin afterwards either.
+    let (code, _) = post(&b, true, "amount=5&csrf=stale");
+    assert_eq!(code, 0);
+    assert!(last_body(&b).contains("amount=5&csrf=stale"), "{}", last_body(&b));
+    assert!(reaches(&a) && !reaches(&b));
+
+    // Naming the parameter and variable is no way around that without a URL.
+    ok(&p, &["auth", "rule", "remove", "app", "1"]);
+    ok(&p, &["auth", "rule", "add", "app", "--action", "update:csrf,amount=amount"]);
+    let (code, _) = post(&b, true, "amount=5&csrf=stale");
+    assert_eq!(code, 0);
+    assert!(last_body(&b).contains("amount=5&csrf=stale"), "{}", last_body(&b));
+    assert!(!reaches(&b));
+    // On the macro's own origin a named variable of any macro is what was asked for.
+    let (code, _) = post(&a, true, "amount=5&csrf=stale");
+    assert_eq!(code, 0);
+    assert!(last_body(&a).contains("amount=csrf-tok-"), "{}", last_body(&a));
+
+    // A URL on the rule says where else the value goes: there, and only there.
+    ok(&p, &["auth", "rule", "remove", "app", "1"]);
+    ok(&p, &["auth", "rule", "add", "app", "--url", &b.origin(), "--action", "update:csrf"]);
+    let (code, _) = post(&b, true, "amount=5&csrf=stale");
+    assert_eq!(code, 0);
+    assert!(last_body(&b).contains("amount=5&csrf=csrf-tok-"), "{}", last_body(&b));
+    assert!(reaches(&b) && !reaches(&c));
 }

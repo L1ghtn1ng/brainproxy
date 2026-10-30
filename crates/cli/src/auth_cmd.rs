@@ -19,7 +19,7 @@ use crate::output::Out;
 #[derive(Subcommand)]
 pub enum AuthCmd {
     /// Add or replace a profile. Use it with `--auth NAME` on send, fuzz, crawl,
-    /// scan active, and proxy start.
+    /// scan active, and proxy start. For a session with no login, start with `auth macro add`.
     #[command(after_help = "Form login: --login-url URL --login-body 'user={{username}}&pass={{password}}' \
         --username alice --password-env APP_PW. JSON bodies (starting with '{') are sent as application/json.\n\
         CSRF: --csrf-url PAGE --csrf-regex 'name=\"csrf\" value=\"([^\"]+)\"' fills {{csrf}}.\n\
@@ -79,7 +79,7 @@ pub enum AuthCmd {
 
 #[derive(Subcommand)]
 pub enum MacroCmd {
-    /// Add or replace a macro.
+    /// Add or replace a macro. A profile that doesn't exist yet is made, with no login.
     #[command(after_help = "Steps run in the order given, with the profile's session; cookies carry \
         through. --step takes a history id, a raw request FILE (sent to its Host over --scheme), or \
         ORIGIN=FILE (e.g. https://app.test:8443=req.txt).\n\
@@ -127,7 +127,8 @@ pub enum RuleCmd {
         macro:NAME[:each|:N]    run a macro: once and again when its values go stale (default), on \
         every request, or every Nth\n  \
         update[:P[=VAR],...]    put macro values into the request: each query, form, JSON or multipart \
-        parameter, header or cookie P gets VAR (default: every variable into parameters of its name)\n  \
+        parameter, header or cookie P gets VAR (default: the variables of this rule's macros, into \
+        parameters of their names)\n  \
         login                   log in again with the profile if the session is not logged in\n\
         A response that looks logged out, or matches --invalid, refreshes the rule's macros (and \
         logs in again) and the request is sent once more.\n\
@@ -144,6 +145,7 @@ pub enum RuleCmd {
         #[arg(long = "tool", value_delimiter = ',')]
         tools: Vec<String>,
         /// Only for requests to this host pattern (*.example.com) or URL prefix (https://example.com/api/).
+        /// Without it, macro values only go to the origins of the macro that extracted them.
         #[arg(long)]
         url: Option<String>,
         /// Regex marking a response rejected for stale values (e.g. "invalid csrf"): refresh and resend.
@@ -639,15 +641,25 @@ fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
             let replaced = h.macros.iter().any(|o| o.name == name);
             h.macros.retain(|o| o.name != name);
             h.macros.push(m.clone());
-            store.auth_save_handling(&profile, &h)?;
+            // A macro can start a profile with no login; `auth add` can set its options after.
+            let created = matches!(store.auth_profile(&profile), Err(Error::NotFound(_)));
+            if created {
+                store.auth_create_for_macros(&profile, &h)?;
+            } else {
+                store.auth_save_handling(&profile, &h)?;
+            }
             let summary = macro_summary(&m);
-            out.ok(json!({"profile": profile, "macro": summary, "replaced": replaced}), || {
-                format!(
-                    "macro {name:?} {} for {profile} ({} steps); try it: brainproxy auth macro run {profile} {name}",
+            out.ok(
+                json!({"profile": profile, "profile_created": created, "macro": summary, "replaced": replaced}),
+                || {
+                    format!(
+                    "macro {name:?} {} for {}{profile} ({} steps); try it: brainproxy auth macro run {profile} {name}",
                     if replaced { "replaced" } else { "saved" },
+                    if created { "new profile " } else { "" },
                     m.steps.len()
                 )
-            });
+                },
+            );
         }
         MacroCmd::List { profile } => {
             store.auth_profile(&profile)?;

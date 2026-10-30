@@ -92,7 +92,7 @@ export function actionLabel(a: Action): string {
     case "update":
       return a.params.length
         ? `update ${a.params.map(([p, v]) => (p === v ? p : `${p} ← ${v}`)).join(", ")}`
-        : "update parameters named like the macro values";
+        : "update parameters named like this rule's macro values";
     case "login":
       return "log in again if not logged in";
   }
@@ -145,10 +145,12 @@ export function ruleAddArgs(profile: string, r: RuleForm): string[] {
 export function ruleProblems(r: RuleForm, macros: string[], hasCheckUrl: boolean, hasLogin: boolean): string[] {
   const out: string[] = [];
   if (!r.actions.length) out.push("Add at least one action.");
-  for (const a of r.actions) {
+  r.actions.forEach((a, i) => {
+    if (a.action === "update" && !a.params.length && !r.actions.slice(0, i).some((b) => b.action === "run_macro"))
+      out.push("Update with no parameters needs a macro before it.");
     if (a.action === "check" && !hasCheckUrl) out.push("A session check needs the profile's check URL.");
     if (a.action === "login" && !hasLogin) out.push("Log in needs a profile with a login URL.");
     if (a.action === "run_macro" && !macros.includes(a.macro)) out.push(`No macro named "${a.macro}".`);
-  }
+  });
   return [...new Set(out)];
 }

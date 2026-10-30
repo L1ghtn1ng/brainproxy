@@ -293,7 +293,7 @@ byte, side by side or unified.
     so history keeps the request without it. A request that brings its own Authorization
     header is left alone. NTLM works over HTTP/1.1 only: the proxy sends those hosts'
     requests upstream over HTTP/1.1 even when the browser speaks HTTP/2 to it.
-  - **Macros:** requests that run in order with the profile's session, like Burp's macros.
+  - **Macros:** requests that run in order with the profile's session.
     *New macro from Traffic* lists recent requests; click them in the order they should run
     (move them up or down), then say what to take from each response into a variable: an
     HTML input by name (or a `<meta name=… content=…>`), a JSON path such as `data.token`, a
@@ -308,20 +308,24 @@ byte, side by side or unified.
     `https://app.test/api/`. Actions run in order: *Check session* fetches the check URL
     (every N requests); if it's still valid the rest of the rule is skipped. *Run macro*
     runs a macro on every request, every N requests, or once and again only when its values
-    go stale. *Update request* puts macro values into the request: every query, form, JSON
-    or multipart parameter, header or cookie with the variable's name (or the names you map,
+    go stale. *Update request* puts the values of this rule's macros into the request: every query, form,
+    JSON or multipart parameter, header or cookie with the variable's name (or the names you map,
     such as `X-CSRF-Token=csrf`; an `Authorization` header keeps its scheme, as in
     `Bearer …`); a parameter being fuzzed or attacked keeps its payload.
     *Log in* logs in with the profile when the session isn't logged in or a check just
     failed. A response that looks logged out, or matches the rule's *stale-values* regex
     (for example `invalid csrf token`), refreshes the rule's macros (once, however many
     requests notice at the same time), logs in again if it can, and sends the request once
-    more. A profile needs no login or headers of its own when its rules do the work.
+    more. A profile with no login or headers of its own needs at least one macro or rule:
+    start it with *New macro profile* (CLI: `auth macro add` on a new name), then edit it to
+    set its options; its last macro or rule can't be removed, only the profile.
     Extracted values are stored like the session cookies and recorded as placeholders such
     as `«auth:NAME:var:csrf#7»`: each macro run has its own, so requests prepared at the
     same time each send their own token, and a request re-sent later gets the latest value.
-    A value only goes to the origins of its macro's steps and of the requests a rule put it
-    in. Macro requests are checked against the engagement scope like any other request.
+    A value only goes to the origins of its macro's steps. To send it elsewhere (a token from
+    a sign-in host used on an API host), give the rule a URL: it then also goes to the requests
+    that URL matches, from then on. A rule with no URL leaves requests to other origins as they
+    are. Macro requests are checked against the engagement scope like any other request.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
@@ -462,7 +466,9 @@ Crawl and active-scan scope and safety flags:
 Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles above):
 
 - `auth macro add PROFILE NAME --step ID|FILE|ORIGIN=FILE ... --extract STEP:VAR=KIND:EXPR ...`
-  adds or replaces a macro. KIND is `regex`, `json`, `header`, `cookie` or `input`. A FILE
+  adds or replaces a macro, making the profile with no login if it doesn't exist (`auth add`
+  can then set its options; `auth add` alone refuses a profile with no login, header, macro or
+  rule). KIND is `regex`, `json`, `header`, `cookie` or `input`. A FILE
   step is sent to its `Host` over `--scheme` (default https) unless the request line has a
   full URL or ORIGIN is given. `auth macro list/show/run/remove`; a macro a rule runs
   can't be removed until the rule is.
@@ -470,7 +476,8 @@ Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles abov
   found, and says which, with each step's status and history id.
 - `auth rule add PROFILE --action SPEC ... [--tool T,...] [--url PATTERN] [--invalid REGEX]`,
   SPEC being `check[:N]`, `macro:NAME[:each|:N]`, `update[:PARAM[=VAR],...]` or `login`.
-  `auth rule list/remove`. `auth show` lists the macros and rules too.
+  `auth rule list/remove`. `auth show` lists the macros and rules too. `update` with no list
+  needs a macro before it in the rule. Without `--url`, values only go to their macros' origins.
 - `macro:NAME` alone runs the macro once per command and again when a response shows its
   values went stale; the cache isn't shared between commands, so each `send` runs it once.
   `:each` runs it for every request, which a scan or fuzz run with `-c 10` does ten at a

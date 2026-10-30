@@ -124,8 +124,41 @@ impl AuthProfile {
         self.login_url.is_some()
     }
 
-    /// Checks regexes and required fields.
+    /// A profile with no login or headers, whose session its macros and rules make.
+    pub(crate) fn without_login(name: &str) -> Self {
+        AuthProfile {
+            name: name.to_string(),
+            login_method: post(),
+            relogin_interval_secs: five(),
+            max_relogins: twenty(),
+            ..Default::default()
+        }
+    }
+
+    /// Checks regexes and required fields, for a profile with no macros or rules.
     pub fn validate(&self) -> Result<()> {
+        self.validate_with(&Default::default())
+    }
+
+    /// Checks regexes and required fields: a profile needs a login, a header, or at least
+    /// one of the macros and rules in `handling`.
+    pub fn validate_with(&self, handling: &crate::session::Handling) -> Result<()> {
+        if !self.has_login()
+            && self.headers.is_empty()
+            && self.platform.is_none()
+            && handling.macros.is_empty()
+            && handling.rules.is_empty()
+        {
+            return Err(Error::InvalidInput(format!(
+                "profile needs --login-url, --platform, at least one --header, or a macro \
+                 (`auth macro add {} MACRO --step ...` makes a profile with no login)",
+                self.name
+            )));
+        }
+        self.validate_fields()
+    }
+
+    fn validate_fields(&self) -> Result<()> {
         if let Some(p) = &self.platform {
             p.validate(self.username.as_deref(), self.password.as_ref())?;
         }
@@ -189,7 +222,7 @@ fn is_zero(n: &u64) -> bool {
 impl Store {
     /// Adds or replaces a profile (keeping no old session state).
     pub fn auth_save_profile(&self, p: &AuthProfile) -> Result<()> {
-        p.validate()?;
+        p.validate_with(&self.auth_handling(&p.name)?)?;
         let json = serde_json::to_string(p).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.conn.execute(
             "INSERT INTO auth_profiles (name, profile, state) VALUES (?1, ?2, '{}')
@@ -240,7 +273,7 @@ impl Store {
         if self.conn.execute("DELETE FROM auth_profiles WHERE name = ?1", [name])? == 0 {
             return Err(Error::NotFound(format!("auth profile {name:?}")));
         }
-        self.auth_save_handling(name, &Default::default())?;
+        self.auth_clear_handling(name)?;
         self.bump_settings_version()
     }
 }
@@ -526,7 +559,8 @@ impl AuthSession {
     }
 
     pub fn new(project: &Path, profile: AuthProfile, state: SessionState, client: Client) -> Result<Self> {
-        profile.validate()?;
+        // Whether it has something to do depends on its macros and rules: checked when saved.
+        profile.validate_fields()?;
         let compile = |r: &Option<String>| {
             r.as_deref().map(Regex::new).transpose().map_err(|e| Error::InvalidInput(e.to_string()))
         };
@@ -1168,8 +1202,18 @@ mod tests {
 
     #[test]
     fn validation_and_redaction() {
-        // No login and no headers: a session made by macros and session rules only.
-        assert!(AuthProfile { name: "x".into(), ..Default::default() }.validate().is_ok());
+        // No login, no headers: only with a macro or a rule.
+        let bare = AuthProfile { name: "x".into(), ..Default::default() };
+        assert!(bare.validate().is_err());
+        let rule = crate::session::SessionRule {
+            id: 1,
+            description: String::new(),
+            tools: vec![],
+            url: None,
+            actions: vec![crate::session::Action::Login],
+            invalid: None,
+        };
+        assert!(bare.validate_with(&crate::session::Handling { macros: vec![], rules: vec![rule] }).is_ok());
         let p = AuthProfile {
             name: "x".into(),
             login_url: Some("https://a.test/l".into()),

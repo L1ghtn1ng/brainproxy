@@ -53,4 +53,7 @@ test("a rule that can't be saved says why", () => {
     'No macro named "x".',
   ]);
   assert.deepEqual(ruleProblems(bad, ["x"], true, true), []);
+  const update = { action: "update", params: [] } as Action;
+  assert.deepEqual(ruleProblems({ ...r, actions: [update] }, [], true, true), ["Update with no parameters needs a macro before it."]);
+  assert.deepEqual(ruleProblems({ ...r, actions: [{ action: "run_macro", macro: "x", every: 1 }, update] }, ["x"], true, true), []);
 });

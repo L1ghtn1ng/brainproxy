@@ -223,7 +223,7 @@ interface Picked {
   status: number | null;
 }
 
-function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved: () => void }) {
+export function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved: () => void }) {
   const exec = useExec();
   const [items, setItems] = useState<Picked[]>([]);
   const [filter, setFilter] = useState("");
@@ -345,7 +345,7 @@ function MacroBuilder(p: { profile: string; onCancel: () => void; onSaved: () =>
         </>
       )}
       <div className="row gap set-actions">
-        <button className="btn primary" disabled={!name.trim() || steps.length === 0} onClick={save}>
+        <button className="btn primary" disabled={!p.profile || !name.trim() || steps.length === 0} onClick={save}>
           Save macro
         </button>
         <button className="btn" onClick={p.onCancel}>
@@ -393,7 +393,7 @@ function RuleBuilder(p: {
           </div>
         </div>
         <label>
-          <span className="label">URL: host pattern or URL prefix (empty: any)</span>
+          <span className="label">URL: host pattern or URL prefix (empty: any, values stay on their macro's origins)</span>
           <input className="input mono" value={f.url} placeholder="*.app.test or https://app.test/api/" onChange={(e) => set({ url: e.target.value })} />
         </label>
         <label>
@@ -442,7 +442,7 @@ function RuleBuilder(p: {
               <input
                 className="input mono grow"
                 defaultValue={a.params.map(([k, v]) => (k === v ? k : `${k}=${v}`)).join(", ")}
-                placeholder="empty: every value into parameters of its name; or csrf, X-CSRF-Token=csrf"
+                placeholder="empty: this rule's macro values, by name; or csrf, X-CSRF-Token=csrf"
                 onChange={(e) => setAction(i, { action: "update", params: parseParams(e.target.value) })}
               />
             )}

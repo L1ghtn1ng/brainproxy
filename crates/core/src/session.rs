@@ -1,4 +1,4 @@
-//! Session handling on top of an auth profile, like Burp's macros and session rules.
+//! Session handling on top of an auth profile: macros and session rules.
 //!
 //! A macro is an ordered list of requests. Each step can extract values from its
 //! response (a regex group, a JSON path, a header, a cookie, or an HTML input by
@@ -173,8 +173,9 @@ pub enum Action {
         every: u32,
     },
     /// Put macro values into the request: each parameter (query, form, JSON, multipart),
-    /// header or cookie named PARAM gets variable VAR. Empty: every variable into the
-    /// parameters of its own name.
+    /// header or cookie named PARAM gets variable VAR. Empty: each variable of the macros
+    /// this rule ran into the parameters of its own name. A rule with no URL only puts a
+    /// value into requests to the origins of the macro that extracted it.
     Update {
         #[serde(default)]
         params: Vec<(String, String)>,
@@ -237,9 +238,13 @@ pub struct SessionVar {
     pub value: String,
     /// The macro run that extracted it.
     pub run: u64,
-    /// Origins the value may be sent to: the macro's steps' and those its rules update.
+    /// Origins the value may be sent to: the macro's steps' and those a rule with a URL
+    /// put it in.
     #[serde(default)]
     pub origins: Vec<String>,
+    /// The origins of the steps of the macro that extracted it.
+    #[serde(default)]
+    pub home: Vec<String>,
 }
 
 /// The placeholder kind of a macro variable: `var:NAME#RUN` (or `var:NAME`, its latest
@@ -329,8 +334,14 @@ impl Handling {
             if let Some(u) = &r.url {
                 UrlPattern::new(u).map_err(|e| what(e.to_string()))?;
             }
-            for a in &r.actions {
+            for (i, a) in r.actions.iter().enumerate() {
                 match a {
+                    Action::Update { params }
+                        if params.is_empty()
+                            && !r.actions[..i].iter().any(|b| matches!(b, Action::RunMacro { .. })) =>
+                    {
+                        return Err(what("update with no parameters needs a macro before it in the rule".into()))
+                    }
                     Action::Check { .. } if profile.check_url.is_none() => {
                         return Err(what("a check needs the profile's check URL (auth add --check-url)".into()))
                     }
@@ -491,13 +502,34 @@ impl Store {
             .unwrap_or_default())
     }
 
-    /// Stores a profile's macros and rules (checked against the profile first).
-    pub fn auth_save_handling(&self, profile: &str, h: &Handling) -> Result<()> {
-        if *h == Handling::default() {
-            return self.meta_set(&handling_key(profile), None);
-        }
-        let (p, _) = self.auth_profile(profile)?;
+    /// Forgets a removed profile's macros and rules.
+    pub(crate) fn auth_clear_handling(&self, profile: &str) -> Result<()> {
+        self.meta_set(&handling_key(profile), None)
+    }
+
+    /// Makes a profile with no login or headers for its first macro.
+    pub fn auth_create_for_macros(&self, name: &str, h: &Handling) -> Result<()> {
+        let p = AuthProfile::without_login(name);
         h.validate(&p)?;
+        p.validate_with(h)?;
+        self.auth_write_handling(name, h)?;
+        self.auth_save_profile(&p)
+    }
+
+    /// Stores a profile's macros and rules (checked against the profile first). A profile
+    /// with no login or headers can't lose its last macro or rule: it would do nothing.
+    pub fn auth_save_handling(&self, profile: &str, h: &Handling) -> Result<()> {
+        let (p, _) = self.auth_profile(profile)?;
+        p.validate_with(h)
+            .map_err(|e| Error::InvalidInput(format!("{e}; to delete the profile itself: auth remove {profile}")))?;
+        h.validate(&p)?;
+        self.auth_write_handling(profile, h)
+    }
+
+    fn auth_write_handling(&self, profile: &str, h: &Handling) -> Result<()> {
+        if *h == Handling::default() {
+            return self.auth_clear_handling(profile);
+        }
         let json = serde_json::to_string(h).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.meta_set(&handling_key(profile), Some(&json))
     }
@@ -634,6 +666,7 @@ impl AuthSession {
         macro_generation: u64,
     ) -> Vec<u8> {
         let rule = &self.handling.cfg.rules[i];
+        let scoped = rule.url.is_some();
         let counters = &self.handling.compiled[i].counters;
         // Variables of the macros this rule ran, with their runs.
         let mut local: HashMap<String, u64> = HashMap::new();
@@ -674,7 +707,7 @@ impl AuthSession {
                     }
                 }
                 Action::Update { params } => {
-                    request = self.update_request(&request, target, params, &local, keep_params, keep_cookies);
+                    request = self.update_request(&request, target, params, &local, keep_params, keep_cookies, scoped);
                 }
                 Action::Login => {
                     if check_failed || !self.state.lock().unwrap().logged_in {
@@ -769,7 +802,7 @@ impl AuthSession {
             // Parameters named like an earlier step's variable get its value too.
             let derived: Vec<(String, String)> = found.iter().map(|v| (v.clone(), v.clone())).collect();
             let runs: HashMap<String, u64> = found.iter().map(|v| (v.clone(), run)).collect();
-            raw = self.update_request(&raw, &target, &derived, &runs, &[], &[]);
+            raw = self.update_request(&raw, &target, &derived, &runs, &[], &[], false);
             let head = RawRequest::from_bytes(raw.clone()).head().ok();
             let mut sr = StepRun {
                 step: i + 1,
@@ -797,7 +830,13 @@ impl AuthSession {
                 match extract(x, &ex.response) {
                     Some(value) => {
                         sr.extracted.push(Extracted { var: x.var.clone(), value: Some(mask(&value)) });
-                        let var = SessionVar { name: x.var.clone(), value, run, origins: origins.clone() };
+                        let var = SessionVar {
+                            name: x.var.clone(),
+                            value,
+                            run,
+                            origins: origins.clone(),
+                            home: origins.clone(),
+                        };
                         if let Some(v) = vault {
                             v.put_var(&self.profile.name, &var);
                         }
@@ -821,8 +860,12 @@ impl AuthSession {
     }
 
     /// The request with each mapped parameter, header or cookie set to its variable's
-    /// placeholder (from `runs`, else the session's latest value). Parameters and headers
-    /// named in `keep_params`, and cookies in `keep_cookies`, stay as they are.
+    /// placeholder (from `runs`, else, when named in `params`, the session's latest value).
+    /// With no `params`, only the variables in `runs` are mapped, each to its own name.
+    /// `scoped` says the caller's URL pattern chose this request, which lets a value go to
+    /// this origin from now on; otherwise it only goes to its macro's own origins. Parameters
+    /// and headers named in `keep_params`, and cookies in `keep_cookies`, stay as they are.
+    #[allow(clippy::too_many_arguments)]
     fn update_request(
         &self,
         raw: &[u8],
@@ -831,13 +874,13 @@ impl AuthSession {
         runs: &HashMap<String, u64>,
         keep_params: &[&str],
         keep_cookies: &[&str],
+        scoped: bool,
     ) -> Vec<u8> {
-        let latest: HashMap<String, u64> =
-            self.state.lock().unwrap().vars.iter().map(|v| (v.name.clone(), v.run)).collect();
+        let vars: HashMap<String, (u64, Vec<String>)> =
+            self.state.lock().unwrap().vars.iter().map(|v| (v.name.clone(), (v.run, v.home.clone()))).collect();
         let mapping: Vec<(String, String)> = if params.is_empty() {
-            let mut names: Vec<&String> = runs.keys().chain(latest.keys()).collect();
+            let mut names: Vec<&String> = runs.keys().collect();
             names.sort();
-            names.dedup();
             names.into_iter().map(|n| (n.clone(), n.clone())).collect()
         } else {
             params.to_vec()
@@ -849,13 +892,19 @@ impl AuthSession {
             if keep_params.iter().any(|k| k == &param) {
                 continue;
             }
+            let Some((latest, home)) = vars.get(&var) else { continue };
+            if !scoped && !home.contains(&origin) {
+                continue;
+            }
             let cookies = !keep_cookies.iter().any(|k| k == &param);
-            let Some(run) = runs.get(&var).or_else(|| latest.get(&var)).copied() else { continue };
+            let run = runs.get(&var).copied().unwrap_or(*latest);
             let ph = |enc| placeholder(&self.profile.name, &var_kind(&var, Some(run), enc));
             let updated = set_param(&out, &param, cookies, ph);
-            if updated != out {
-                out = updated;
-                // The value may go where the rule puts it.
+            if updated == out {
+                continue;
+            }
+            out = updated;
+            if scoped {
                 if let Some(v) = vault {
                     for enc in [Enc::Raw, Enc::Form, Enc::Json] {
                         v.allow(&ph(enc), &origin);
@@ -1202,7 +1251,13 @@ mod tests {
         let profile =
             AuthProfile { name: "t".into(), headers: vec![("X-Csrf".into(), "static".into())], ..Default::default() };
         let state = crate::auth::SessionState {
-            vars: vec![SessionVar { name: "csrf".into(), value: "v1".into(), run: 1, origins: vec![] }],
+            vars: vec![SessionVar {
+                name: "csrf".into(),
+                value: "v1".into(),
+                run: 1,
+                origins: vec!["https://a.test".into()],
+                home: vec!["https://a.test".into()],
+            }],
             ..Default::default()
         };
         let update = Action::Update { params: vec![("X-Csrf".into(), "csrf".into()), ("csrf".into(), "csrf".into())] };

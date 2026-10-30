@@ -26,7 +26,7 @@ import {
   type PlatformForm,
   type UpstreamForm,
 } from "./connection";
-import { SessionHandling } from "./SessionHandling";
+import { MacroBuilder, SessionHandling } from "./SessionHandling";
 import type { MacroSummary, SessionRule } from "./sessionHandling";
 import NOTICE from "../../../NOTICE?raw";
 
@@ -295,6 +295,7 @@ function Auth() {
   const [form, setForm] = useState<Form | null>(null);
   const [editing, setEditing] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [macroProfile, setMacroProfile] = useState<string | null>(null);
   const [busy, setBusy] = useState("");
 
   const load = async () => {
@@ -357,6 +358,7 @@ function Auth() {
             title="Log in once in a browser; brainproxy works out the profile"
             onClick={() => {
               setForm(null);
+              setMacroProfile(null);
               setRecording(true);
             }}
           >
@@ -366,11 +368,23 @@ function Auth() {
             className="btn"
             onClick={() => {
               setRecording(false);
+              setMacroProfile(null);
               setEditing(false);
               setForm({ ...EMPTY_FORM });
             }}
           >
             New profile
+          </button>
+          <button
+            className="btn"
+            title="A session with no login: its macros and rules make it"
+            onClick={() => {
+              setRecording(false);
+              setForm(null);
+              setMacroProfile("");
+            }}
+          >
+            New macro profile
           </button>
           <span className="grow" />
           <span className="muted">{list.length} profiles</span>
@@ -386,6 +400,7 @@ function Auth() {
               onClick={() => {
                 setForm(null);
                 setRecording(false);
+                setMacroProfile(null);
                 setSelected(p.name);
               }}
             >
@@ -408,6 +423,29 @@ function Auth() {
             load();
           }}
         />
+      ) : macroProfile !== null ? (
+        <div className="detail">
+          <div className="detail-head">
+            <h2>New macro profile</h2>
+          </div>
+          <p className="muted small">A profile with no login: its macros and session rules make the session. Edit it afterwards to add a check URL or username.</p>
+          <div className="form">
+            <Field label="Profile name">
+              <input className="input" value={macroProfile} onChange={(e) => setMacroProfile(e.target.value)} />
+            </Field>
+          </div>
+          <MacroBuilder
+            profile={macroProfile.trim()}
+            onCancel={() => setMacroProfile(null)}
+            onSaved={() => {
+              const name = macroProfile.trim();
+              setMacroProfile(null);
+              setSelected(name);
+              show(name);
+              load();
+            }}
+          />
+        </div>
       ) : form ? (
         <div className="detail">
           <div className="detail-head">
@@ -415,8 +453,7 @@ function Auth() {
           </div>
           <p className="muted small">
             A profile logs in (form, JSON, or a raw request), keeps the session, and re-logs in when it sees a 401, a
-            redirect to the login page, or the logged-out pattern. Without a login URL it only adds the headers below (and
-            what its macros and session rules do).
+            redirect to the login page, or the logged-out pattern. Without a login URL it only adds the headers below.
           </p>
           <h3>Profile</h3>
           <div className="form">

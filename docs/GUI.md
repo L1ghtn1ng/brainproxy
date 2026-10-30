@@ -203,5 +203,6 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
 - Macros are built from Traffic entries only (the 500 most recent); a step from a raw
   request file, or a step whose request should be edited (to add `{{name}}`), needs
   `auth macro add` on the command line. A macro or rule is replaced or removed, not edited
-  in place.
+  in place. *New macro profile* starts a profile with no login from its first macro, since
+  `auth add` refuses a profile with nothing to do.
 - The native window was not screenshot-tested; the browser build was (`npm run dev`).
