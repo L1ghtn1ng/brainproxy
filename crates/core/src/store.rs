@@ -16,7 +16,7 @@ use crate::capture::Capture;
 use crate::error::{Error, Result};
 use crate::http::{Exchange, Target};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS history (
@@ -1141,6 +1141,33 @@ mod tests {
             duration_ms: 7,
         };
         store.record_exchange("send", &ex).unwrap()
+    }
+
+    #[test]
+    fn a_project_on_v11_gets_the_websocket_tables() {
+        let dir = std::env::temp_dir().join(format!("bp-store-v11-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.bpdb");
+        {
+            let store = Store::open(&path).unwrap();
+            store.conn.execute_batch("DROP TABLE ws_messages; DROP TABLE ws_connections;").unwrap();
+            store.conn.pragma_update(None, "user_version", 11).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let tables: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN ('ws_connections', 'ws_messages')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 2);
+        let version: i64 = store.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
