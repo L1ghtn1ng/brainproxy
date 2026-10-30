@@ -25,6 +25,7 @@ mod gateway;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -60,6 +61,12 @@ const MAX_CHAIN: usize = 6;
 const MAX_PER_ELEMENT: usize = 3;
 /// Labels and URLs listed in the summary.
 const MAX_LISTED: usize = 50;
+/// Longest URL queued, and longest label kept from a page.
+const MAX_URL: usize = 4096;
+/// --max-minutes when none is given: a hostile page can make every step wait for a timeout.
+const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
+/// Commands timing out in a row before the tab is replaced by a fresh one.
+const MAX_TIMEOUTS: usize = 3;
 
 #[derive(Clone)]
 pub struct BrowserCrawlConfig {
@@ -82,6 +89,10 @@ pub struct BrowserCrawlSummary {
     pub mode: String,
     /// Browser product and version.
     pub browser: String,
+    /// Chromium's sandbox was on (off only with BRAINPROXY_BROWSER_NO_SANDBOX=1).
+    pub sandbox: bool,
+    /// Tabs replaced because their page stopped answering.
+    pub tab_restarts: usize,
     /// Requests the browser made (all recorded, source crawl-browser).
     pub requests: usize,
     pub by_status: BTreeMap<String, usize>,
@@ -126,6 +137,25 @@ pub(crate) struct Snapshot {
     pub opened: Vec<String>,
     pub clickables: Vec<Clickable>,
     pub forms: Vec<Form>,
+}
+
+impl Snapshot {
+    /// The page script limits all this too, but a page can tamper with what that script uses.
+    fn bounded(mut self) -> Self {
+        self.routes.truncate(200);
+        self.opened.truncate(200);
+        self.links.truncate(500);
+        self.clickables.truncate(300);
+        self.forms.truncate(100);
+        for c in self.links.iter_mut().chain(&mut self.clickables) {
+            for s in [&mut c.text, &mut c.id, &mut c.name, &mut c.class, &mut c.title, &mut c.href, &mut c.action] {
+                if s.len() > MAX_URL {
+                    *s = s.chars().take(MAX_URL).collect();
+                }
+            }
+        }
+        self
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -209,15 +239,25 @@ pub async fn crawl(project: &Path, cfg: BrowserCrawlConfig, ctl: JobControl) -> 
     )
     .await?;
     let explored = async {
+        let no_sandbox = cdp::sandbox_off();
         let chrome = Chrome::launch(&LaunchOptions {
             path: &cfg.browser,
             headless: cfg.headless,
             proxy: gateway.addr,
             ca_spki: cfg.ca.spki_sha256_base64(),
-            no_sandbox: cdp::sandbox_off(),
+            no_sandbox,
         })?;
         let mut ex = Explorer::new(&chrome, &gateway, &cfg, &scope, &ctl, started);
-        let result = ex.run(&seeds).await.map(|_| ex.finish());
+        ex.summary.sandbox = !no_sandbox;
+        // Ctrl-C ends the crawl normally, so the profile (the target's cookies) is removed.
+        let ran = tokio::select! {
+            r = ex.run(&seeds) => r,
+            () = interrupted() => {
+                ctl.request_stop();
+                Ok(())
+            }
+        };
+        let result = ran.map(|_| ex.finish());
         chrome.close().await;
         result
     }
@@ -250,9 +290,33 @@ pub async fn crawl(project: &Path, cfg: BrowserCrawlConfig, ctl: JobControl) -> 
     Ok(s)
 }
 
+/// Resolves on Ctrl-C or, on Unix, a request to terminate.
+async fn interrupted() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                () = ctrl_c => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    ctrl_c.await;
+}
+
 struct Explorer<'a> {
     chrome: &'a Chrome,
     session: String,
+    target: String,
+    /// Commands timed out in a row; a reply resets it.
+    timeouts: AtomicUsize,
     gateway: &'a Gateway,
     cfg: &'a BrowserCrawlConfig,
     scope: &'a Scope,
@@ -287,6 +351,8 @@ impl<'a> Explorer<'a> {
         Explorer {
             chrome,
             session: String::new(),
+            target: String::new(),
+            timeouts: AtomicUsize::new(0),
             gateway,
             cfg,
             scope,
@@ -316,10 +382,13 @@ impl<'a> Explorer<'a> {
             if self.ctl.stopped() {
                 break;
             }
-            let timed_out = self.cfg.crawl.max_duration.is_some_and(|d| self.started.elapsed() >= d);
+            let timed_out = self.started.elapsed() >= self.cfg.crawl.max_duration.unwrap_or(DEFAULT_MAX_DURATION);
             if self.ops >= self.cfg.crawl.max_pages || timed_out {
                 self.summary.limit_reached = true;
                 break;
+            }
+            if self.timeouts.load(Ordering::Relaxed) >= MAX_TIMEOUTS {
+                self.replace_tab().await?;
             }
             self.summary.depth_reached = self.summary.depth_reached.max(a.depth);
             self.progress();
@@ -327,7 +396,10 @@ impl<'a> Explorer<'a> {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) if !self.chrome.alive() => return Err(e),
-                Err(_) => {
+                Err(e) => {
+                    if matches!(e, Error::Timeout(_)) {
+                        self.timeouts.fetch_add(1, Ordering::Relaxed);
+                    }
                     self.summary.errors += 1;
                     self.current = None;
                     continue;
@@ -338,7 +410,7 @@ impl<'a> Explorer<'a> {
             }
             match self.eval("window.__bp ? __bp.snapshot() : null").await {
                 Ok(v) if !v.is_null() => {
-                    let snap: Snapshot = serde_json::from_value(v).unwrap_or_default();
+                    let snap = serde_json::from_value::<Snapshot>(v).unwrap_or_default().bounded();
                     self.expand(&a, &snap);
                 }
                 // Not a page the script runs in (an error page, a download): nothing to explore.
@@ -359,10 +431,15 @@ impl<'a> Explorer<'a> {
         self.summary.browser = version["product"].as_str().unwrap_or("").to_string();
         self.chrome.call("Target.setDiscoverTargets", json!({"discover": true}), None).await?;
         let _ = self.chrome.call("Browser.setDownloadBehavior", json!({"behavior": "deny"}), None).await;
+        self.open_tab().await
+    }
+
+    /// A new tab with the page script in every document it loads.
+    async fn open_tab(&mut self) -> Result<()> {
         let target = self.chrome.call("Target.createTarget", json!({"url": "about:blank"}), None).await?;
-        let target_id = target["targetId"].as_str().unwrap_or("").to_string();
+        self.target = target["targetId"].as_str().unwrap_or("").to_string();
         let attached =
-            self.chrome.call("Target.attachToTarget", json!({"targetId": target_id, "flatten": true}), None).await?;
+            self.chrome.call("Target.attachToTarget", json!({"targetId": self.target, "flatten": true}), None).await?;
         self.session = attached["sessionId"]
             .as_str()
             .ok_or_else(|| Error::Protocol("the browser gave no session for the crawl tab".into()))?
@@ -370,6 +447,19 @@ impl<'a> Explorer<'a> {
         let s = Some(self.session.as_str());
         self.chrome.call("Page.enable", json!({}), s).await?;
         self.chrome.call("Page.addScriptToEvaluateOnNewDocument", json!({"source": PAGE_JS}), s).await?;
+        Ok(())
+    }
+
+    /// Swaps a tab whose page stopped answering (a script spinning forever) for a fresh one.
+    /// The new one opens first: closing a browser's last tab can end the browser.
+    async fn replace_tab(&mut self) -> Result<()> {
+        let old = std::mem::take(&mut self.target);
+        self.open_tab().await?;
+        let close = json!({"targetId": old});
+        let _ = self.chrome.call_timeout("Target.closeTarget", close, None, Duration::from_secs(5)).await;
+        self.timeouts.store(0, Ordering::Relaxed);
+        self.current = None;
+        self.summary.tab_restarts += 1;
         Ok(())
     }
 
@@ -403,7 +493,13 @@ impl<'a> Explorer<'a> {
                 Some(&self.session),
                 Duration::from_secs(10),
             )
-            .await?;
+            .await
+            .inspect_err(|e| {
+                if matches!(e, Error::Timeout(_)) {
+                    self.timeouts.fetch_add(1, Ordering::Relaxed);
+                }
+            })?;
+        self.timeouts.store(0, Ordering::Relaxed);
         if let Some(ex) = r.get("exceptionDetails") {
             let text = ex["exception"]["description"].as_str().or(ex["text"].as_str()).unwrap_or("exception");
             return Err(Error::Protocol(format!("page script: {text}")));
@@ -524,8 +620,9 @@ impl<'a> Explorer<'a> {
 
     /// Gives empty fields the spider's test values (required boxes ticked, a select's first value).
     async fn fill(&self) -> Result<()> {
-        let fields: Vec<Field> =
+        let mut fields: Vec<Field> =
             serde_json::from_value(self.eval("window.__bp ? __bp.fields() : []").await?).unwrap_or_default();
+        fields.truncate(200);
         let pairs: Vec<Value> = fields.iter().filter_map(|f| fill_value(f).map(|v| json!([f.i, v]))).collect();
         if !pairs.is_empty() {
             self.eval(&format!("__bp.setFields({})", Value::Array(pairs))).await?;
@@ -535,6 +632,9 @@ impl<'a> Explorer<'a> {
 
     /// Queues a page load of `raw` if it is in scope and new.
     fn enqueue_url(&mut self, raw: &str, depth: usize) {
+        if raw.len() > MAX_URL {
+            return;
+        }
         let Ok(u) = Url::parse(raw) else { return };
         if !matches!(u.scheme(), "http" | "https") {
             return;

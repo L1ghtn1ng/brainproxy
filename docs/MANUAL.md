@@ -252,10 +252,13 @@ attack type, and pick payloads:
     to every request on the site and renewed when lost.
   - **Limits:** depth, max pages (page loads, clicks and form submissions, counting the
     reloads and clicks needed to get back to a page state), rate, path
-    prefix and the site's origin apply as for the plain crawl. Linux and macOS only. If
-    the browser can't start because Chromium's sandbox is unavailable (running as root
-    starts it without one; some containers lack user namespaces), install your
-    distribution's `chromium-sandbox` package or set `BRAINPROXY_BROWSER_NO_SANDBOX=1`.
+    prefix and the site's origin apply as for the plain crawl, and it stops after 30
+    minutes unless you set `--max-minutes`. Linux and macOS only.
+  - **Chromium's sandbox:** it stays on, because the pages it opens are the target's. As
+    root, or where it is unavailable (some containers lack user namespaces), the browser
+    won't start: run as a normal user, install your distribution's `chromium-sandbox`
+    package, or set `BRAINPROXY_BROWSER_NO_SANDBOX=1` to run without it. The crawl's
+    summary then says `"sandbox": false`.
 - **New scan › PHP2Shell check:** checks the listed sites for PHP2Shell (CVE-2026-109618,
   CVE-2026-109619) with active rule 100002 only, a few requests per site. See
   [ACTIVE_RULES.md](ACTIVE_RULES.md#brainproxys-own-rules).
@@ -538,7 +541,7 @@ Crawl and active-scan scope and safety flags:
   request, it's sent once and they share the response.
 - The crawler submits at most 200 forms per page.
 - `crawl --max-minutes M`: stop crawling after M minutes (`scan active --max-minutes`
-  bounds its crawl too).
+  bounds its crawl too, with `--browser` both crawls together).
 - `crawl --browser` and `scan active --crawl --browser`: the JavaScript-aware crawl
   described under [Scans](#scans). `--browser-id ID` picks the browser from
   `brainproxy browser list`, `--headful` shows its window, `--avoid REGEX` (repeatable)

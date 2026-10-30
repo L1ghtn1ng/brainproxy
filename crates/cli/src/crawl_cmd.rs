@@ -23,8 +23,9 @@ use crate::output::Out;
     --path-prefix are not sent, confirm() dialogs answer no, logout-like URLs and DELETE \
     requests are not sent (--allow-destructive and --no-default-exclude lift that). --max-pages counts page loads, \
     clicks and form submissions, including those that return to a page state; robots.txt, sitemaps, --concurrency and --http2 apply to the plain crawl only. \
-    Linux and macOS; a temporary browser profile is used and removed. Without Chromium's sandbox (as root, or where \
-    user namespaces are off) set BRAINPROXY_BROWSER_NO_SANDBOX=1.")]
+    Linux and macOS; a temporary browser profile is used and removed. Chromium's sandbox stays on: to run without it \
+    (as root, or where user namespaces are off) set BRAINPROXY_BROWSER_NO_SANDBOX=1, and the summary then says \
+    \"sandbox\": false.")]
 pub struct CrawlArgs {
     /// Seed URLs. The crawl stays on their origins (scheme, host and port; an http
     /// seed also covers https on port 443 of the same host).
@@ -80,7 +81,7 @@ pub struct CrawlArgs {
     /// Send over HTTP/2 (ALPN h2 for https, prior knowledge for http).
     #[arg(long)]
     http2: bool,
-    /// Stop crawling after this many minutes.
+    /// Stop crawling after this many minutes (with --browser, 30 unless given).
     #[arg(long)]
     max_minutes: Option<f64>,
     /// Crawl in a headless Chromium-based browser that runs JavaScript (single-page apps).
@@ -180,6 +181,9 @@ pub fn crawl(project: &Path, home: &Path, args: CrawlArgs, out: &Out) -> Result<
                 summary["states"],
                 summary["api_call_count"]
             ));
+            if summary["sandbox"] == false {
+                lines.push("warning: Chromium ran without its sandbox (BRAINPROXY_BROWSER_NO_SANDBOX)".into());
+            }
         }
         for e in summary["endpoints"].as_array().into_iter().flatten() {
             let params: Vec<&str> = e["params"].as_array().into_iter().flatten().filter_map(|p| p.as_str()).collect();

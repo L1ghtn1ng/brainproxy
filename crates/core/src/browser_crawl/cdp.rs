@@ -26,6 +26,12 @@ use crate::error::{Error, Result};
 
 /// How long one protocol command may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest protocol message kept: a page decides how big its snapshot is.
+#[cfg_attr(not(unix), allow(dead_code))]
+const MAX_MESSAGE: usize = 32 * 1024 * 1024;
+/// Start of the temporary profile folders' names: this, the owner's pid, random hex.
+#[cfg_attr(not(unix), allow(dead_code))]
+const PROFILE_PREFIX: &str = "brainproxy-browser-";
 
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct LaunchOptions<'a> {
@@ -35,7 +41,7 @@ pub(crate) struct LaunchOptions<'a> {
     pub proxy: SocketAddr,
     /// base64(SHA-256(SPKI)) of the CA the proxy signs with.
     pub ca_spki: String,
-    /// Run without Chromium's sandbox (needed as root, or where user namespaces are off).
+    /// Run without Chromium's sandbox: only when asked for ([`sandbox_off`]).
     pub no_sandbox: bool,
 }
 
@@ -131,6 +137,8 @@ impl Chrome {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
 
+        // Left by a crawl that was killed; they hold the target's cookies.
+        sweep_stale_profiles(&std::env::temp_dir());
         let profile = temp_profile()?;
         // Commands go down `to_browser` (the browser's fd 3); replies come up `from_browser` (fd 4).
         let (to_browser_r, to_browser_w) = std::io::pipe()?;
@@ -178,20 +186,13 @@ impl Chrome {
         });
         let reader = conn.clone();
         std::thread::spawn(move || {
-            use std::io::BufRead;
             let mut input = std::io::BufReader::new(from_browser_r);
             let mut buf = Vec::new();
-            loop {
-                buf.clear();
-                match input.read_until(0, &mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if buf.last() == Some(&0) {
-                            buf.pop();
-                        }
-                        if let Ok(msg) = serde_json::from_slice::<Value>(&buf) {
-                            reader.dispatch(msg);
-                        }
+            // A message over the limit is dropped: the command waiting for it times out.
+            while let Ok(Some(complete)) = read_message(&mut input, &mut buf, MAX_MESSAGE) {
+                if complete {
+                    if let Ok(msg) = serde_json::from_slice::<Value>(&buf) {
+                        reader.dispatch(msg);
                     }
                 }
             }
@@ -281,12 +282,64 @@ impl Drop for Chrome {
     }
 }
 
+/// Reads one NUL-ended message into `buf`, keeping at most `max` bytes. `None` at the end of
+/// the stream; otherwise whether the message fitted (the rest of a long one is skipped).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn read_message(input: &mut impl std::io::BufRead, buf: &mut Vec<u8>, max: usize) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let mut fits = true;
+    let mut any = false;
+    loop {
+        let chunk = input.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(any.then_some(fits));
+        }
+        any = true;
+        let end = chunk.iter().position(|b| *b == 0);
+        let part = &chunk[..end.unwrap_or(chunk.len())];
+        fits = fits && buf.len() + part.len() <= max;
+        if fits {
+            buf.extend_from_slice(part);
+        } else {
+            buf.clear();
+        }
+        let used = end.map_or(chunk.len(), |e| e + 1);
+        input.consume(used);
+        if end.is_some() {
+            return Ok(Some(fits));
+        }
+    }
+}
+
+/// Removes profile folders in `dir` whose owning process is gone.
+#[cfg(unix)]
+fn sweep_stale_profiles(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let owner = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(PROFILE_PREFIX))
+            .and_then(|n| n.split('-').next())
+            .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0);
+        let Some(pid) = owner else { continue };
+        // SAFETY: signal 0 only checks that the process exists.
+        let gone =
+            unsafe { libc::kill(pid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// A new private directory for the browser profile.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn temp_profile() -> Result<PathBuf> {
     let mut rnd = [0u8; 8];
     getrandom::fill(&mut rnd).map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-    let dir = std::env::temp_dir().join(format!("brainproxy-browser-{}", hex::encode(rnd)));
+    let name = format!("{PROFILE_PREFIX}{}-{}", std::process::id(), hex::encode(rnd));
+    let dir = std::env::temp_dir().join(name);
     let mut b = std::fs::DirBuilder::new();
     // Not recursive: the temp dir exists, and the profile must be a new folder.
     b.recursive(false);
@@ -296,15 +349,11 @@ fn temp_profile() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Whether Chromium's sandbox must be off: it refuses to start as root with it, and
-/// `BRAINPROXY_BROWSER_NO_SANDBOX=1` turns it off where user namespaces are unavailable.
+/// Whether Chromium's sandbox is off: only when `BRAINPROXY_BROWSER_NO_SANDBOX=1` asks for it,
+/// since target pages then render unconfined. As root, Chromium refuses to start without this
+/// and the error explains it. The crawl summary reports `"sandbox": false`.
 pub(crate) fn sandbox_off() -> bool {
-    #[cfg(unix)]
-    // SAFETY: geteuid has no preconditions.
-    let root = unsafe { libc::geteuid() } == 0;
-    #[cfg(not(unix))]
-    let root = false;
-    root || std::env::var("BRAINPROXY_BROWSER_NO_SANDBOX").is_ok_and(|v| !v.is_empty() && v != "0")
+    std::env::var("BRAINPROXY_BROWSER_NO_SANDBOX").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// The browser's command line.
@@ -367,6 +416,43 @@ fn args(opts: &LaunchOptions, profile: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_message_splits_and_drops_long_messages() {
+        let mut input = std::io::BufReader::with_capacity(4, &b"ab\0abcdefghij\0xyz\0tail"[..]);
+        let mut buf = Vec::new();
+        assert_eq!(read_message(&mut input, &mut buf, 5).unwrap(), Some(true));
+        assert_eq!(buf, b"ab");
+        assert_eq!(read_message(&mut input, &mut buf, 5).unwrap(), Some(false));
+        assert!(buf.is_empty());
+        assert_eq!(read_message(&mut input, &mut buf, 5).unwrap(), Some(true));
+        assert_eq!(buf, b"xyz");
+        assert_eq!(read_message(&mut input, &mut buf, 5).unwrap(), Some(true));
+        assert_eq!(buf, b"tail");
+        assert_eq!(read_message(&mut input, &mut buf, 5).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_only_profiles_of_dead_processes() {
+        let root = std::env::temp_dir().join(format!("bp-test-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let (gone, live, other) = (
+            root.join(format!("{PROFILE_PREFIX}{dead}-aa")),
+            root.join(format!("{PROFILE_PREFIX}{}-bb", std::process::id())),
+            root.join("brainproxy-browser-notes"),
+        );
+        for d in [&gone, &live, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        sweep_stale_profiles(&root);
+        assert!(!gone.exists());
+        assert!(live.exists() && other.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn launch_flags_route_everything_through_the_proxy() {

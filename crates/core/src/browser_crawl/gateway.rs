@@ -268,8 +268,7 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
     let ours = parsed.as_ref().is_some_and(|u| s.opts.scope.on_site(u));
     // A page load (a link, form, redirect or script navigating the tab or a frame) must stay
     // inside the crawl scope; the page's own API and asset requests may go elsewhere in the engagement.
-    let navigation = header(&head.headers, "sec-fetch-mode") == Some("navigate");
-    let leaves_scope = navigation && !parsed.as_ref().is_some_and(|u| s.opts.scope.allows(u));
+    let leaves_scope = is_navigation(&head.headers) && !parsed.as_ref().is_some_and(|u| s.opts.scope.allows(u));
 
     if let Some(reason) = blocked_reason(&url, &method, &s.opts.exclude, s.opts.block_delete)
         .or(leaves_scope.then_some("the page would leave the crawl's sites or path prefix"))
@@ -338,9 +337,7 @@ async fn handle(s: &Shared, target: &Target, mut request: Vec<u8>) -> (Vec<u8>, 
         *st.by_status.entry(status.map(|c| c.to_string()).unwrap_or_else(|| "error".into())).or_default() += 1;
         if let Some(u) = parsed.as_ref().filter(|u| ours && !is_static(u)) {
             let ep = endpoint(&method, u, &head.headers, RawRequest::from_bytes(request.clone()).body());
-            let api = header(&head.headers, "sec-fetch-dest") == Some("empty")
-                || header(&head.headers, "x-requested-with").is_some();
-            if api {
+            if is_api_call(&head.headers) {
                 st.api_calls.insert(ep.clone());
             }
             st.endpoints.insert(ep);
@@ -385,6 +382,33 @@ fn add_header(req: RawRequest, name: &str, value: &str) -> RawRequest {
     req.set_header("Cookie", &merged)
 }
 
+/// A page load of the tab or a frame. Chromium sends `Sec-Fetch-*` only to https and loopback;
+/// on plain http a navigation is the request that asks for HTML first. A script can ask the
+/// same in fetch(), which is then held to the crawl's sites too; it can't do the reverse.
+fn is_navigation(headers: &[(String, String)]) -> bool {
+    match header(headers, "sec-fetch-mode") {
+        Some(mode) => mode == "navigate",
+        None => accept_starts_with(headers, &["text/html"]),
+    }
+}
+
+/// An XHR or fetch() call. Without `Sec-Fetch-Dest` (plain http), anything that isn't a
+/// navigation and doesn't ask for an asset type; the caller has already left out static paths.
+fn is_api_call(headers: &[(String, String)]) -> bool {
+    if header(headers, "x-requested-with").is_some() {
+        return true;
+    }
+    match header(headers, "sec-fetch-dest") {
+        Some(dest) => dest == "empty",
+        None => !is_navigation(headers) && !accept_starts_with(headers, &["image/", "text/css", "video/", "audio/"]),
+    }
+}
+
+fn accept_starts_with(headers: &[(String, String)], types: &[&str]) -> bool {
+    let accept = header(headers, "accept").unwrap_or("").to_ascii_lowercase();
+    types.iter().any(|t| accept.starts_with(t))
+}
+
 fn send_capture(s: &Shared, c: Capture) {
     let _ = s.save.lock().unwrap().send(c);
 }
@@ -413,6 +437,35 @@ fn endpoint(method: &str, u: &Url, headers: &[(String, String)], body: &[u8]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn navigations_and_api_calls_are_told_apart_with_and_without_sec_fetch() {
+        const PAGE: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,*/*;q=0.8";
+        // https and loopback.
+        let nav = headers(&[("Sec-Fetch-Mode", "navigate"), ("Sec-Fetch-Dest", "document"), ("Accept", PAGE)]);
+        assert!(is_navigation(&nav) && !is_api_call(&nav));
+        let fetch = headers(&[("Sec-Fetch-Mode", "cors"), ("Sec-Fetch-Dest", "empty"), ("Accept", "*/*")]);
+        assert!(!is_navigation(&fetch) && is_api_call(&fetch));
+        let script = headers(&[("Sec-Fetch-Mode", "no-cors"), ("Sec-Fetch-Dest", "script"), ("Accept", "*/*")]);
+        assert!(!is_navigation(&script) && !is_api_call(&script));
+        // Plain http: Chromium sends no Sec-Fetch headers.
+        let nav = headers(&[("Accept", PAGE), ("Upgrade-Insecure-Requests", "1")]);
+        assert!(is_navigation(&nav) && !is_api_call(&nav));
+        let fetch = headers(&[("Accept", "*/*")]);
+        assert!(!is_navigation(&fetch) && is_api_call(&fetch));
+        let json = headers(&[("Accept", "application/json")]);
+        assert!(!is_navigation(&json) && is_api_call(&json));
+        let image = headers(&[("Accept", "image/avif,image/webp,*/*;q=0.8")]);
+        assert!(!is_navigation(&image) && !is_api_call(&image));
+        let css = headers(&[("Accept", "text/css,*/*;q=0.1")]);
+        assert!(!is_navigation(&css) && !is_api_call(&css));
+        let xhr = headers(&[("Accept", "text/html"), ("X-Requested-With", "XMLHttpRequest")]);
+        assert!(is_api_call(&xhr));
+    }
 
     #[test]
     fn logout_urls_and_deletes_are_not_sent() {

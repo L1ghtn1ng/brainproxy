@@ -245,14 +245,19 @@ pub fn active(project: &Path, home: &Path, args: ActiveArgs, out: &Out) -> Resul
                     auth: auth.clone(),
                     max_duration: cfg.max_duration,
                 };
+                let crawl_started = std::time::Instant::now();
                 let c = rt.block_on(brainproxy_core::crawl::crawl(project, crawl_cfg.clone(), ctl.clone()))?;
                 crawled =
                     json!({"requests": c.requests, "endpoints": c.endpoints.len(), "depth_reached": c.depth_reached});
                 if let (Some(path), false) = (browser, ctl.stopped()) {
                     let avoid = crate::crawl_cmd::avoid_patterns(&[], false)?;
+                    // --max-minutes covers the two crawls together.
+                    let mut crawl_cfg = crawl_cfg;
+                    crawl_cfg.max_duration = crawl_cfg.max_duration.map(|d| d.saturating_sub(crawl_started.elapsed()));
                     let b = crate::crawl_cmd::browser_config(home, crawl_cfg, path, true, avoid, false)?;
                     let b = rt.block_on(brainproxy_core::browser_crawl::crawl(project, b, ctl.clone()))?;
                     crawled["browser"] = json!({
+                        "sandbox": b.sandbox,
                         "requests": b.requests,
                         "endpoints": b.endpoint_count,
                         "api_calls": b.api_call_count,

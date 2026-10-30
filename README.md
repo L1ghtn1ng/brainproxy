@@ -283,11 +283,12 @@ brainproxy findings list --source active
 # answers no; logout-like URLs, DELETE requests and page loads off the crawl's sites aren't sent.
 # --depth, --max-pages (page loads, clicks and form submits, replays included),
 # --max-per-path, --max-minutes, --rate, -H, --auth, --path-prefix, --exclude and the origin rules
-# apply. Each crawl uses a fresh temporary browser profile. Linux and macOS.
+# apply (30 minutes unless --max-minutes is set). Each crawl uses a fresh temporary browser profile,
+# removed on Ctrl-C too. Linux and macOS.
 brainproxy crawl https://app.example.com/ --browser --background
 brainproxy crawl https://app.example.com/ --browser --auth app --max-pages 300
 brainproxy crawl https://app.example.com/ --browser --browser-id chrome --headful   # watch it work
-BRAINPROXY_BROWSER_NO_SANDBOX=1 brainproxy crawl https://app.example.com/ --browser  # where Chromium's sandbox can't run
+BRAINPROXY_BROWSER_NO_SANDBOX=1 brainproxy crawl https://app.example.com/ --browser  # as root or where Chromium's sandbox can't run; the summary says "sandbox": false
 
 # API import: one request per operation with example/typed values, sent in scope and recorded as
 # history source 'import', which `scan active` attacks by default. DELETE and GraphQL mutations

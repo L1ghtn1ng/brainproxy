@@ -4,10 +4,19 @@
 // list links, clickable elements, forms and fields, fill fields and click elements.
 (() => {
   if (window.__bp) return;
-  const bp = { routes: [], opened: [], listeners: new WeakSet(), lastMutation: 0, fieldEls: [] };
+  // The page can reach __bp, so it is frozen and holds only functions; state stays in here,
+  // and what it returns is limited, so a page can't hand back a huge snapshot.
+  const bp = {};
+  const st = { routes: [], opened: [], listeners: new WeakSet(), lastMutation: 0, fieldEls: [] };
   Object.defineProperty(window, "__bp", { value: bp, enumerable: false });
   const now = () => performance.now();
-  bp.lastMutation = now();
+  st.lastMutation = now();
+  const MAX_NOTED = 200;
+  const MAX_URL = 4096;
+  const short = (s, n = 256) => String(s || "").slice(0, n);
+  const note = (list, url) => {
+    if (list.length < MAX_NOTED && url.length <= MAX_URL) list.push(url);
+  };
   const abs = (u) => {
     try {
       return new URL(String(u), location.href).href;
@@ -21,7 +30,7 @@
   const add = EventTarget.prototype.addEventListener;
   EventTarget.prototype.addEventListener = function (type, fn, opts) {
     try {
-      if (CLICK_EVENTS.has(type) && this instanceof Element) bp.listeners.add(this);
+      if (CLICK_EVENTS.has(type) && this instanceof Element) st.listeners.add(this);
     } catch (e) {}
     return add.call(this, type, fn, opts);
   };
@@ -32,15 +41,15 @@
     history[m] = function (state, title, url) {
       if (url != null) {
         const a = abs(url);
-        if (a) bp.routes.push(a);
+        if (a) note(st.routes, a);
       }
-      bp.lastMutation = now();
+      st.lastMutation = now();
       return orig.apply(this, arguments);
     };
   }
   addEventListener("hashchange", () => {
-    bp.routes.push(location.href);
-    bp.lastMutation = now();
+    note(st.routes, location.href);
+    st.lastMutation = now();
   });
 
   // Nobody answers dialogs; confirm() says no. Pop-ups are noted, not opened.
@@ -50,12 +59,12 @@
   window.print = () => {};
   window.open = function (u) {
     const a = u == null ? null : abs(u);
-    if (a) bp.opened.push(a);
+    if (a) note(st.opened, a);
     return null;
   };
 
   new MutationObserver(() => {
-    bp.lastMutation = now();
+    st.lastMutation = now();
   }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
 
   const clean = (s) => String(s || "").replace(/\s+/g, " ").trim().slice(0, 80);
@@ -81,20 +90,20 @@
     return h != null && h.trim() !== "" && !/^\s*(#\s*$|javascript:)/i.test(h);
   };
 
-  bp.quiet = () => [document.readyState, now() - bp.lastMutation];
+  bp.quiet = () => [document.readyState, now() - st.lastMutation];
 
   // Each link with its labels, so destructive ones ("Delete account") can be left alone.
   bp.links = () => {
     const out = new Map();
     const put = (el, v) => {
-      if (!v || /^\s*(javascript:|mailto:|tel:|data:|blob:)/i.test(v)) return;
+      if (!v || out.size >= 500 || /^\s*(javascript:|mailto:|tel:|data:|blob:)/i.test(v)) return;
       const href = abs(v.trim());
-      if (!href || out.has(href)) return;
+      if (!href || href.length > MAX_URL || out.has(href)) return;
       out.set(href, {
         tag: el.tagName.toLowerCase(),
         text: el.tagName === "IFRAME" || el.tagName === "FRAME" ? "" : label(el),
-        id: el.id || "",
-        name: el.getAttribute("name") || "",
+        id: short(el.id),
+        name: short(el.getAttribute("name")),
         class: clean(typeof el.className === "string" ? el.className : ""),
         title: clean(el.getAttribute("title")),
         href,
@@ -127,7 +136,7 @@
     for (const el of all) {
       if (++n > 5000) break;
       if (seen.has(el)) continue;
-      if (bp.listeners.has(el) || typeof el.onclick === "function") {
+      if (st.listeners.has(el) || typeof el.onclick === "function") {
         put(el);
         continue;
       }
@@ -165,13 +174,13 @@
       role: (el.getAttribute("role") || "").toLowerCase(),
       type,
       text: label(el),
-      id: el.id || "",
-      name: el.getAttribute("name") || "",
+      id: short(el.id),
+      name: short(el.getAttribute("name")),
       class: clean(typeof el.className === "string" ? el.className : ""),
       title: clean(el.getAttribute("title")),
-      href: el.getAttribute("href") || "",
+      href: short(el.getAttribute("href"), MAX_URL),
       submits,
-      action: submits ? form.action || location.href : "",
+      action: submits ? short(form.action || location.href, MAX_URL) : "",
     };
   };
 
@@ -191,9 +200,9 @@
   const find = (key) => (keyed().find(([, d]) => d.key === key) || [])[0];
 
   const forms = () =>
-    [...document.forms].map((f, i) => ({
+    [...document.forms].slice(0, 100).map((f, i) => ({
       key: "form#" + (i + 1),
-      action: f.action || location.href,
+      action: short(f.action || location.href, MAX_URL),
       method: (f.getAttribute("method") || "get").toLowerCase(),
       has_submit: [...f.elements].some((e) => {
         const t = (e.getAttribute("type") || (e.tagName === "BUTTON" ? "submit" : "")).toLowerCase();
@@ -206,10 +215,10 @@
     for (const el of document.querySelectorAll("form[target],a[target]")) el.removeAttribute("target");
     return {
       url: location.href,
-      title: document.title,
+      title: short(document.title),
       links: bp.links(),
-      routes: bp.routes.splice(0),
-      opened: bp.opened.splice(0),
+      routes: st.routes.splice(0),
+      opened: st.opened.splice(0),
       clickables: keyed().map(([, d]) => d),
       forms: forms(),
     };
@@ -242,24 +251,26 @@
   };
 
   bp.fields = () => {
-    bp.fieldEls = [...document.querySelectorAll("input,textarea,select")].filter(
-      (el) => !el.disabled && !el.readOnly && visible(el),
-    );
-    return bp.fieldEls.map((el, i) => ({
+    st.fieldEls = [];
+    for (const el of document.querySelectorAll("input,textarea,select")) {
+      if (st.fieldEls.length >= 200) break;
+      if (!el.disabled && !el.readOnly && visible(el)) st.fieldEls.push(el);
+    }
+    return st.fieldEls.map((el, i) => ({
       i,
       tag: el.tagName.toLowerCase(),
-      type: (el.type || "").toLowerCase(),
-      name: el.name || el.id || el.getAttribute("aria-label") || el.placeholder || "",
-      value: el.value || "",
+      type: short(el.type).toLowerCase(),
+      name: short(el.name || el.id || el.getAttribute("aria-label") || el.placeholder),
+      value: short(el.value),
       required: !!el.required,
       checked: !!el.checked,
-      options: el.tagName === "SELECT" ? [...el.options].map((o) => o.value) : [],
+      options: el.tagName === "SELECT" ? [...el.options].slice(0, 50).map((o) => short(o.value)) : [],
     }));
   };
   // Sets values the way typing does, so frameworks that track input events see them.
   bp.setFields = (pairs) => {
     for (const [i, v] of pairs) {
-      const el = bp.fieldEls[i];
+      const el = st.fieldEls[i];
       if (!el || !el.isConnected) continue;
       if (v === true) {
         if (!el.checked) el.click();
@@ -273,4 +284,6 @@
     }
     return true;
   };
+
+  Object.freeze(bp);
 })();
