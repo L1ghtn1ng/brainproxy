@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { joinMessages, splitMessages, wsOrigin, wsSendArgs } from "./ws.ts";
+import { joinMessages, splitMessages, wsOrigin, wsSendArgs, wsSendInput } from "./ws.ts";
 
 test("messages are split on lines holding only ---", () => {
   assert.deepEqual(splitMessages('{"a":1}\n---\nline one\nline two\r\n  ---  \n\n---\nlast'), ['{"a":1}', "line one\nline two", "last"]);
@@ -10,10 +10,11 @@ test("messages are split on lines holding only ---", () => {
   assert.deepEqual(splitMessages(joinMessages(["x", "y\nz"])), ["x", "y\nz"]);
 });
 
-test("ws send arguments keep each message whole", () => {
-  const args = wsSendArgs({ target: "wss://a.test", messages: ["--not-a-flag", "two words"], wait: 3, until: "ok" });
-  assert.deepEqual(args, ["ws", "send", "--target=wss://a.test", "--wait", "3", "--until=ok", "--message=--not-a-flag", "--message=two words", "--max-body=2000000", "-"]);
-  assert.ok(!wsSendArgs({ target: "ws://a", messages: [], wait: 1 }).some((a) => a.startsWith("--until")));
+test("messages go on stdin, never in the arguments", () => {
+  const args = wsSendArgs({ target: "wss://a.test", wait: 3, until: "ok" });
+  assert.deepEqual(args, ["ws", "send", "--target=wss://a.test", "--wait", "3", "--until=ok", "--input-json", "--max-body=2000000"]);
+  assert.ok(!wsSendArgs({ target: "ws://a", wait: 1 }).some((a) => a.startsWith("--until")));
+  assert.deepEqual(JSON.parse(wsSendInput("GET / HTTP/1.1\n\n", ["--not-a-flag", "token=secret"])), { handshake: "GET / HTTP/1.1\n\n", messages: ["--not-a-flag", "token=secret"] });
 });
 
 test("a ws URL's origin is the http origin of its handshake", () => {

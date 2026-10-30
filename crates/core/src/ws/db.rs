@@ -70,7 +70,11 @@ pub const CONNECTION_COLUMNS: &[(&str, &str, &str)] = &[
     ("close_code", "INTEGER", "Status code of the first close frame (1000 normal, 1006 never sent)"),
     ("close_reason", "TEXT", "Reason text of the first close frame"),
     ("messages", "INTEGER", "Messages recorded"),
-    ("error", "TEXT", "Why recording stopped early (bad frame, over the size limit, proxy stopped)"),
+    (
+        "error",
+        "TEXT",
+        "Why recording stopped or missed messages (bad frame, over the size limit, recorder behind, proxy stopped)",
+    ),
 ];
 
 pub const MESSAGE_COLUMNS: &[(&str, &str, &str)] = &[

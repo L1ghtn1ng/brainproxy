@@ -9,7 +9,7 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { arrow, joinMessages, splitMessages, wsOrigin, wsSendArgs, type WsConnection, type WsMessage, type WsSendResult } from "./ws";
+import { arrow, joinMessages, splitMessages, wsOrigin, wsSendArgs, wsSendInput, type WsConnection, type WsMessage, type WsSendResult } from "./ws";
 
 const PREVIEW = 300;
 
@@ -232,7 +232,7 @@ export function WsReplayTab({ tab }: { tab: RepeaterTab }) {
     setBusy(true);
     let r: WsSendResult | string;
     try {
-      r = await run<WsSendResult>(wsSendArgs({ target: to, messages: splitMessages(text), wait, until: until || undefined }), raw);
+      r = await run<WsSendResult>(wsSendArgs({ target: to, wait, until: until || undefined }), wsSendInput(raw, splitMessages(text)));
     } catch (e: any) {
       r = e.message as string;
     }

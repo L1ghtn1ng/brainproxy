@@ -12,7 +12,7 @@ use flate2::{Decompress, FlushDecompress, Status};
 use serde::Serialize;
 
 use crate::error::{Error, Result};
-use crate::http::{RawRequest, ResponseHead};
+use crate::http::ResponseHead;
 
 pub const OP_CONTINUATION: u8 = 0x0;
 pub const OP_TEXT: u8 = 0x1;
@@ -21,9 +21,11 @@ pub const OP_CLOSE: u8 = 0x8;
 pub const OP_PING: u8 = 0x9;
 pub const OP_PONG: u8 = 0xA;
 
-/// Largest frame, and largest (decompressed) message, recorded or held. A connection that
+/// Largest frame, and largest (decompressed) message, recorded or held. A message can exist
+/// in several copies on its way through (read buffer, reassembly, raw frames, inflated
+/// payload, recorder queue), so this also bounds peak memory per connection. A direction that
 /// goes over it is relayed byte for byte from then on, unrecorded.
-pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+pub const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
 /// The permessage-deflate tail every compressed message has removed (RFC 7692 7.2.1).
 const DEFLATE_TAIL: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
@@ -384,13 +386,6 @@ impl Assembler {
         }
         Ok(out)
     }
-}
-
-/// Whether a request asks for a WebSocket upgrade.
-pub fn is_upgrade_request(request: &[u8]) -> bool {
-    RawRequest::from_bytes(request.to_vec()).head().is_ok_and(|h| {
-        h.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("upgrade") && v.to_ascii_lowercase().contains("websocket"))
-    })
 }
 
 /// Whether a response accepts a WebSocket upgrade (101 with `Upgrade: websocket`).

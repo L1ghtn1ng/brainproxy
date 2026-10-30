@@ -74,8 +74,8 @@ export function joinMessages(messages: string[]): string {
   return messages.join(`\n${SEPARATOR}\n`);
 }
 
-/** `ws send` arguments for a handshake on stdin. */
-export function wsSendArgs(o: { target: string; messages: string[]; wait: number; until?: string }): string[] {
+/** `ws send` arguments; the handshake and messages go on stdin (see `wsSendInput`), out of the process list. */
+export function wsSendArgs(o: { target: string; wait: number; until?: string }): string[] {
   return [
     "ws",
     "send",
@@ -83,10 +83,14 @@ export function wsSendArgs(o: { target: string; messages: string[]; wait: number
     "--wait",
     String(o.wait),
     ...(o.until ? [`--until=${o.until}`] : []),
-    ...o.messages.flatMap((m) => [`--message=${m}`]),
+    "--input-json",
     "--max-body=2000000",
-    "-",
   ];
+}
+
+/** Stdin for `ws send --input-json`. */
+export function wsSendInput(handshake: string, messages: string[]): string {
+  return JSON.stringify({ handshake, messages });
 }
 
 export const arrow = (d: WsMessage["direction"]) => (d === "to-server" ? "→" : "←");

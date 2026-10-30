@@ -45,6 +45,26 @@ impl Env {
         (out.status.code().unwrap(), v)
     }
 
+    /// Runs a command with `stdin`, expecting success.
+    fn ok_with_stdin(&self, args: &[&str], stdin: &[u8]) -> Value {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+            .args(["--format", "json", "--project"])
+            .arg(&self.project)
+            .arg("--home")
+            .arg(&self.home)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?} -> {v}");
+        v["data"].clone()
+    }
+
     fn ok(&self, args: &[&str]) -> Value {
         let (code, v) = self.run(args);
         assert_eq!(code, 0, "{args:?} -> {v}");
@@ -106,6 +126,7 @@ async fn echo(mut s: TcpStream) {
     if head.target.contains("hints") {
         s.write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </app.js>; rel=preload\r\n\r\n").await.unwrap();
     }
+    let closes = head.target.contains("closes");
     let deflate = header("sec-websocket-extensions").is_some_and(|e| e.contains("permessage-deflate"));
     let ext = if deflate { "Sec-WebSocket-Extensions: permessage-deflate\r\n" } else { "" };
     let resp = format!(
@@ -114,6 +135,11 @@ async fn echo(mut s: TcpStream) {
         accept_key(&key)
     );
     s.write_all(resp.as_bytes()).await.unwrap();
+    if closes {
+        // Goes away by itself, whatever the client is doing.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        return;
+    }
     let negotiated = Deflate { enabled: deflate, ..Default::default() };
     let mut assembler = Assembler::new(negotiated, Direction::ToServer, MAX_MESSAGE);
     let mut compress = Compress::new(Compression::default(), false);
@@ -375,6 +401,70 @@ fn websocket_messages_can_be_intercepted() {
         &id,
     ]);
     assert_eq!(rows["rows"], serde_json::json!([["edited\n", "edited"], ["drop me", "dropped"]]));
+}
+
+#[test]
+fn a_held_message_is_resolved_when_its_connection_ends() {
+    let env = Env::new("abandoned");
+    let port = spawn_ws_echo();
+    let proxy = start_proxy(&env);
+    env.ok(&["intercept", "enable", "--ws-to-server", "--timeout", "120"]);
+    std::thread::sleep(Duration::from_millis(700));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let mut c = WsClient::connect(&proxy, &format!("http://127.0.0.1:{port}/closes"), false).await;
+        c.send(OP_TEXT, b"never decided").await;
+        assert_eq!(env.ok(&["intercept", "list", "--wait", "10"])["count"], 1);
+        // The server has gone: after the linger the held message gives up, without a decision.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if env.ok(&["intercept", "list", "--state", "dropped"])["count"] == 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{}", env.ok(&["intercept", "list", "--state", "all"]));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+    assert_eq!(env.ok(&["intercept", "list"])["count"], 0);
+    assert_eq!(env.closed_connection()["state"], "closed");
+}
+
+#[test]
+fn ws_send_reads_messages_from_stdin() {
+    let env = Env::new("stdin");
+    let port = spawn_ws_echo();
+    // Over the 128 KiB a single argument may have on Linux (and Windows' 32 KB command line).
+    let big = "x".repeat(200_000);
+    let handshake = format!("GET /json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+    let input = serde_json::json!({"handshake": handshake, "messages": [big, "token=secret"]});
+    let target = format!("--target=http://127.0.0.1:{port}");
+    let r = env.ok_with_stdin(
+        &["ws", "send", &target, "--input-json", "--until", "echo: token", "--max-body=300000"],
+        input.to_string().as_bytes(),
+    );
+    assert_eq!((r["upgraded"].as_bool(), r["stopped"].as_str()), (Some(true), Some("until")), "{r}");
+    let last = r["messages"].as_array().unwrap().iter().rfind(|m| m["opcode"] == "text").unwrap().clone();
+    assert_eq!(last["payload"]["content"], "echo: token=secret");
+    assert!(r["messages"].as_array().unwrap().iter().any(|m| m["payload"]["length"] == 200_006), "{r}");
+
+    // Messages alone, with the handshake from another source; a bad shape is refused.
+    let r = env.ok_with_stdin(
+        &["ws", "send", "--url", &format!("ws://127.0.0.1:{port}/x"), "--input-json", "--until", "echo"],
+        br#"{"messages": ["hi"]}"#,
+    );
+    assert_eq!(r["stopped"], "until");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_brainproxy"))
+        .args(["--format", "json", "--project"])
+        .arg(&env.project)
+        .args(["ws", "send", "--url", "ws://127.0.0.1:1/x", "--input-json"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(br#"{"mesages": []}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stdout));
 }
 
 #[test]

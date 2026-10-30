@@ -179,11 +179,14 @@ where
                 to.flush().await?;
                 let decided = hooks.hold(dir, &m);
                 tokio::pin!(decided);
-                // Pings and pongs keep flowing while the message waits, so heartbeats don't time
-                // out. Anything else (data, close) waits behind the held message.
+                // Pings and pongs right behind the message keep flowing while it waits, so
+                // heartbeats don't time out. Anything else (data, close) waits behind it, and so
+                // does whatever follows that. Once a full message's worth is waiting, reading
+                // stops and TCP makes the sender wait too, until the decision or its timeout.
                 loop {
-                    while let Ok(Some((f, n))) = parse_frame(&buf[used..], MAX_MESSAGE) {
-                        if !matches!(f.opcode, OP_PING | OP_PONG) || f.rsv != 0 {
+                    while buf.get(used).is_some_and(|b| matches!(b & 0x0f, OP_PING | OP_PONG)) {
+                        let Ok(Some((f, n))) = parse_frame(&buf[used..], MAX_MESSAGE) else { break };
+                        if f.rsv != 0 {
                             break;
                         }
                         hooks.record(dir, &Message::new(f.opcode, f.payload), None);
@@ -196,7 +199,7 @@ where
                     }
                     tokio::select! {
                         d = &mut decided => break d,
-                        read = from.read(&mut chunk) => match read? {
+                        read = from.read(&mut chunk), if buf.len() - used < MAX_MESSAGE + MAX_FRAMING => match read? {
                             0 => eof = true,
                             n => buf.extend_from_slice(&chunk[..n]),
                         },
@@ -263,6 +266,8 @@ mod tests {
         hold_to_server: bool,
         decision: Mutex<Vec<Hold>>,
         hold_for: Duration,
+        /// When set, a held message waits for a permit here.
+        gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     }
 
     impl Hooks for Recorder {
@@ -275,8 +280,12 @@ mod tests {
         fn hold(&self, _: Direction, _: &Message) -> impl Future<Output = Hold> + Send {
             let d = self.decision.lock().unwrap().remove(0);
             let wait = self.hold_for;
+            let gate = self.gate.clone();
             async move {
                 tokio::time::sleep(wait).await;
+                if let Some(g) = gate {
+                    let _ = g.acquire().await;
+                }
                 d
             }
         }
@@ -508,5 +517,102 @@ mod tests {
             },
         );
         assert!(ended.error.unwrap().contains("too many frames"));
+    }
+
+    #[tokio::test]
+    async fn the_sender_waits_once_a_held_message_has_a_full_message_behind_it() {
+        let (client, proxy_client) = duplex(1 << 16);
+        let (proxy_server, server) = duplex(1 << 16);
+        const FRAME: usize = 1 << 20;
+        let frames = (MAX_MESSAGE + MAX_FRAMING) / FRAME * 2;
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let rec = Recorder {
+            hold_to_server: true,
+            decision: Mutex::new(vec![Hold::Forward; frames]),
+            gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = written.clone();
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+        let frame = encode_frame(true, 0, OP_BINARY, &vec![7u8; FRAME], None);
+        let frame_len = frame.len();
+        let (_, received, ..) = tokio::join!(
+            relay(proxy_client, Vec::new(), proxy_server, Vec::new(), Deflate::default(), &rec),
+            async move {
+                let mut got = 0usize;
+                let mut chunk = vec![0u8; 1 << 16];
+                loop {
+                    match server_r.read(&mut chunk).await.unwrap() {
+                        0 => return got,
+                        n => got += n,
+                    }
+                }
+            },
+            async move {
+                for _ in 0..frames {
+                    client_w.write_all(&frame).await.unwrap();
+                    counter.fetch_add(frame.len(), std::sync::atomic::Ordering::SeqCst);
+                }
+                client_w.shutdown().await.unwrap();
+            },
+            async {
+                // Wait for the sender to stop getting anywhere, then look at how far it got.
+                let mut last = 0;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let now = written.load(std::sync::atomic::Ordering::SeqCst);
+                    if now == last && now > 0 {
+                        break;
+                    }
+                    last = now;
+                }
+                let limit = MAX_MESSAGE + MAX_FRAMING + 3 * frame_len;
+                assert!(last <= limit, "{last} bytes read while a message was held (limit {limit})");
+                gate.add_permits(frames);
+            },
+            async move {
+                server_w.shutdown().await.unwrap();
+                let mut sink = Vec::new();
+                client_r.read_to_end(&mut sink).await.unwrap();
+            },
+        );
+        // Nothing was lost: once released, every frame arrives.
+        assert_eq!(received, frames * frame_len);
+    }
+
+    #[tokio::test]
+    async fn a_message_over_the_limit_is_relayed_unchanged_and_unrecorded() {
+        let (client, proxy_client) = duplex(1 << 16);
+        let (proxy_server, server) = duplex(1 << 16);
+        let rec = Recorder::default();
+        let mut sent = encode_frame(true, 0, OP_TEXT, b"small", None);
+        sent.extend(encode_frame(true, 0, OP_BINARY, &vec![1u8; MAX_MESSAGE + 1], None));
+        sent.extend(encode_frame(true, 0, OP_TEXT, b"after", None));
+        let want = sent.len();
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut server_r, mut server_w) = tokio::io::split(server);
+        let (ended, got, ..) = tokio::join!(
+            relay(proxy_client, Vec::new(), proxy_server, Vec::new(), Deflate::default(), &rec),
+            async move {
+                let mut got = Vec::new();
+                server_r.read_to_end(&mut got).await.unwrap();
+                got
+            },
+            async move {
+                client_w.write_all(&sent).await.unwrap();
+                client_w.shutdown().await.unwrap();
+            },
+            async move {
+                server_w.shutdown().await.unwrap();
+                let mut sink = Vec::new();
+                client_r.read_to_end(&mut sink).await.unwrap();
+            },
+        );
+        assert_eq!(got.len(), want);
+        assert!(got.ends_with(&encode_frame(true, 0, OP_TEXT, b"after", None)));
+        assert!(ended.error.unwrap().contains("limit"));
+        assert_eq!(rec.seen.lock().unwrap().len(), 1);
     }
 }

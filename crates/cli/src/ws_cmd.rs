@@ -66,9 +66,9 @@ pub enum WsCmd {
     /// Replay: open a new connection with a recorded (or new) handshake, send messages, and
     /// print what comes back.
     #[command(after_help = "Handshake sources, in order: --from CONN (a recorded connection), --history ID (an \
-        upgrade request in history), --url ws(s)://..., FILE, or stdin. A new Sec-WebSocket-Key is always used; \
+        upgrade request in history), --url ws(s)://..., --input-json, FILE, or stdin. A new Sec-WebSocket-Key is always used; \
         -H and --remove-header change the handshake. Messages go out in order: --resend ones first, then \
-        --message ones. Replies are collected until --until matches, --max-messages arrive, the server closes, \
+        --message ones, then --input-json ones. Replies are collected until --until matches, --max-messages arrive, the server closes, \
         or --wait seconds pass after the last message; the connection is then closed. Everything is recorded \
         (history source ws, connection source replay) unless --no-store.")]
     Send(Box<SendArgs>),
@@ -120,9 +120,14 @@ pub struct SendArgs {
     /// Remove a header from the handshake. Repeatable.
     #[arg(long)]
     remove_header: Vec<String>,
-    /// Message to send (a text frame). Repeatable; sent in order.
+    /// Message to send (a text frame). Repeatable; sent in order. On the command line it is visible in
+    /// the process list and limited in size; --input-json has neither problem.
     #[arg(short = 'm', long = "message")]
     messages: Vec<String>,
+    /// Read JSON from stdin: {"messages": ["text", ...], "handshake": "GET / HTTP/1.1..."}. Both are
+    /// optional; messages go out after --resend and --message ones.
+    #[arg(long, conflicts_with = "file")]
+    input_json: bool,
     /// Send each --message as a binary frame; the values are base64.
     #[arg(long)]
     binary: bool,
@@ -273,8 +278,17 @@ fn http_url(url: &str) -> String {
     }
 }
 
+/// What `--input-json` reads from stdin.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Input {
+    handshake: Option<String>,
+    #[serde(default)]
+    messages: Vec<String>,
+}
+
 /// The handshake to send and where to, from the first source given.
-fn handshake_source(store: &Store, args: &SendArgs) -> Result<(RawRequest, Target), Error> {
+fn handshake_source(store: &Store, args: &SendArgs, input: &Input) -> Result<(RawRequest, Target), Error> {
     let headers = args.headers.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()?;
     let history =
         match (args.from, args.history) {
@@ -291,6 +305,7 @@ fn handshake_source(store: &Store, args: &SendArgs) -> Result<(RawRequest, Targe
         (req, Some(target))
     } else {
         let bytes = match args.file.as_deref() {
+            _ if args.input_json => input.handshake.clone().unwrap_or_default().into_bytes(),
             Some(path) if path != "-" => std::fs::read(path)
                 .map_err(|e| Error::InvalidInput(format!("cannot read handshake file {path:?}: {e}")))?,
             _ => crate::read_input(None)?,
@@ -315,7 +330,7 @@ fn handshake_source(store: &Store, args: &SendArgs) -> Result<(RawRequest, Targe
 }
 
 /// The messages to send, --resend ones first.
-fn outgoing(store: &Store, args: &SendArgs) -> Result<Vec<(u8, Vec<u8>)>, Error> {
+fn outgoing(store: &Store, args: &SendArgs, input: &Input) -> Result<Vec<(u8, Vec<u8>)>, Error> {
     let mut list = Vec::new();
     for id in &args.resend {
         let m = store.ws_message(*id)?;
@@ -328,13 +343,20 @@ fn outgoing(store: &Store, args: &SendArgs) -> Result<Vec<(u8, Vec<u8>)>, Error>
             (ws::OP_TEXT, m.as_bytes().to_vec())
         });
     }
+    list.extend(input.messages.iter().map(|m| (ws::OP_TEXT, m.as_bytes().to_vec())));
     Ok(list)
 }
 
 fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
-    let (handshake, target) = handshake_source(&store, &args)?;
-    let messages = outgoing(&store, &args)?;
+    let input = if args.input_json {
+        serde_json::from_slice(&crate::read_input(None)?)
+            .map_err(|e| Error::InvalidInput(format!("--input-json: {e}")))?
+    } else {
+        Input::default()
+    };
+    let (handshake, target) = handshake_source(&store, &args, &input)?;
+    let messages = outgoing(&store, &args, &input)?;
     let until = args
         .until
         .as_deref()

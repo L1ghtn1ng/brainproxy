@@ -159,7 +159,11 @@ pub const INTERCEPT_COLUMNS: &[(&str, &str, &str)] = &[
     ("id", "INTEGER", "Intercept id"),
     ("time", "TEXT", "UTC time the message was held"),
     ("direction", "TEXT", "request, response, ws-to-server, or ws-to-client (WebSocket messages)"),
-    ("state", "TEXT", "pending, forwarded, dropped, or expired (timed out)"),
+    (
+        "state",
+        "TEXT",
+        "pending, forwarded, dropped (also when its WebSocket connection ended while held), or expired (timed out)",
+    ),
     ("method", "TEXT", "Request method (WS for WebSocket messages)"),
     ("url", "TEXT", "Request URL (ws:// or wss:// for WebSocket messages)"),
     ("status", "INTEGER", "Response status (response direction only)"),
