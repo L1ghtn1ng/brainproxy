@@ -90,13 +90,12 @@ pub fn newer(latest: &str, current: &str) -> bool {
 /// running copy is chosen. macOS has no separate command-line download (the app
 /// includes it).
 pub fn find_asset(release: &Release, kind: Kind) -> Option<&Asset> {
-    pick(release, &names(this_platform(kind)?, &release.version))
+    find(release, &name(this_platform(kind)?, &release.version))
 }
 
 /// The file name this platform's download has in a release of `version`.
 pub fn asset_name(kind: Kind, version: &str) -> Option<String> {
-    let [name, _] = names(this_platform(kind)?, version);
-    Some(name)
+    Some(name(this_platform(kind)?, version))
 }
 
 fn this_platform(kind: Kind) -> Option<(&'static str, String)> {
@@ -131,16 +130,14 @@ fn platform_asset(os: &str, arch: &str, kind: Kind, msi: bool, appimage: bool) -
     })
 }
 
-/// The names a download goes by: with the version since 0.3.9
-/// (`brainproxy-gui-0.3.9-linux-x86_64.deb`), and without it in older releases
-/// (`brainproxy-gui-linux-x86_64.deb`).
-fn names((product, rest): (&str, String), version: &str) -> [String; 2] {
-    [format!("{product}-{version}-{rest}"), format!("{product}-{rest}")]
+/// The name a download has in a release of `version`
+/// (`brainproxy-gui-0.3.9-linux-x86_64.deb`).
+fn name((product, rest): (&str, String), version: &str) -> String {
+    format!("{product}-{version}-{rest}")
 }
 
-/// The first of `names` that `release` has.
-fn pick<'a>(release: &'a Release, names: &[String]) -> Option<&'a Asset> {
-    names.iter().find_map(|n| release.assets.iter().find(|a| &a.name == n))
+fn find<'a>(release: &'a Release, name: &str) -> Option<&'a Asset> {
+    release.assets.iter().find(|a| a.name == name)
 }
 
 /// Whether a download is a program to run as is: the command line (no extension
@@ -225,11 +222,8 @@ mod tests {
 
     #[test]
     fn asset_names_per_platform() {
-        let name = |os, arch, kind, msi, appimage| {
-            let [new, old] = names(platform_asset(os, arch, kind, msi, appimage).unwrap(), "0.3.9");
-            assert_eq!(new.replacen("-0.3.9", "", 1), old);
-            new
-        };
+        let name =
+            |os, arch, kind, msi, appimage| name(platform_asset(os, arch, kind, msi, appimage).unwrap(), "0.3.9");
         use Kind::*;
         assert_eq!(name("linux", "x86_64", Cli, false, false), "brainproxy-0.3.9-linux-x86_64");
         assert_eq!(name("linux", "aarch64", Cli, false, false), "brainproxy-0.3.9-linux-arm64");
@@ -259,9 +253,9 @@ mod tests {
     }
 
     #[test]
-    fn picks_versioned_then_old_names() {
-        let deb = |v| names(platform_asset("linux", "x86_64", Kind::Gui, false, false).unwrap(), v);
-        let cli = |v| names(platform_asset("linux", "x86_64", Kind::Cli, false, false).unwrap(), v);
+    fn picks_the_versioned_name() {
+        let deb = |v| name(platform_asset("linux", "x86_64", Kind::Gui, false, false).unwrap(), v);
+        let cli = |v| name(platform_asset("linux", "x86_64", Kind::Cli, false, false).unwrap(), v);
         let new = release(
             "0.3.9",
             &[
@@ -272,18 +266,14 @@ mod tests {
                 "SHA256SUMS",
             ],
         );
-        assert_eq!(pick(&new, &deb("0.3.9")).unwrap().name, "brainproxy-gui-0.3.9-linux-x86_64.deb");
-        assert_eq!(pick(&new, &cli("0.3.9")).unwrap().name, "brainproxy-0.3.9-linux-x86_64");
-        // Releases up to 0.3.8 have no version in their names.
+        assert_eq!(find(&new, &deb("0.3.9")).unwrap().name, "brainproxy-gui-0.3.9-linux-x86_64.deb");
+        assert_eq!(find(&new, &cli("0.3.9")).unwrap().name, "brainproxy-0.3.9-linux-x86_64");
+        // An unversioned name (releases up to 0.3.8) is not looked for.
         let old = release("0.3.8", &["brainproxy-linux-x86_64", "brainproxy-gui-linux-x86_64.deb"]);
-        assert_eq!(pick(&old, &deb("0.3.8")).unwrap().name, "brainproxy-gui-linux-x86_64.deb");
-        assert_eq!(pick(&old, &cli("0.3.8")).unwrap().name, "brainproxy-linux-x86_64");
-        // The versioned name wins when both are there.
-        let both = release("0.4.0", &["brainproxy-linux-x86_64", "brainproxy-0.4.0-linux-x86_64"]);
-        assert_eq!(pick(&both, &cli("0.4.0")).unwrap().name, "brainproxy-0.4.0-linux-x86_64");
+        assert!(find(&old, &cli("0.3.8")).is_none());
         // A file for another version, or another platform, is not this release's download.
         let other = release("0.4.0", &["brainproxy-0.3.9-linux-x86_64", "brainproxy-0.4.0-linux-arm64"]);
-        assert!(pick(&other, &cli("0.4.0")).is_none());
+        assert!(find(&other, &cli("0.4.0")).is_none());
     }
 
     #[test]
