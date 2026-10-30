@@ -484,6 +484,62 @@ Session handling (`auth macro`, `auth rule`; see Settings › Auth profiles abov
   time: use it when tokens are single-use, and lower `-c` if the site keeps only the
   latest token per session.
 
+### Access control across users (`authz`)
+
+Broken access control (IDOR, missing authorization checks) only shows up when one user's
+request is tried with another user's session. `authz run` does that for the requests in
+history. Make an auth profile per user, browse or send as one of them, then:
+
+```sh
+brainproxy auth add alice --login-url https://app.acme.test/login ... --username alice --password-env ALICE_PW
+brainproxy auth add bob   --login-url https://app.acme.test/login ... --username bob   --password-env BOB_PW
+brainproxy crawl https://app.acme.test/ --auth alice          # or browse as alice through the proxy
+brainproxy authz run --as bob --where "host = 'app.acme.test'"
+brainproxy authz matrix 7                  # one row per request, a cell per identity
+brainproxy authz results 7 --verdict bypass
+brainproxy diff 120 131 --part response-body   # the baseline and bob's response, from the row
+```
+
+For each request it:
+
+1. works out who made it (the owner) from its auth placeholders, or a cookie, token or
+   header value of a profile's session; `--owner NAME` sets it. A request whose owner
+   isn't known is re-sent with the credentials it was recorded with;
+2. sends it as the owner twice; whatever differs between the two (timestamps, nonces,
+   CSRF tokens) is left out of every comparison. If the owner doesn't get a 2xx, there is
+   nothing to compare and the request is `skipped`;
+3. sends it with no credentials at all (the anonymous control; `--no-anonymous` skips it),
+   then as each `--as` profile, with the owner's cookies, `Authorization` and profile
+   headers removed first (`--keep-cookie NAME` keeps a cookie that isn't a credential).
+
+Each response gets a verdict:
+
+| Verdict | Meaning |
+| --- | --- |
+| `enforced` | refused: an error status, a logged-out page, or a body saying access is denied |
+| `bypass` | the owner's data came back: most of the owner's private values (JSON values the anonymous response and the request don't contain), the owner's username, or a nearly identical response when there is nothing private to look for |
+| `public` | the anonymous control got the same response, so the page isn't protected |
+| `different` | a successful but different response, such as the identity's own data |
+| `inconclusive` | a successful response with nothing to compare: an empty body, `{}`, or a HEAD or OPTIONS request. It says nothing about access, so check it by hand |
+
+A bypass is `high` confidence when the request names an object (a number, UUID, long hex
+id or email address) and the owner's values or username came back, `medium` when it names
+an object but only the similarity shows it, or when the path looks privileged (admin,
+users, roles, ...), and `low` otherwise: `/dashboard` may simply be the same for everyone.
+Medium and high bypasses are findings (source `authz`): *Access Control Bypass* (100003)
+for another profile, *Protected Content Without Authentication* (100004) for the anonymous
+control. Low ones are only in the results, to review.
+
+Safety: from history only GET, HEAD and OPTIONS requests that carry credentials are
+replayed; `--include-methods POST,PUT` (or `all`) adds others, which then change data as
+another user. Paths matching `--exclude` (default: logout and sign-off) are never replayed,
+so the owner stays logged in. `--history-id` picks a request whatever its method. URLs on
+the command line are fetched with GET and need `--owner`. Every request stays inside the
+engagement scope and is recorded in history with source `authz`.
+
+`authz run --background` returns a run id; `job wait|status|stop` work on it, and
+`authz list` shows recent runs. The rows are also in the `authz_results` table for `query`.
+
 More detail: [README](../README.md), [MCP](MCP.md), [checks](CHECKS.md),
 [rule updates](RULE_UPDATES.md), [out-of-band](OOB.md), [desktop app](GUI.md).
 

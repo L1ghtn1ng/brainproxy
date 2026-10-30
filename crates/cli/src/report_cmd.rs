@@ -36,7 +36,7 @@ pub struct ReportArgs {
     #[arg(long, value_enum)]
     confidence: Option<ConfidenceArg>,
     /// Only findings from this scanner.
-    #[arg(long, value_parser = ["passive", "active"])]
+    #[arg(long, value_parser = ["passive", "active", "authz"])]
     source: Option<String>,
     /// Triage state to include (default: open and confirmed, i.e. hides false positives).
     #[arg(long, value_parser = ["open", "confirmed", "false_positive", "false-positive", "all"])]

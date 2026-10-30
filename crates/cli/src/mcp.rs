@@ -77,6 +77,10 @@ const HINTS: &[(&str, Hints)] = &[
     ("auth list", READ),
     ("auth show", READ),
     ("auth remove", REPLACE),
+    ("authz run", NET),
+    ("authz results", READ),
+    ("authz matrix", READ),
+    ("authz list", READ),
     // Starts a browser on the machine running the server.
     ("auth record start", ADD),
     ("auth record finish", REPLACE),

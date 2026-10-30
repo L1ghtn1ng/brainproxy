@@ -312,6 +312,13 @@ brainproxy auth rule list app
 # wire (each macro run its own, so concurrent requests each send their own token). Macro requests are
 # scope-checked like everything else.
 
+# Access control across users (IDOR, missing authorization): re-send what alice did as bob and with
+# no session, compare with alice's responses. Only GET/HEAD/OPTIONS from history unless --include-methods.
+brainproxy auth add bob --login-url https://app.example.com/login ... --username bob --password-env BOB_PW
+brainproxy authz run --as bob --where "host = 'app.example.com'"   # owner worked out per request
+brainproxy authz matrix 7                         # request x identity: enforced, bypass, public, different, ...
+brainproxy authz results 7 --verdict bypass       # with baseline/replay history ids for `diff`
+
 # Reports: findings grouped by alert type with description, solution, references, and the
 # request/response from history as evidence. False positives are left out by default.
 brainproxy report html -o report.html             # self-contained, no external assets
