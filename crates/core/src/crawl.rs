@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde::Serialize;
@@ -50,6 +50,8 @@ pub struct CrawlConfig {
     pub sitemap: bool,
     /// Logged-in session applied to every request (re-login on logout).
     pub auth: Option<Arc<AuthSession>>,
+    /// Stop crawling after this long.
+    pub max_duration: Option<Duration>,
 }
 
 pub const DEFAULT_EXCLUDE: &str = r"(?i)(log|sign)[-_]?out|/logoff";
@@ -91,7 +93,7 @@ pub struct CrawlSummary {
     pub elapsed_ms: u64,
 }
 
-struct Scope {
+pub(crate) struct Scope {
     hosts: Vec<String>,
     /// Seed origins: (scheme, host, port).
     origins: Vec<(String, String, u16)>,
@@ -102,7 +104,24 @@ struct Scope {
 }
 
 impl Scope {
-    fn host_allowed(&self, u: &Url) -> bool {
+    /// The crawl scope of `seeds` under `cfg`'s host, port and path rules.
+    pub(crate) fn new(seeds: &[Url], cfg: &CrawlConfig) -> Scope {
+        Scope {
+            hosts: seeds.iter().filter_map(|u| u.host_str().map(|h| h.to_ascii_lowercase())).collect(),
+            origins: seeds
+                .iter()
+                .filter_map(|u| {
+                    Some((u.scheme().to_string(), u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()?))
+                })
+                .collect(),
+            any_port: cfg.any_port,
+            subdomains: cfg.subdomains,
+            path_prefix: cfg.path_prefix.clone(),
+            exclude: cfg.exclude.clone(),
+        }
+    }
+
+    pub(crate) fn host_allowed(&self, u: &Url) -> bool {
         let Some(host) = u.host_str().map(|h| h.to_ascii_lowercase()) else { return false };
         self.hosts.iter().any(|h| self.same_host(&host, h))
     }
@@ -122,40 +141,37 @@ impl Scope {
         })
     }
 
-    fn allows(&self, u: &Url) -> bool {
-        self.host_allowed(u)
-            && (self.any_port || self.origin_allowed(u))
-            && matches!(u.scheme(), "http" | "https")
+    /// On the crawl's sites: a seed host (or subdomain with `subdomains`) and, unless
+    /// `any_port`, a seed origin. Path prefix and exclusions aside.
+    pub(crate) fn on_site(&self, u: &Url) -> bool {
+        self.host_allowed(u) && (self.any_port || self.origin_allowed(u)) && matches!(u.scheme(), "http" | "https")
+    }
+
+    pub(crate) fn allows(&self, u: &Url) -> bool {
+        self.on_site(u)
             && self.path_prefix.as_deref().is_none_or(|p| u.path().starts_with(p))
             && !self.exclude.iter().any(|r| r.is_match(u.as_str()))
     }
 }
 
-pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<CrawlSummary> {
-    let started = Instant::now();
-    let mut seeds = Vec::new();
-    for s in &cfg.seeds {
+/// The seed URLs (https:// assumed without a scheme); at least one.
+pub(crate) fn parse_seeds(seeds: &[String]) -> Result<Vec<Url>> {
+    let mut out = Vec::new();
+    for s in seeds {
         let s = if s.contains("://") { s.clone() } else { format!("https://{s}") };
-        seeds.push(Url::parse(&s).map_err(|e| Error::InvalidInput(format!("bad seed URL {s:?}: {e}")))?);
+        out.push(Url::parse(&s).map_err(|e| Error::InvalidInput(format!("bad seed URL {s:?}: {e}")))?);
     }
-    if seeds.is_empty() {
+    if out.is_empty() {
         return Err(Error::InvalidInput("give at least one seed URL".into()));
     }
-    let scope = Scope {
-        hosts: seeds.iter().filter_map(|u| u.host_str().map(|h| h.to_ascii_lowercase())).collect(),
-        origins: seeds
-            .iter()
-            .filter_map(|u| {
-                Some((u.scheme().to_string(), u.host_str()?.to_ascii_lowercase(), u.port_or_known_default()?))
-            })
-            .collect(),
-        any_port: cfg.any_port,
-        subdomains: cfg.subdomains,
-        path_prefix: cfg.path_prefix.clone(),
-        exclude: cfg.exclude.clone(),
-    };
+    Ok(out)
+}
 
-    // Saving and the passive scan run on their own thread, beside the fetches.
+pub(crate) type Writer = std::thread::JoinHandle<Result<(usize, usize)>>;
+
+/// Saving and the passive scan on their own thread, beside the fetches. The thread
+/// ends once every sender is dropped; [`join_writer`] gives (new findings, record errors).
+pub(crate) fn spawn_writer(project: &Path) -> Result<(std::sync::mpsc::Sender<Capture>, Writer)> {
     let (save, saved) = std::sync::mpsc::channel::<Capture>();
     let mut store = Store::open(project)?;
     let writer = std::thread::spawn(move || -> Result<(usize, usize)> {
@@ -178,6 +194,21 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
         }
         Ok((new_findings, record_errors))
     });
+    Ok((save, writer))
+}
+
+pub(crate) async fn join_writer(writer: Writer) -> Result<(usize, usize)> {
+    tokio::task::spawn_blocking(move || writer.join())
+        .await
+        .map_err(|e| Error::Protocol(e.to_string()))?
+        .map_err(|_| Error::Protocol("crawl writer panicked".into()))?
+}
+
+pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<CrawlSummary> {
+    let started = Instant::now();
+    let seeds = parse_seeds(&cfg.seeds)?;
+    let scope = Scope::new(&seeds, &cfg);
+    let (save, writer) = spawn_writer(project)?;
 
     let client = Arc::new(Client::new(cfg.send.clone()));
     // One limiter for the whole crawl: --rate holds across tasks and depths.
@@ -222,7 +253,7 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
         // Start fetches up to the limit, within the page budget and per-path cap.
         while running.len() < cfg.concurrency.max(1) && !ctl.stopped() {
             let Some((req, depth)) = queue.pop_front() else { break };
-            if sent >= cfg.max_pages {
+            if sent >= cfg.max_pages || cfg.max_duration.is_some_and(|d| started.elapsed() >= d) {
                 summary.limit_reached = true;
                 queue.clear();
                 break;
@@ -309,10 +340,7 @@ pub async fn crawl(project: &Path, cfg: CrawlConfig, ctl: JobControl) -> Result<
         }
     }
     drop(save);
-    let (new_findings, record_errors) = tokio::task::spawn_blocking(move || writer.join())
-        .await
-        .map_err(|e| Error::Protocol(e.to_string()))?
-        .map_err(|_| Error::Protocol("crawl writer panicked".into()))??;
+    let (new_findings, record_errors) = join_writer(writer).await?;
     summary.new_findings = new_findings;
     summary.record_errors = record_errors;
 
@@ -512,13 +540,13 @@ fn endpoint(req: &Req, page: &Url) -> Endpoint {
     Endpoint { method: req.method.clone(), path: page.path().to_string(), params }
 }
 
-fn strip_fragment(u: &Url) -> String {
+pub(crate) fn strip_fragment(u: &Url) -> String {
     let mut u = u.clone();
     u.set_fragment(None);
     u.to_string()
 }
 
-fn is_static(u: &Url) -> bool {
+pub(crate) fn is_static(u: &Url) -> bool {
     let path = u.path().to_ascii_lowercase();
     path.rsplit_once('.').is_some_and(|(_, ext)| STATIC_EXT.contains(&ext))
 }
@@ -737,7 +765,7 @@ fn form_requests(html: &str, all: &[Tag], base: &Url) -> Vec<Found> {
 }
 
 /// A plausible value for a form field (like ZAP's default value generator).
-fn field_value(name: &str, ty: &str, existing: Option<&str>) -> String {
+pub(crate) fn field_value(name: &str, ty: &str, existing: Option<&str>) -> String {
     if let Some(v) = existing.filter(|v| !v.is_empty()) {
         return v.to_string();
     }

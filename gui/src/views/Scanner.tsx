@@ -5,6 +5,7 @@ import { useApp } from "../store";
 import { DataTable, type Column } from "../ui/DataTable";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { browserFlag, browserProgress, hasChromium, type BrowserList } from "./browserCrawl";
 
 export interface Job {
   id: number;
@@ -33,9 +34,10 @@ export function progress(j: Job): { text: string; frac: number | null } {
   if (!p) return { text: "", frac: null };
   // A crawl-and-audit scan reports crawl progress until the attack phase starts.
   if (j.kind === "active-scan" && p.units == null && p.depth != null)
-    return { text: `crawling · depth ${p.depth} · ${p.requests ?? 0} req · ${p.endpoints ?? 0} endpoints`, frac: null };
+    return { text: `crawling · ${browserProgress(p) ?? `depth ${p.depth} · ${p.requests ?? 0} req · ${p.endpoints ?? 0} endpoints`}`, frac: null };
   if (j.kind === "active-scan")
     return { text: `${p.units_done ?? 0}/${p.units ?? 0} units · ${p.requests ?? 0} req · ${p.raised ?? 0} raised`, frac: p.units ? (p.units_done ?? 0) / p.units : null };
+  if (j.kind === "crawl" && browserProgress(p)) return { text: browserProgress(p)!, frac: null };
   if (j.kind === "crawl") return { text: `depth ${p.depth ?? 0} · ${p.requests ?? 0} req · ${p.endpoints ?? 0} endpoints · ${p.queued ?? 0} queued`, frac: null };
   return { text: Object.entries(p).map(([k, v]) => `${k} ${v}`).join(" · "), frac: null };
 }
@@ -322,6 +324,7 @@ const SCAN_DEFAULTS = {
   pathPrefix: "",
   headers: "",
   subdomains: false,
+  browser: false,
   noForms: false,
 };
 
@@ -513,6 +516,9 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
       .catch(() => {});
   }, []);
   const [auth] = usePoll<{ profiles: { name: string }[] }>(() => run(["auth", "list"]), 30000);
+  // The JavaScript crawl needs a Chromium-based browser on this machine.
+  const [browsers] = usePoll<BrowserList>(() => run(["browser", "list"]), 60000);
+  const canBrowse = hasChromium(browsers);
   const set = (patch: Partial<typeof SCAN_DEFAULTS>) => setF((x) => ({ ...x, ...patch }));
 
   // Rules picked in the Rules tab fill the rules field.
@@ -548,6 +554,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           ...opt("--header", f.headers),
           ...flag("--subdomains", f.subdomains),
           ...flag("--no-forms", f.noForms),
+          ...browserFlag(f.browser, canBrowse),
           ...flag("--http2", f.http2),
           ...flag("--verify-tls", f.verifyTls),
         ]
@@ -555,7 +562,7 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
           "scan",
           "active",
           ...(mode === "recorded" ? [] : urls(f.urls)),
-          ...(mode === "crawl" ? ["--crawl"] : []),
+          ...(mode === "crawl" ? ["--crawl", ...browserFlag(f.browser, canBrowse)] : []),
           ...opt("--where", f.where),
           `--strength=${f.strength}`,
           ...(kind === "targeted"
@@ -618,11 +625,20 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
       <input className="input" value={f[key] as string} placeholder={placeholder} onChange={(e) => set({ [key]: e.target.value })} />
     </label>
   );
-  const check = (label: string, key: keyof typeof SCAN_DEFAULTS, title?: string) => (
-    <label className="check" title={title}>
-      <input type="checkbox" checked={f[key] as boolean} onChange={(e) => set({ [key]: e.target.checked })} /> {label}
+  const check = (label: string, key: keyof typeof SCAN_DEFAULTS, title?: string, disabled = false) => (
+    <label className={`check ${disabled ? "muted" : ""}`} title={title}>
+      <input type="checkbox" checked={f[key] as boolean && !disabled} disabled={disabled} onChange={(e) => set({ [key]: e.target.checked })} /> {label}
     </label>
   );
+  const browserCheck = () =>
+    check(
+      "Run JavaScript (browser)",
+      "browser",
+      canBrowse
+        ? "Also crawl in a headless Chromium-based browser: follows client-side routes, clicks buttons and menus, fills and submits forms, and records the XHR/fetch calls they make. Slower; for single-page apps. Logout, delete and remove buttons aren't clicked."
+        : "Needs Chrome, Chromium, Edge or Brave on this machine (brainproxy browser list)",
+      !canBrowse,
+    );
 
   return (
     <div className="detail sc-form">
@@ -841,11 +857,13 @@ function NewScan({ picked, onLaunched }: { picked: Set<number>; onLaunched: (id:
             {check("Skip JSON bodies", "noJson")}
             {check("Checks only (no rules)", "noRules")}
             {check("No out-of-band", "noOob")}
+            {mode === "crawl" && browserCheck()}
           </>
         ) : kind === "crawl" ? (
           <>
             {check("Include subdomains", "subdomains")}
             {check("Don't submit forms", "noForms")}
+            {browserCheck()}
           </>
         ) : null}
         {check("HTTP/2", "http2")}
@@ -876,7 +894,7 @@ interface Rule {
   alerts: { alert_ref: string; name: string; risk: Risk }[];
 }
 
-const SOURCES = ["proxy", "send", "crawl", "fuzz", "scan", "import", "auth", "race"];
+const SOURCES = ["proxy", "send", "crawl", "crawl-browser", "fuzz", "scan", "import", "auth", "race"];
 const RISK_RANK: Record<Risk, number> = { info: 0, low: 1, medium: 2, high: 3 };
 
 function Rules(p: { active: boolean; picked: Set<number>; setPicked: (s: Set<number>) => void }) {

@@ -114,6 +114,47 @@ pub(crate) fn find() -> Vec<Found> {
         .collect()
 }
 
+/// Whether `crawl --browser` can run on this platform (it passes pipes the Unix way).
+const BROWSER_CRAWL: bool = cfg!(unix);
+
+/// The Chromium-family browser for a browser crawl: `id` from `browser list`, or the
+/// first one found. The crawl drives it over the DevTools protocol, which Firefox lacks.
+pub(crate) fn chromium(id: Option<&str>) -> Result<PathBuf, Error> {
+    if !BROWSER_CRAWL {
+        return Err(Error::InvalidInput(
+            "the browser crawl (--browser) runs on Linux and macOS; on Windows, browse the site through the proxy \
+             (brainproxy browser open)"
+                .into(),
+        ));
+    }
+    let found = find();
+    let chromium: Vec<&Found> = found.iter().filter(|f| f.kind == Kind::Chromium).collect();
+    match id {
+        Some(id) => match found.iter().find(|f| f.id == id) {
+            Some(f) if f.kind == Kind::Chromium => Ok(f.path.clone()),
+            Some(f) => Err(Error::InvalidInput(format!(
+                "the browser crawl drives Chromium-based browsers (Chrome, Chromium, Edge, Brave), not {}",
+                f.name
+            ))),
+            None => Err(Error::NotFound(format!(
+                "browser {id:?}; Chromium-based browsers found: {}",
+                if chromium.is_empty() {
+                    "none".into()
+                } else {
+                    chromium.iter().map(|f| f.id).collect::<Vec<_>>().join(", ")
+                }
+            ))),
+        },
+        None => chromium.first().map(|f| f.path.clone()).ok_or_else(|| {
+            Error::NotFound(
+                "no Chromium-based browser found for --browser (Chrome, Chromium, Edge or Brave on the PATH or in the \
+                 usual install folders; on Kali: sudo apt install chromium). See `brainproxy browser list`."
+                    .into(),
+            )
+        }),
+    }
+}
+
 fn describe(f: &Found) -> Value {
     json!({"id": f.id, "name": f.name, "kind": if f.kind == Kind::Chromium { "chromium" } else { "firefox" }, "path": f.path})
 }
@@ -123,7 +164,9 @@ pub fn browser(project: &Path, home: &Path, cmd: BrowserCmd, out: &Out) -> Resul
     match cmd {
         BrowserCmd::List => {
             let list: Vec<Value> = found.iter().map(describe).collect();
-            out.ok(json!({"browsers": list, "default": found.first().map(|f| f.id)}), || {
+            let data =
+                json!({"browsers": list, "default": found.first().map(|f| f.id), "browser_crawl": BROWSER_CRAWL});
+            out.ok(data, || {
                 if found.is_empty() {
                     return "no supported browser found (Chrome, Chromium, Edge, Brave, Firefox)".into();
                 }

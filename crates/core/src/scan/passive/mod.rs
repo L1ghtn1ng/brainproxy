@@ -32,7 +32,7 @@ pub struct PassiveSettings {
 }
 
 fn default_sources() -> Vec<String> {
-    ["proxy", "send", "crawl"].map(String::from).to_vec()
+    ["proxy", "send", "crawl", "crawl-browser"].map(String::from).to_vec()
 }
 
 impl Default for PassiveSettings {

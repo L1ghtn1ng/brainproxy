@@ -103,7 +103,7 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, request/response), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `ws list/messages` |
 | Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T --input-json` (handshake and messages on stdin) |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
-| Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl` |
+| Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, either with *Run JavaScript (browser)* for single-page apps (greyed out without a Chromium-based browser), passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl`, `crawl --browser`, `scan active --crawl --browser`, `browser list` |
 | Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, or a SQL condition), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background`, `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/stop/start --authz` |
 | Results | Findings | Issues grouped by type and risk, detail, evidence, triage | `findings list/show/mark` |
 | Results | Callbacks | OOB listener start/stop, payload generator, interactions with raw detail | `oob start/stop/status/payload/poll` |
@@ -120,7 +120,9 @@ out of scope), login (none, or an existing auth profile, with a pointer to Setti
 (Quick: medium strength, crawl depth 3, 150 pages; Standard: high, 5, 500; Thorough:
 insane, 8, 1500; Standard and Thorough also attack cookies (`--cookies`); once the Nuclei templates are downloaded, Standard adds those of high
 severity and Thorough those of medium and above, both plus the end-of-life checks via
-`--check-include-tags eol`), speed (Gentle `-c 3`, Normal, Fast `-c 30`),
+`--check-include-tags eol`; Thorough also crawls with JavaScript in a hidden browser
+(`--browser`) when `browser list` finds a Chromium-based one, and says so on its card and
+in the review), speed (Gentle `-c 3`, Normal, Fast `-c 30`),
 and a review with a warning about real
 attack traffic. It runs
 `scan active URL --crawl ... --background`, shows progress as "exploring" then "testing",
