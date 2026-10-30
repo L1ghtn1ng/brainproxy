@@ -238,8 +238,9 @@ Access control across users: does the app let bob read alice's data? See
   the run.
 - **Grid:** one row per request, one column per identity. Cells are coloured by verdict:
   red for a high-confidence bypass, orange medium, yellow low, blue public, grey different,
-  green enforced. Rows with nothing to compare (the owner didn't get a 2xx) are marked
-  skipped. Click a verdict chip above the grid to show only those rows; *Worst first* puts
+  a dashed outline inconclusive (a successful response with nothing to compare, so check it
+  by hand), green enforced. Rows with nothing to compare (the owner didn't get a 2xx) are
+  marked skipped. Click a verdict chip above the grid to show only those rows; *Worst first* puts
   bypasses at the top.
 - **Compare:** click a cell to see the owner's response (the baseline) and that identity's
   side by side, with the evidence for the verdict. *Requests* shows what was sent, so you

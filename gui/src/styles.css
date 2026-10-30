@@ -2436,6 +2436,10 @@ button.chip {
   background: var(--panel-2);
   color: var(--text);
 }
+.az-inconclusive {
+  border: 1px dashed var(--border-strong);
+  color: var(--muted);
+}
 .az-enforced {
   background: color-mix(in oklch, var(--ok) 14%, transparent);
   color: var(--ok);

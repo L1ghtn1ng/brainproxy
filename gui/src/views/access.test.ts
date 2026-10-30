@@ -46,6 +46,7 @@ test("cells get a kind from their verdict and confidence", () => {
   assert.equal(cellKind(cell("bypass", 200, 1, "medium")), "bypass-medium");
   assert.equal(cellKind(cell("bypass", 200, 1, null)), "bypass-low");
   assert.equal(cellKind(cell("enforced", 403, 1)), "enforced");
+  assert.equal(cellKind(cell("inconclusive", 204, 1)), "inconclusive");
   assert.equal(cellKind(cell("weird", 200, 1)), "none");
   assert.equal(cellKind(undefined), "none");
 });
@@ -74,6 +75,24 @@ test("the matrix becomes rows with a cell per identity, anonymous first", () => 
     Object.fromEntries(Object.entries(g.counts).filter(([, n]) => n)),
     { "bypass-high": 1, "bypass-low": 1, public: 1, different: 2, enforced: 2, error: 1, none: 1 },
   );
+});
+
+test("inconclusive cells are shown, counted and filterable", () => {
+  const m: Matrix = {
+    ...matrix,
+    requests: [
+      { source_id: 5, method: "HEAD", url: "http://shop.test/a", owner: "alice", baseline_history_id: 50, baseline_status: 200, cells: { anonymous: cell("enforced", 401, 51), bob: cell("inconclusive", 200, 52), carol: cell("different", 200, 53) } },
+      { source_id: 6, method: "GET", url: "http://shop.test/b", owner: "alice", baseline_history_id: 60, baseline_status: 200, cells: { anonymous: cell("enforced", 401, 61), bob: cell("enforced", 403, 62), carol: cell("inconclusive", 204, 63) } },
+    ],
+  };
+  const g = grid(m);
+  assert.deepEqual([g.rows[0].cells[1].kind, g.rows[0].cells[1].text, g.rows[0].cells[1].historyId], ["inconclusive", "inconclusive 200", 52]);
+  assert.equal(g.counts.inconclusive, 2);
+  assert.equal(g.counts.none, 0);
+  assert.equal(g.rows[1].worst, "inconclusive");
+  assert.equal(grid(m, { only: "inconclusive" }).rows.length, 2);
+  // Ranked below a real difference, above a refusal.
+  assert.deepEqual(grid(m, { worstFirst: true }).rows.map((r) => r.worst), ["different", "inconclusive"]);
 });
 
 test("rows can be filtered by kind and sorted worst first", () => {

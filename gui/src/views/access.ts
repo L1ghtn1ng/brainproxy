@@ -35,10 +35,10 @@ export interface AuthzRun {
   verdicts: Record<string, number>;
 }
 
-export type CellKind = "bypass-high" | "bypass-medium" | "bypass-low" | "public" | "different" | "enforced" | "error" | "none";
+export type CellKind = "bypass-high" | "bypass-medium" | "bypass-low" | "public" | "different" | "inconclusive" | "enforced" | "error" | "none";
 
 /** Most severe first: the order of the legend and of "worst first" sorting. */
-export const KINDS: CellKind[] = ["bypass-high", "bypass-medium", "bypass-low", "public", "different", "enforced", "error", "none"];
+export const KINDS: CellKind[] = ["bypass-high", "bypass-medium", "bypass-low", "public", "different", "inconclusive", "enforced", "error", "none"];
 
 export const KIND_LABEL: Record<CellKind, string> = {
   "bypass-high": "bypass (high)",
@@ -46,6 +46,7 @@ export const KIND_LABEL: Record<CellKind, string> = {
   "bypass-low": "bypass (low)",
   public: "public",
   different: "different",
+  inconclusive: "inconclusive",
   enforced: "enforced",
   error: "error",
   none: "not sent",
@@ -54,7 +55,7 @@ export const KIND_LABEL: Record<CellKind, string> = {
 export function cellKind(c: MatrixCell | undefined): CellKind {
   if (!c) return "none";
   if (c.verdict === "bypass") return c.confidence === "high" ? "bypass-high" : c.confidence === "medium" ? "bypass-medium" : "bypass-low";
-  if (c.verdict === "public" || c.verdict === "different" || c.verdict === "enforced" || c.verdict === "error") return c.verdict;
+  if (c.verdict === "public" || c.verdict === "different" || c.verdict === "inconclusive" || c.verdict === "enforced" || c.verdict === "error") return c.verdict;
   return "none";
 }
 

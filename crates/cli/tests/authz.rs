@@ -352,21 +352,33 @@ fn live_mode_shares_the_proxys_auth_session() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "200");
+    // Nothing to compare in an empty response: inconclusive, not a bypass.
+    let out = Command::new("curl")
+        .args(["-sS", "--noproxy", "", "-x", &proxy, "-o", if cfg!(windows) { "NUL" } else { "/dev/null" }])
+        .args(["-w", "%{http_code}", &srv.url("/api/orders/9")])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "204");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let m = loop {
         let m = ok(&p, &["authz", "matrix", &run_id]);
-        if !m["requests"].as_array().unwrap().is_empty() || std::time::Instant::now() > deadline {
+        if m["requests"].as_array().unwrap().len() >= 2 || std::time::Instant::now() > deadline {
             break m;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     };
     assert_eq!(cell(&m, "/api/orders/1", "bob")["verdict"], "bypass", "{m}");
+    assert_eq!(cell(&m, "/api/orders/9", "bob")["verdict"], "inconclusive", "{m}");
     assert_eq!(m["requests"][0]["owner"], "alice", "{m}");
     // The options it was started with, for starting it again alike.
     let status = ok(&p, &["--home", home, "proxy", "status"]);
     let started_with = status["proxy"]["args"].to_string();
     assert!(started_with.contains("\"--auth\",\"alice\"") && started_with.contains("\"--authz\",\"bob\""), "{status}");
     ok(&p, &["--home", home, "proxy", "stop"]);
+    let job = ok(&p, &["job", "status", &run_id]);
+    assert_eq!(job["result"]["verdicts"]["inconclusive"], 1, "{job}");
+    assert_eq!(job["result"]["verdicts"]["bypass"], 1, "{job}");
+    assert_eq!(job["result"]["new_findings"], 1, "{job}");
 }
 
 /// A run whose proxy was killed isn't shown as live for ever.
