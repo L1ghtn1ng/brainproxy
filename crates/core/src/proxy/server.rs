@@ -37,6 +37,9 @@ use crate::proxy::config::{
 use crate::proxy::h2 as h2p;
 use crate::session::Tool;
 use crate::store::Store;
+use crate::ws::db::WsEvent;
+use crate::ws::relay::{Hold, Hooks};
+use crate::ws::{Deflate, Direction, Message};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTINGS_REFRESH: Duration = Duration::from_millis(300);
@@ -78,14 +81,22 @@ struct Ctx {
     client: Client,
     control: Mutex<Store>,
     live: RwLock<Arc<Live>>,
-    recorder: Mutex<mpsc::Sender<Recorded>>,
+    recorder: Mutex<mpsc::Sender<Record>>,
     authz: Option<Arc<LiveAuthz>>,
+    /// Names WebSocket connections for the recorder.
+    ws_keys: AtomicU64,
     stats: Stats,
     http2: bool,
     /// Whether each https origin negotiated HTTP/2 (tried for HTTP/2 clients).
     h2_origins: Mutex<HashMap<String, bool>>,
     invisible: bool,
     redirect: Option<Target>,
+}
+
+/// What the recorder thread writes, in order.
+enum Record {
+    Capture(Box<Recorded>),
+    Ws(WsEvent),
 }
 
 #[derive(Default)]
@@ -102,17 +113,20 @@ pub async fn run(
     opts: ProxyOptions,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    const STALE_WS: &str = "the proxy stopped before the connection closed";
     let control = Store::open(&opts.project)?;
-    let (tx, rx) = mpsc::channel::<Recorded>();
+    control.ws_close_stale("proxy", STALE_WS)?;
+    let (tx, rx) = mpsc::channel::<Record>();
     let mut writer_store = Store::open(&opts.project)?;
     let authz = opts.authz.clone();
     let writer = std::thread::spawn(move || {
+        let mut ws_ids = HashMap::new();
         while let Ok(first) = rx.recv() {
-            let mut batch = vec![first];
-            while let Ok(c) = rx.try_recv() {
-                batch.push(c);
-                if batch.len() >= 256 {
-                    break;
+            let (mut batch, mut ws) = (Vec::new(), Vec::new());
+            for r in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok()).take(255)) {
+                match r {
+                    Record::Capture(c) => batch.push(*c),
+                    Record::Ws(e) => ws.push(e),
                 }
             }
             let (captures, offers): (Vec<Capture>, Vec<_>) = batch.into_iter().map(|r| (r.capture, r.authz)).unzip();
@@ -129,9 +143,15 @@ pub async fn run(
                 }
                 Err(e) => eprintln!("brainproxy: failed to record {} captures: {e}", captures.len()),
             }
+            if let Err(e) = writer_store.ws_record(&ws, &mut ws_ids) {
+                eprintln!("brainproxy: failed to record {} WebSocket events: {e}", ws.len());
+            }
             if let Err(e) = crate::scan::passive::scan_pending(&mut writer_store) {
                 eprintln!("brainproxy: passive scan failed: {e}");
             }
+        }
+        if let Err(e) = writer_store.ws_close_stale("proxy", STALE_WS) {
+            eprintln!("brainproxy: WebSocket connections left open: {e}");
         }
     });
 
@@ -144,6 +164,7 @@ pub async fn run(
         live: RwLock::new(Arc::new(Live { version: -1, ..Default::default() })),
         recorder: Mutex::new(tx),
         authz: opts.authz,
+        ws_keys: AtomicU64::new(0),
         stats: Stats::default(),
         http2: opts.http2,
         h2_origins: Mutex::default(),
@@ -480,17 +501,12 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }
                 continue;
             }
-            // WebSocket and other upgrades: hand the raw streams to each other.
-            Reply::Response(response, Some(mut upstream_conn)) => {
-                client.write_all(&response).await?;
-                let pending_to_upstream = reader.into_leftover();
-                let pending_to_client = upstream_conn.reader.into_leftover();
-                upstream_conn.stream.write_all(&pending_to_upstream).await?;
-                client.write_all(&pending_to_client).await?;
-                tokio::io::copy_bidirectional(&mut client, &mut upstream_conn.stream).await?;
-                return Ok(());
+            Reply::Upgrade(upgrade) => {
+                client.write_all(&upgrade.response).await?;
+                client.flush().await?;
+                return relay_upgrade(ctx, client, reader.into_leftover(), *upgrade).await;
             }
-            Reply::Response(response, None) => response,
+            Reply::Response(response) => response,
         };
         client.write_all(&response).await?;
         client.flush().await?;
@@ -557,7 +573,14 @@ async fn serve_h2_stream(
         }
         let request = h2p::request_text(&parts, &data, target);
         match handle_request(ctx, target, request, true).await? {
-            Reply::Response(response, _) | Reply::Error(response, _) => response,
+            Reply::Response(response) | Reply::Error(response, _) => response,
+            // Upgrades don't exist in HTTP/2; an HTTP/1.1 origin that answers 101 anyway gets nothing.
+            Reply::Upgrade(u) => {
+                if let Some(c) = u.capture {
+                    send_capture(ctx, c, None);
+                }
+                u.response
+            }
         }
     };
     let (head, body) = match h2p::response_parts(&response, &method) {
@@ -573,11 +596,24 @@ async fn serve_h2_stream(
 
 /// What goes back to the client for one request.
 enum Reply {
-    /// The response, after rules and intercept; with the upstream connection
-    /// when it is a 101 upgrade (sent as received).
-    Response(Vec<u8>, Option<Conn>),
+    /// The response, after rules and intercept.
+    Response(Vec<u8>),
+    /// A 101 response (sent as received) and the connection to relay from then on.
+    Upgrade(Box<Upgrade>),
     /// A brainproxy error response; `true` ends the client connection.
     Error(Vec<u8>, bool),
+}
+
+struct Upgrade {
+    response: Vec<u8>,
+    conn: Option<Conn>,
+    /// The upgrade exchange, when it is to be recorded.
+    capture: Option<Capture>,
+    /// Intercept may apply (as to the upgrade request).
+    in_scope: bool,
+    host: String,
+    path: String,
+    url: String,
 }
 
 /// One request through scope, rules, auth, and intercept, forwarded upstream
@@ -647,13 +683,15 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     };
     let duration = started.elapsed().as_millis() as i64;
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
-    if record {
+    let capture = record.then(|| Capture::new("proxy", target, &sent, Some(&response), Some(duration), None));
+    if status == Some(101) {
+        let upgrade = Upgrade { response, conn, capture, in_scope, host: target.host.clone(), path, url };
+        return Ok(Reply::Upgrade(Box::new(upgrade)));
+    }
+    if let Some(c) = capture {
         // Live access-control testing gets the in-scope requests, as sent.
         let authz = (in_scope && ctx.authz.is_some()).then(|| (target.clone(), sent.clone()));
-        send_capture(ctx, Capture::new("proxy", target, &sent, Some(&response), Some(duration), None), authz);
-    }
-    if status == Some(101) {
-        return Ok(Reply::Response(response, conn));
+        send_capture(ctx, c, authz);
     }
     if let Some(conn) = conn.filter(|_| !close_after(&sent, &response, &method)) {
         ctx.client.checkin(target, conn);
@@ -666,7 +704,106 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
             None => return Ok(Reply::Error(error_response(502, "dropped", "response dropped by brainproxy"), true)),
         }
     }
-    Ok(Reply::Response(response, None))
+    Ok(Reply::Response(response))
+}
+
+/// Relays a connection after a 101: WebSocket frames are parsed, recorded and may be held in
+/// intercept; any other protocol is relayed as raw bytes.
+async fn relay_upgrade<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    ctx: &Arc<Ctx>,
+    mut client: S,
+    from_client: Vec<u8>,
+    upgrade: Upgrade,
+) -> Result<()> {
+    let Upgrade { response, conn, capture, in_scope, host, path, url } = upgrade;
+    let Some(mut conn) = conn else { return Ok(()) };
+    let from_server = std::mem::take(&mut conn.reader).into_leftover();
+    // After any 1xx interim responses (103 Early Hints).
+    let head = parse_response_head(final_response(&response)).ok().filter(crate::ws::is_upgrade_response);
+    let Some(head) = head else {
+        if let Some(c) = capture {
+            send_capture(ctx, c, None);
+        }
+        conn.stream.write_all(&from_client).await?;
+        client.write_all(&from_server).await?;
+        tokio::io::copy_bidirectional(&mut client, &mut conn.stream).await?;
+        return Ok(());
+    };
+    let key = ctx.ws_keys.fetch_add(1, Ordering::Relaxed);
+    let recording = capture.is_some();
+    let url = crate::ws::ws_url(&url);
+    if let Some(capture) = capture {
+        let open = WsEvent::Open {
+            key,
+            capture: Box::new(capture),
+            source: "proxy",
+            url: url.clone(),
+            time: crate::ws::now_iso(),
+        };
+        send_record(ctx, Record::Ws(open));
+    }
+    let hooks = WsHooks { ctx: ctx.clone(), key, recording, in_scope, host, path, url };
+    let ended =
+        crate::ws::relay::relay(client, from_client, conn.stream, from_server, Deflate::from_response(&head), &hooks)
+            .await;
+    if recording {
+        let close = WsEvent::Close {
+            key,
+            time: crate::ws::now_iso(),
+            code: ended.close_code,
+            reason: ended.close_reason,
+            error: ended.error,
+        };
+        send_record(ctx, Record::Ws(close));
+    }
+    Ok(())
+}
+
+/// The proxy's side of a relayed WebSocket connection: recording and intercept.
+struct WsHooks {
+    ctx: Arc<Ctx>,
+    key: u64,
+    recording: bool,
+    in_scope: bool,
+    host: String,
+    path: String,
+    url: String,
+}
+
+impl Hooks for WsHooks {
+    fn record(&self, direction: Direction, message: &Message, intercept: Option<&'static str>) {
+        if self.recording {
+            let event = WsEvent::Message { key: self.key, direction, message: message.clone(), intercept };
+            send_record(&self.ctx, Record::Ws(event));
+        }
+    }
+
+    fn should_hold(&self, direction: Direction) -> bool {
+        self.in_scope && live(&self.ctx).intercept.matches_ws(direction, &self.host, &self.path)
+    }
+
+    async fn hold(&self, direction: Direction, message: &Message) -> Hold {
+        let live = live(&self.ctx);
+        let held = hold(
+            &self.ctx,
+            &live.intercept,
+            direction.intercept_direction(),
+            "WS",
+            &self.url,
+            None,
+            message.payload.clone(),
+        )
+        .await;
+        match held {
+            Ok(Some(p)) if p == message.payload => Hold::Forward,
+            Ok(Some(p)) => Hold::Edited(p),
+            Ok(None) => Hold::Drop,
+            Err(e) => {
+                eprintln!("brainproxy: {}: WebSocket message not held: {e}", self.url);
+                Hold::Forward
+            }
+        }
+    }
 }
 
 /// Works out the upstream target and rewrites absolute-form requests to origin-form.
@@ -818,7 +955,11 @@ async fn hold(
 }
 
 fn send_capture(ctx: &Ctx, capture: Capture, authz: Option<(Target, Vec<u8>)>) {
-    let _ = ctx.recorder.lock().unwrap().send(Recorded { capture, authz });
+    send_record(ctx, Record::Capture(Box::new(Recorded { capture, authz })));
+}
+
+fn send_record(ctx: &Ctx, record: Record) {
+    let _ = ctx.recorder.lock().unwrap().send(record);
 }
 
 fn wants_close(version: &str, headers: &[(String, String)]) -> bool {

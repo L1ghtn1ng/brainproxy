@@ -244,6 +244,7 @@ dependencies = [
  "brainproxy-core",
  "bytes",
  "clap",
+ "flate2",
  "h2",
  "http",
  "libc",

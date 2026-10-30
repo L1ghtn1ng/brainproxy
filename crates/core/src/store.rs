@@ -158,12 +158,12 @@ pub const FUZZ_RESULT_COLUMNS: &[(&str, &str, &str)] = &[
 pub const INTERCEPT_COLUMNS: &[(&str, &str, &str)] = &[
     ("id", "INTEGER", "Intercept id"),
     ("time", "TEXT", "UTC time the message was held"),
-    ("direction", "TEXT", "request or response"),
+    ("direction", "TEXT", "request, response, ws-to-server, or ws-to-client (WebSocket messages)"),
     ("state", "TEXT", "pending, forwarded, dropped, or expired (timed out)"),
-    ("method", "TEXT", "Request method"),
-    ("url", "TEXT", "Request URL"),
+    ("method", "TEXT", "Request method (WS for WebSocket messages)"),
+    ("url", "TEXT", "Request URL (ws:// or wss:// for WebSocket messages)"),
     ("status", "INTEGER", "Response status (response direction only)"),
-    ("original", "BLOB", "The message as held"),
+    ("original", "BLOB", "The message as held (a WebSocket message's payload)"),
     ("edited", "BLOB", "Replacement message, if one was forwarded"),
     ("resolved_time", "TEXT", "When it was forwarded, dropped, or expired"),
 ];
@@ -173,7 +173,7 @@ pub const INTERCEPT_COLUMNS: &[(&str, &str, &str)] = &[
 pub const HISTORY_COLUMNS: &[(&str, &str, &str)] = &[
     ("id", "INTEGER", "Capture id, increasing"),
     ("time", "TEXT", "UTC ISO-8601 time the capture was recorded"),
-    ("source", "TEXT", "Tool that produced it: send, race, proxy, fuzz, scan, crawl, import"),
+    ("source", "TEXT", "Tool that produced it: send, race, proxy, fuzz, scan, crawl, import, ws"),
     ("scheme", "TEXT", "http or https"),
     ("host", "TEXT", "Target host name or IP"),
     ("port", "INTEGER", "Target port"),
@@ -218,6 +218,8 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     ("JSON body field", "SELECT id, json_extract(resp_body_text, '$.token') FROM history WHERE resp_content_type LIKE '%json%'"),
     ("Extract values", "SELECT id, regexp_extract(resp_body_text, 'csrf[^\"]*\"([^\"]+)', 1) AS csrf FROM history WHERE csrf IS NOT NULL"),
     ("Parameters seen", "SELECT DISTINCT path, query FROM history WHERE query IS NOT NULL"),
+    ("WebSocket messages", "SELECT m.id, c.url, m.direction, m.payload_text FROM ws_messages m JOIN ws_connections c ON c.id = m.connection_id WHERE m.opcode = 'text' ORDER BY m.id DESC LIMIT 50"),
+    ("WebSocket search", "SELECT id, connection_id, payload_text FROM ws_messages WHERE id IN (SELECT rowid FROM ws_messages_fts WHERE ws_messages_fts MATCH 'token')"),
 ];
 
 pub struct Store {
@@ -316,7 +318,10 @@ impl Store {
                  WHERE state IN ('queued', 'running', 'stopping');
              UPDATE fuzz_runs SET state = 'failed', error = 'still running when the project was saved',
                  finished_time = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE state IN ('queued', 'running', 'stopping');",
+                 WHERE state IN ('queued', 'running', 'stopping');
+             UPDATE ws_connections SET state = 'closed', error = COALESCE(error, 'still open when the project was saved'),
+                 closed_time = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE state = 'open';",
         )?;
         owner_only(path);
         Ok(())
@@ -443,6 +448,9 @@ impl Store {
         }
         if version < 11 {
             self.conn.execute_batch(crate::authz::SCHEMA)?;
+        }
+        if version < 12 {
+            self.conn.execute_batch(crate::ws::db::SCHEMA)?;
         }
         if version < SCHEMA_VERSION {
             self.conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

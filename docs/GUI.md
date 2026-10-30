@@ -100,8 +100,8 @@ Views stay mounted when hidden, so state (selection, edits, Replay tabs) survive
 | --- | --- | --- | --- |
 | Recon | Overview | Guided scan (below), a new-version card when brainproxy has an update (checked daily unless turned off in Settings › Rules & data; download, open installer), rules and checks card (ZAP rule data and Nuclei templates: status and one-click download; at the top while either is missing), issue counts, recent findings, tasks, history stats | `job list`, `query`, `scan active --crawl`, `scan data status/update`, `checks status/update --background`, `update check/download --kind gui` |
 | Recon | Site map | Host → path tree with issue dots (crawl/scan/replay a node), engagement and proxy scope | `query`, `history show`, `crawl`, `scan active`, `engagement *`, `scope *` |
-| Capture | Proxy | Intercept (held queue, edit, forward/drop), Traffic (filters, request/response) | `intercept *`, `history list/show/note/tag` |
-| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor | `send --target T -` |
+| Capture | Proxy | Intercept (held queue incl. WebSocket messages, edit, forward/drop), Traffic (filters, request/response), WebSockets (connections, messages both ways, payload viewer, send to Replay) | `intercept *`, `history list/show/note/tag`, `ws list/messages` |
+| Attack | Replay | Tabs, raw request editor, response, back/forward through sends; auto URL-encode on send (request line and form bodies: only characters invalid in a URL, structure kept); ⌘U / ⌘⇧U encode or decode the selection in any editor. WebSocket tabs (**+ WS**): handshake editor, messages separated by `---`, listen time and stop regex, the conversation with a payload viewer | `send --target T -`, `ws send --target T -` |
 | Attack | Fuzzer | §positions§ (manual or auto), attack types, built-in lists (`wordlist:NAME`), lists/numbers/files with processing, grep/extract/status match, Discover content preset; live results with baseline and outliers; past runs | `wordlists list/show`, `fuzz run --background`, `fuzz status/results/list/stop` |
 | Attack | Scans | Tasks (live progress, stop), new scan (crawl and audit, audit everything recorded, or specific URLs; downloaded Nuclei templates included by default at high severity and up, adjustable) or crawl, passive and active rules | `job *`, `scan active/passive/rules/enable/disable/sources`, `crawl` |
 | Attack | Access | Access control across users: start a run (identities from the auth profiles plus an anonymous toggle, an optional owner, and all credentialed history, one site, a tag, or a SQL condition), or restart the proxy with live testing; a run picker; the run as a grid of requests by identities, cells coloured by verdict (bypass high/medium/low, public, different, inconclusive, enforced, error) with skipped rows marked, filterable by verdict; click a cell to see the owner's baseline and that identity's response (or requests) side by side, or open both in Diff | `auth list`, `authz run --background`, `authz list/matrix/results`, `job status/stop`, `history show`, `proxy status/stop/start --authz` |
@@ -197,6 +197,11 @@ cd gui && npx tauri build --target $T --config '{"bundle":{"externalBin":["binar
   order; the GUI refetches everything when a run ends.
 - Changing intercept filters needs `intercept enable` (there is no "set" that keeps it
   off), so Settings briefly turns intercept on and off again when it is off.
+- Replay's WebSocket tabs send text messages only (binary: `ws send --binary` or `--resend ID`
+  from the CLI), and show one run at a time (each run is in Proxy › WebSockets).
+- Proxy › WebSockets reloads the newest 5,000 connections every 2 s (`ws list --newest`);
+  older ones are reachable with `ws list` or `query`. Messages are fetched incrementally.
+  Only text messages can be sent to Replay; Copy payload refuses messages over 2 MB.
 - `auth add` replaces the whole profile, so editing one with a stored password needs it
   typed again; `--login-request` only takes a file.
 - A literal auth password goes to `auth add` in `BRAINPROXY_SECRET_PASSWORD`, not argv. The

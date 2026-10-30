@@ -24,6 +24,8 @@ export interface Handoff {
   title?: string;
   /** `raw` holds a binary body, one char per byte (see `bodyText`); send it with `textBytes(raw, true)`. */
   binary?: boolean;
+  /** A WebSocket handshake: Replay opens it in WebSocket mode with these messages to send. */
+  ws?: string[];
 }
 
 export interface RepeaterTab extends Handoff {

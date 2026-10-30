@@ -27,6 +27,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 brainproxy-core = { path = "../core" }
 bytes = "1"
+flate2.workspace = true
 h2 = "0.4"
 http = "1"
 tokio.workspace = true

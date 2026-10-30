@@ -23,6 +23,7 @@ mod report_cmd;
 mod request_args;
 mod scan_cmd;
 mod update_cmd;
+mod ws_cmd;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -127,6 +128,15 @@ enum Cmd {
         `intercept show ID --raw > msg.http`, edit, `intercept forward ID --file msg.http` (or `drop ID`)."
     )]
     Intercept(proxy_cmd::InterceptCmd),
+
+    /// WebSocket connections and messages recorded by the proxy, and replay (`ws send`).
+    #[command(
+        subcommand,
+        after_help = "The proxy records every WebSocket connection it relays (the upgrade request is a history \
+        entry). Hold messages with `intercept enable --ws-to-server/--ws-to-client`. Search payloads with \
+        `query` (tables ws_connections, ws_messages, ws_messages_fts)."
+    )]
+    Ws(ws_cmd::WsCmd),
 
     /// Intruder-style fuzzing: payload positions, four attack modes, grep/extract, outlier summary.
     #[command(subcommand)]
@@ -383,6 +393,12 @@ fn command_name(cmd: &Cmd) -> String {
             fuzz_cmd::FuzzCmd::Stop { .. } => "fuzz stop",
         },
         Cmd::Diff(_) => "diff",
+        Cmd::Ws(c) => match c {
+            ws_cmd::WsCmd::List { .. } => "ws list",
+            ws_cmd::WsCmd::Show { .. } => "ws show",
+            ws_cmd::WsCmd::Messages { .. } => "ws messages",
+            ws_cmd::WsCmd::Send(_) => "ws send",
+        },
         Cmd::Scan(_) => "scan",
         Cmd::Crawl(_) => "crawl",
         Cmd::Import(c) => match c {
@@ -492,6 +508,7 @@ fn run(cli: Cli, out: &Out) -> Result<(), Error> {
         Cmd::Browser(cmd) => browser_cmd::browser(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Fuzz(cmd) => fuzz_cmd::fuzz_cmd(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Diff(args) => fuzz_cmd::diff_cmd(&cli.project, args, out)?,
+        Cmd::Ws(cmd) => ws_cmd::ws(&cli.project, cmd, out)?,
         Cmd::Scan(cmd) => scan_cmd::scan(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
         Cmd::Crawl(args) => crawl_cmd::crawl(&cli.project, &proxy_cmd::resolve_home(cli.home), args, out)?,
         Cmd::Import(cmd) => import_cmd::import(&cli.project, &proxy_cmd::resolve_home(cli.home), cmd, out)?,
@@ -708,7 +725,9 @@ fn schema_json() -> Value {
     };
     json!({
         "tables": [
-            {"name": "history", "description": "One row per request: source is send, race, proxy, fuzz, crawl, import, or scan.", "columns": cols(store::HISTORY_COLUMNS)},
+            {"name": "history", "description": "One row per request: source is send, race, proxy, fuzz, crawl, import, scan, or ws (ws send handshakes).", "columns": cols(store::HISTORY_COLUMNS)},
+            {"name": "ws_connections", "description": "WebSocket connections the proxy relayed (source proxy) or ws send opened (source replay). Join history ON history.id = history_id for the upgrade request.", "columns": cols(brainproxy_core::ws::db::CONNECTION_COLUMNS)},
+            {"name": "ws_messages", "description": "One row per WebSocket message (control frames included), payload decompressed. Join ws_connections ON ws_connections.id = connection_id.", "columns": cols(brainproxy_core::ws::db::MESSAGE_COLUMNS)},
             {"name": "intercepts", "description": "Proxy intercept queue (manage with the intercept command).", "columns": cols(store::INTERCEPT_COLUMNS)},
             {"name": "fuzz_runs", "description": "One row per fuzz attack.", "columns": cols(store::FUZZ_RUN_COLUMNS)},
             {"name": "fuzz_results", "description": "One row per fuzz request. Join history ON history.id = fuzz_results.history_id.", "columns": cols(store::FUZZ_RESULT_COLUMNS)},
@@ -720,6 +739,7 @@ fn schema_json() -> Value {
             {"name": "oob_payloads", "description": "Out-of-band payload tokens: from active rules (source scan) or `oob payload` (manual).", "columns": cols(brainproxy_core::oob::PAYLOAD_COLUMNS)},
             {"name": "oob_interactions", "description": "Interactions received by the OOB listener. Join oob_payloads ON token.", "columns": cols(brainproxy_core::oob::INTERACTION_COLUMNS)},
             {"name": "history_fts", "description": "FTS5 full-text index over url, req_headers, req_body_text, resp_headers, resp_body_text. rowid = history.id. Query with: WHERE history_fts MATCH 'term'."},
+            {"name": "ws_messages_fts", "description": "FTS5 full-text index over ws_messages.payload_text. rowid = ws_messages.id. Query with: WHERE ws_messages_fts MATCH 'term'."},
         ],
         "functions": store::FUNCTIONS.iter().map(|(sig, d)| json!({"signature": sig, "description": d})).collect::<Vec<_>>(),
         "examples": store::EXAMPLES.iter().map(|(t, q)| json!({"title": t, "sql": q})).collect::<Vec<_>>(),
