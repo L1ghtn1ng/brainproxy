@@ -16,6 +16,7 @@
 //! baseline and the replay so the two can be compared (`diff`).
 
 pub(crate) mod compare;
+pub mod live;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -96,6 +97,13 @@ pub const AUTHZ_RESULT_COLUMNS: &[(&str, &str, &str)] = &[
     ("reason", "TEXT", "Why the verdict was given"),
     ("evidence", "TEXT", "What showed the bypass"),
 ];
+
+/// Methods replayed unless asked otherwise. Replaying a request that changes state as
+/// another user changes their data, so POST and the like are opt-in.
+pub const SAFE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
+
+/// Paths not replayed by default: logging out would end the owner's session.
+pub const DEFAULT_EXCLUDE: &str = r"(?i)(log|sign)[-_]?(out|off)\b";
 
 /// The identity that sends without any credentials.
 pub const ANONYMOUS: &str = "anonymous";
@@ -324,8 +332,8 @@ impl Row {
     }
 }
 
-/// Everything learned about one request, for the writer.
-struct Outcome {
+/// Everything learned about one request, ready to record with a [`Recorder`].
+pub struct Outcome {
     source_id: Option<i64>,
     method: String,
     url: String,
@@ -469,15 +477,55 @@ enum As {
     Anonymous,
 }
 
-struct Shared {
+/// Sends requests as the owner, the anonymous control and the other identities, and
+/// judges each response: the engine behind [`run`] (a list of requests) and the proxy's
+/// live mode (each request as it is recorded). Stops sending once `ctl` is stopped.
+pub struct Tester {
     client: Client,
     cfg: AuthzConfig,
     limiter: Option<Limiter>,
     sent: AtomicU64,
     ctl: JobControl,
+    identities: Vec<String>,
 }
 
-impl Shared {
+impl Tester {
+    pub fn new(cfg: AuthzConfig, ctl: JobControl) -> Result<Tester> {
+        if !cfg.anonymous && cfg.identities.is_empty() {
+            return Err(Error::InvalidInput(
+                "nothing to compare: pass --as NAME or leave the anonymous control on".into(),
+            ));
+        }
+        let mut identities: Vec<String> = Vec::new();
+        if cfg.anonymous {
+            identities.push(ANONYMOUS.to_string());
+        }
+        identities.extend(cfg.identities.iter().map(|s| s.profile.name.clone()));
+        Ok(Tester {
+            client: Client::new(cfg.send.clone()),
+            limiter: Limiter::new(cfg.rate),
+            cfg,
+            sent: AtomicU64::new(0),
+            ctl,
+            identities,
+        })
+    }
+
+    /// The identities each request is compared across: `anonymous` first if on.
+    pub fn identities(&self) -> &[String] {
+        &self.identities
+    }
+
+    /// Requests sent so far.
+    pub fn sent(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
+    }
+
+    /// Profiles whose credentials are recognised and removed.
+    pub fn profiles(&self) -> Vec<AuthProfile> {
+        self.cfg.known.iter().map(|s| s.profile.clone()).collect()
+    }
+
     /// Sends unless the run is stopped, before or while waiting for the rate limit
     /// (then None).
     async fn send(&self, who: &As, request: &[u8], target: &Target) -> Option<Result<Exchange>> {
@@ -520,7 +568,8 @@ impl Shared {
         }
     }
 
-    async fn test(&self, t: &AuthzTarget) -> Outcome {
+    /// Tests one request. A stopped run returns what was learned before it stopped.
+    pub async fn test(&self, t: &AuthzTarget) -> Outcome {
         let request = keep_alive(&t.request);
         let msg = Message::from_exchange(0, &t.target, &request, b"");
         let owner = self.cfg.owner.clone().or_else(|| detect_owner(&request, &self.cfg.known));
@@ -696,6 +745,43 @@ fn credential_headers<'a>(profiles: impl IntoIterator<Item = &'a AuthProfile>) -
     names
 }
 
+/// Writes outcomes under one run: the result rows, the exchanges (history, source
+/// `authz`) and the findings.
+pub struct Recorder {
+    store: Store,
+    run_id: i64,
+    idx: i64,
+    new_findings: usize,
+    verdicts: BTreeMap<String, usize>,
+}
+
+impl Recorder {
+    pub fn open(project: &Path, run_id: i64) -> Result<Recorder> {
+        let store = Store::open(project)?;
+        let idx = store.authz_next_idx(run_id)?;
+        Ok(Recorder { store, run_id, idx, new_findings: 0, verdicts: BTreeMap::new() })
+    }
+
+    pub fn record(&mut self, o: &Outcome) -> Result<()> {
+        let (n, c) = self.store.authz_record(self.run_id, &mut self.idx, o)?;
+        self.new_findings += n;
+        for (k, v) in c {
+            *self.verdicts.entry(k).or_default() += v;
+        }
+        Ok(())
+    }
+
+    /// New findings recorded so far.
+    pub fn new_findings(&self) -> usize {
+        self.new_findings
+    }
+
+    /// Rows recorded so far per verdict.
+    pub fn verdicts(&self) -> &BTreeMap<String, usize> {
+        &self.verdicts
+    }
+}
+
 /// Runs the comparison for every target and records the results under `run_id`.
 pub async fn run(
     project: &Path,
@@ -704,37 +790,16 @@ pub async fn run(
     cfg: AuthzConfig,
     ctl: JobControl,
 ) -> Result<AuthzSummary> {
-    if !cfg.anonymous && cfg.identities.is_empty() {
-        return Err(Error::InvalidInput("nothing to compare: pass --as NAME or leave the anonymous control on".into()));
-    }
-    let mut identities: Vec<String> = Vec::new();
-    if cfg.anonymous {
-        identities.push(ANONYMOUS.to_string());
-    }
-    identities.extend(cfg.identities.iter().map(|s| s.profile.name.clone()));
     let concurrency = cfg.concurrency.max(1);
-    let shared = Arc::new(Shared {
-        client: Client::new(cfg.send.clone()),
-        limiter: Limiter::new(cfg.rate),
-        cfg,
-        sent: AtomicU64::new(0),
-        ctl: ctl.clone(),
-    });
+    let tester = Arc::new(Tester::new(cfg, ctl.clone())?);
 
     let (tx, rx) = mpsc::channel::<Outcome>();
-    let mut store = Store::open(project)?;
-    let writer = std::thread::spawn(move || -> Result<(usize, BTreeMap<String, usize>)> {
-        let mut idx = store.authz_next_idx(run_id)?;
-        let mut new = 0;
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut recorder = Recorder::open(project, run_id)?;
+    let writer = std::thread::spawn(move || -> Result<Recorder> {
         while let Ok(o) = rx.recv() {
-            let (n, c) = store.authz_record(run_id, &mut idx, &o)?;
-            new += n;
-            for (k, v) in c {
-                *counts.entry(k).or_default() += v;
-            }
+            recorder.record(&o)?;
         }
-        Ok((new, counts))
+        Ok(recorder)
     });
 
     let total = targets.len();
@@ -742,35 +807,33 @@ pub async fn run(
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut tasks = Vec::with_capacity(total);
     for t in targets {
-        let (shared, sem, done, ctl, tx) = (shared.clone(), sem.clone(), done.clone(), ctl.clone(), tx.clone());
+        let (tester, sem, done, ctl, tx) = (tester.clone(), sem.clone(), done.clone(), ctl.clone(), tx.clone());
         tasks.push(tokio::spawn(async move {
             let Ok(_permit) = sem.acquire().await else { return };
             if ctl.stopped() {
                 return;
             }
-            let outcome = shared.test(&t).await;
+            let outcome = tester.test(&t).await;
             let _ = tx.send(outcome);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            ctl.set_progress(
-                json!({"requests_done": n, "requests": total, "sent": shared.sent.load(Ordering::Relaxed)}),
-            );
+            ctl.set_progress(json!({"requests_done": n, "requests": total, "sent": tester.sent()}));
         }));
     }
     drop(tx);
     for t in tasks {
         let _ = t.await;
     }
-    let (new_findings, verdicts) = tokio::task::spawn_blocking(move || writer.join())
+    let recorder = tokio::task::spawn_blocking(move || writer.join())
         .await
         .map_err(|e| Error::Protocol(e.to_string()))?
         .map_err(|_| Error::Protocol("authz writer panicked".into()))??;
     Ok(AuthzSummary {
         run_id,
         requests: total,
-        sent: shared.sent.load(Ordering::Relaxed),
-        identities,
-        verdicts,
-        new_findings,
+        sent: tester.sent(),
+        identities: tester.identities().to_vec(),
+        verdicts: recorder.verdicts().clone(),
+        new_findings: recorder.new_findings(),
         stopped: ctl.stopped(),
     })
 }

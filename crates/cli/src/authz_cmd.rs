@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brainproxy_core::auth::{AuthProfile, AuthSession};
-use brainproxy_core::authz::{self, AuthzConfig, AuthzTarget, ANONYMOUS};
+use brainproxy_core::authz::{self, AuthzConfig, AuthzTarget, ANONYMOUS, DEFAULT_EXCLUDE, SAFE_METHODS};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
+use brainproxy_core::jobs::is_finished;
 use brainproxy_core::scan::Message;
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
@@ -17,13 +18,6 @@ use clap::{Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
 use crate::output::Out;
-
-/// Methods replayed from history unless --include-methods adds more. Replaying a request
-/// that changes state as another user changes their data, so POST is opt-in here.
-const SAFE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
-
-/// Paths not replayed by default: logging out would end the owner's session.
-const DEFAULT_EXCLUDE: &str = r"(?i)(log|sign)[-_]?(out|off)\b";
 
 #[derive(Subcommand)]
 pub enum AuthzCmd {
@@ -170,7 +164,14 @@ pub fn authz(project: &Path, home: &Path, cmd: AuthzCmd, out: &Out) -> Result<()
             Ok(())
         }
         AuthzCmd::List { limit } => {
-            let runs = Store::open(project)?.authz_runs(limit)?;
+            let store = Store::open(project)?;
+            // A run whose process died (a killed proxy) isn't live any more.
+            for r in store.authz_runs(limit)? {
+                if let Some(id) = r["run_id"].as_i64().filter(|_| !is_finished(r["state"].as_str().unwrap_or(""))) {
+                    crate::jobs_cmd::reap(project, &store, id)?;
+                }
+            }
+            let runs = store.authz_runs(limit)?;
             out.ok(json!({"runs": runs}), || {
                 runs.iter()
                     .map(|r| {
@@ -215,12 +216,7 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
     if !args.urls.is_empty() && args.owner.is_none() {
         return Err(Error::InvalidInput("URLs need --owner: the profile whose response is the baseline".into()));
     }
-    let profiles: Vec<String> = Store::open(project)?.auth_list()?.into_iter().map(|(p, _)| p.name).collect();
-    for name in identities.iter().chain(&args.owner) {
-        if !profiles.contains(name) {
-            return Err(Error::NotFound(format!("auth profile {name} (see auth list)")));
-        }
-    }
+    let profiles = require_profiles(project, identities.iter().chain(&args.owner))?;
     for u in &args.urls {
         crate::require_in_scope(&guard, &Target::from_url(u)?)?;
     }
@@ -254,18 +250,7 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
             }
         }
     }
-    let mut known: Vec<Arc<AuthSession>> = Vec::new();
-    for name in &profiles {
-        let s = if needed.contains(name) {
-            crate::auth_cmd::load_session(project, name, send.clone())?
-        } else {
-            match AuthSession::load(project, name, Client::new(send.clone())) {
-                Ok(s) => Arc::new(s),
-                Err(_) => continue,
-            }
-        };
-        known.push(s);
-    }
+    let known = load_sessions(project, &profiles, &needed, &send)?;
     let find = |n: &str| known.iter().find(|s| s.profile.name == n).cloned().expect("loaded above");
     let cfg = AuthzConfig {
         identities: identities.iter().map(|n| find(n)).collect(),
@@ -305,6 +290,43 @@ fn run(project: &Path, home: &Path, args: RunArgs, out: &Out) -> Result<(), Erro
     })?;
     out.ok(result.clone(), || summary_text(&result));
     Ok(())
+}
+
+/// The stored auth profile names; fails naming the first of `names` that isn't one.
+pub(crate) fn require_profiles<'a>(
+    project: &Path,
+    names: impl IntoIterator<Item = &'a String>,
+) -> Result<Vec<String>, Error> {
+    let profiles: Vec<String> = Store::open(project)?.auth_list()?.into_iter().map(|(p, _)| p.name).collect();
+    for name in names {
+        if !profiles.contains(name) {
+            return Err(Error::NotFound(format!("auth profile {name} (see auth list)")));
+        }
+    }
+    Ok(profiles)
+}
+
+/// A session for each of `profiles`: those in `needed` log in now if they need to. The
+/// others only help to work out who made a request and which credentials to remove.
+pub(crate) fn load_sessions(
+    project: &Path,
+    profiles: &[String],
+    needed: &[String],
+    send: &SendOptions,
+) -> Result<Vec<Arc<AuthSession>>, Error> {
+    let mut known = Vec::new();
+    for name in profiles {
+        let s = if needed.contains(name) {
+            crate::auth_cmd::load_session(project, name, send.clone())?
+        } else {
+            match AuthSession::load(project, name, Client::new(send.clone())) {
+                Ok(s) => Arc::new(s),
+                Err(_) => continue,
+            }
+        };
+        known.push(s);
+    }
+    Ok(known)
 }
 
 /// Picks and de-duplicates the requests to test; returns them with the numbers skipped

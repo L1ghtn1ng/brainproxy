@@ -460,13 +460,15 @@ impl Store {
     }
 
     /// Records many captures in one transaction.
-    pub fn record_batch(&mut self, captures: &[Capture]) -> Result<()> {
+    /// Records captures in one transaction; returns their history ids.
+    pub fn record_batch(&mut self, captures: &[Capture]) -> Result<Vec<i64>> {
         let tx = self.write_tx()?;
+        let mut ids = Vec::with_capacity(captures.len());
         for c in captures {
-            insert_capture(&tx, c)?;
+            ids.push(insert_capture(&tx, c)?);
         }
         tx.commit()?;
-        Ok(())
+        Ok(ids)
     }
 
     #[allow(clippy::too_many_arguments)]

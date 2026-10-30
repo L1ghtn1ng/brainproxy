@@ -223,6 +223,29 @@ By default an active scan only replays GET, HEAD, OPTIONS and POST requests from
 DELETE, PUT, PATCH and other methods are skipped (and counted as `skipped_methods`) unless
 you include them.
 
+### Access
+Access control across users: does the app let bob read alice's data? See
+[Access control across users](#access-control-across-users-authz) for how it works.
+- **New run:** tick the identities to send each request as (your auth profiles, one per
+  user) and keep *anonymous* on to also send with no session. *Owner* is worked out per
+  request unless you pick one. Choose which requests to test: all recorded requests that
+  carry credentials, one site, a tag, or a SQL condition on history. Only GET, HEAD and
+  OPTIONS requests are replayed, and logout paths never are.
+- **Test live while browsing:** restarts the proxy on the same address, with the options it
+  had (such as its login profile), so each in-scope request you browse is also tried as
+  those identities in the background. If it doesn't start, the
+  previous proxy is started again. Results fill the grid as you go; stopping the proxy ends
+  the run.
+- **Grid:** one row per request, one column per identity. Cells are coloured by verdict:
+  red for a high-confidence bypass, orange medium, yellow low, blue public, grey different,
+  a dashed outline inconclusive (a successful response with nothing to compare, so check it
+  by hand), green enforced. Rows with nothing to compare (the owner didn't get a 2xx) are
+  marked skipped. Click a verdict chip above the grid to show only those rows; *Worst first* puts
+  bypasses at the top.
+- **Compare:** click a cell to see the owner's response (the baseline) and that identity's
+  side by side, with the evidence for the verdict. *Requests* shows what was sent, so you
+  can check the owner's credentials were removed; *Diff* opens both in Diff.
+
 ### Findings
 - **Layout:** issues grouped by type, filterable by risk, with false positives hidden by
   default.
@@ -375,7 +398,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 122 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 126 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -539,6 +562,34 @@ engagement scope and is recorded in history with source `authz`.
 
 `authz run --background` returns a run id; `job wait|status|stop` work on it, and
 `authz list` shows recent runs. The rows are also in the `authz_results` table for `query`.
+
+**Live mode.** `proxy start --authz bob,anonymous` tests requests while you browse. Each
+in-scope request the proxy records that carries credentials, uses GET, HEAD or OPTIONS,
+doesn't match `--authz-exclude` (default: logout and sign-off) and got a 2xx response that
+isn't a static asset (scripts, stylesheets, images, fonts, media) is also sent, in the
+background, as each listed profile and/or with no credentials (`anonymous`), exactly as
+`authz run` does. To test a request live mode leaves out, such as a private image, use
+`authz run --history-id`. All of it goes
+under one authz run, created when the proxy starts; `proxy start` and `proxy status` print
+its id, and `authz matrix|results|list` and the desktop app's **Access** view work on it
+while it fills up.
+
+```sh
+brainproxy proxy start --auth alice --authz bob,anonymous   # browse as alice
+brainproxy proxy status        # authz.run_id, and counts: tested, waiting, duplicates, dropped
+brainproxy authz matrix 12     # the live run's id
+```
+
+Proxied traffic never waits for the tests. Each method, URL and body is tested once; the
+requests wait in a queue of `--authz-queue` (default 100), and when it is full new ones are
+dropped and counted (`dropped_queue_full` in `proxy status`, next to `skipped_status`,
+`skipped_static` and the other reasons a request wasn't queued). `--authz-rate` caps the
+requests per second the tests send (default 5, 0 for no limit); `--authz-keep-cookie`
+keeps a cookie that isn't a credential. The settings in use are stored in the project
+(setting `authz`). `proxy stop` and `project stop` end the run (state `completed`), waiting
+up to 30 s for it to be saved; if the proxy has to be killed, or dies, the run is `failed`
+and the rows recorded so far stay;
+`job stop RUN` stops testing while the proxy carries on (`stopped` once the proxy stops).
 
 More detail: [README](../README.md), [MCP](MCP.md), [checks](CHECKS.md),
 [rule updates](RULE_UPDATES.md), [out-of-band](OOB.md), [desktop app](GUI.md).

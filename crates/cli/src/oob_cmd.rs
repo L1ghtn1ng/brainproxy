@@ -110,7 +110,7 @@ pub(crate) fn running(store: &Store) -> Result<Option<OobState>, Error> {
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
     let Some(state) = running(store)? else { return Ok(None) };
     process::request_stop(store, STOP_KEY, state.pid)?;
-    let forced = process::terminate(state.pid, state.start_time, "OOB listener")?;
+    let forced = process::terminate(state.pid, state.start_time, "OOB listener", std::time::Duration::from_secs(5))?;
     store.meta_set(STATE_KEY, None)?;
     store.meta_set(STOP_KEY, None)?;
     Ok(Some((state.pid, forced)))

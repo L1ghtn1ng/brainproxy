@@ -103,13 +103,13 @@ pub(crate) fn still_running(pid: u32, start: Option<u64>) -> Option<bool> {
 /// Stops the process recorded as (`pid`, `start`), after the caller's `request_stop`: on
 /// Unix SIGTERM too, then a forced kill after 5 s. Returns whether the kill was needed. A
 /// process that can't be verified is never killed.
-pub(crate) fn terminate(pid: u32, start: Option<u64>, what: &str) -> Result<bool, Error> {
+pub(crate) fn terminate(pid: u32, start: Option<u64>, what: &str, wait: Duration) -> Result<bool, Error> {
     let gone = || still_running(pid, start) == Some(false);
     if gone() {
         return Ok(false);
     }
     sys::ask_to_exit(pid);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + wait;
     while !gone() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }

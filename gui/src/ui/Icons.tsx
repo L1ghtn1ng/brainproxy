@@ -6,6 +6,7 @@ const PATHS: Record<string, string> = {
   proxy: "M4 8h14l-3-3 M20 16H6l3 3",
   replay: "M4 12a8 8 0 1 0 2.5-5.8 M4 4v5h5",
   fuzzer: "M13 3 5 14h6l-1 7 8-11h-6z",
+  access: "M7 11V8a5 5 0 0 1 10 0v3 M5 11h14v10H5z M12 15v2",
   scans: "M12 12l6-6 M21 12a9 9 0 1 1-9-9 M17 12a5 5 0 1 1-5-5",
   findings: "M12 3 5 6v6c0 4.5 3 7.5 7 9 4-1.5 7-4.5 7-9V6z M12 9v4 M12 16.5v.01",
   callbacks: "M12 21v-8 M8.5 9.5a5 5 0 0 1 7 0 M5.5 6.5a9 9 0 0 1 13 0 M12 13v.01",

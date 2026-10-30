@@ -12,6 +12,7 @@ import { ComparerView } from "./views/Comparer";
 import { DashboardView } from "./views/Dashboard";
 import { ENGAGEMENT_CHANGED, TargetView } from "./views/Target";
 import { ScannerView } from "./views/Scanner";
+import { AccessView } from "./views/Access";
 import { Logo } from "./ui/Logo";
 import { Icon } from "./ui/Icons";
 import { SideBrand } from "./ui/Brand";
@@ -115,6 +116,7 @@ const NAV: { group: string; items: { id: Tab; label: string; icon: string }[] }[
       { id: "repeater", label: "Replay", icon: "replay" },
       { id: "fuzzer", label: "Fuzzer", icon: "fuzzer" },
       { id: "scanner", label: "Scans", icon: "scans" },
+      { id: "access", label: "Access", icon: "access" },
     ],
   },
   {
@@ -398,6 +400,9 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
         </div>
         <div hidden={app.tab !== "scanner"} className="view-slot">
           <Boundary><ScannerView active={app.tab === "scanner"} /></Boundary>
+        </div>
+        <div hidden={app.tab !== "access"} className="view-slot">
+          <Boundary><AccessView active={app.tab === "access"} /></Boundary>
         </div>
         <div hidden={app.tab !== "findings"} className="view-slot">
           <Boundary><FindingsView active={app.tab === "findings"} /></Boundary>

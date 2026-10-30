@@ -4,9 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use brainproxy_core::authz::live::{Live, LiveOptions};
+use brainproxy_core::authz::{AuthzConfig, ANONYMOUS, DEFAULT_EXCLUDE};
 use brainproxy_core::http::{RawRequest, SendOptions, Target};
+use brainproxy_core::jobs::{is_finished, JobControl};
 use brainproxy_core::proxy::config::{
-    InterceptSettings, Rule, RuleLocation, Scope, TimeoutAction, INTERCEPT_KEY, RULES_KEY, SCOPE_KEY,
+    InterceptSettings, LiveAuthz, Rule, RuleLocation, Scope, TimeoutAction, AUTHZ_KEY, INTERCEPT_KEY, RULES_KEY,
+    SCOPE_KEY,
 };
 use brainproxy_core::proxy::{CertAuthority, ProxyOptions, ProxyState, STATE_KEY};
 use brainproxy_core::store::{HistoryFilter, Store};
@@ -19,6 +23,11 @@ use crate::process;
 
 /// `proxy stop` asks the proxy to exit through this key (see `process::shutdown`).
 const STOP_KEY: &str = "proxy.stop";
+
+/// How long a proxy may take to exit when asked to. With a live authz run it also has to
+/// finish its tests and save the run.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+const STOP_WAIT_AUTHZ: Duration = Duration::from_secs(30);
 
 #[derive(Subcommand)]
 pub enum CaCmd {
@@ -90,6 +99,52 @@ pub struct ProxyRunArgs {
     /// like a reverse proxy. Implies --invisible.
     #[arg(long, value_name = "URL")]
     redirect: Option<String>,
+    /// Live access-control testing: also send each in-scope GET/HEAD/OPTIONS request that
+    /// carries credentials and got a 2xx that isn't a static asset as these auth profiles,
+    /// and/or `anonymous` (no credentials), in the background. Comma-separated or
+    /// repeatable. Results: authz matrix RUN.
+    #[arg(long, value_name = "NAMES", value_delimiter = ',')]
+    authz: Vec<String>,
+    /// Requests per second live testing sends at most (0: no limit).
+    #[arg(long, value_name = "N", default_value_t = 5.0)]
+    authz_rate: f64,
+    /// Requests waiting for live testing at most; more are dropped and counted.
+    #[arg(long, value_name = "N", default_value_t = 100)]
+    authz_queue: usize,
+    /// Regex on paths live testing leaves alone.
+    #[arg(long, value_name = "REGEX", default_value = DEFAULT_EXCLUDE)]
+    authz_exclude: String,
+    /// Cookie that isn't a credential and stays on live-tested requests. Repeatable or
+    /// comma-separated.
+    #[arg(long, value_name = "NAME", value_delimiter = ',')]
+    authz_keep_cookie: Vec<String>,
+}
+
+impl ProxyRunArgs {
+    /// The live access-control testing settings these arguments ask for.
+    fn live_authz(&self) -> Result<LiveAuthz, Error> {
+        let mut identities: Vec<String> = Vec::new();
+        for n in &self.authz {
+            let n = n.trim();
+            if !n.is_empty() && n != ANONYMOUS && !identities.iter().any(|i| i == n) {
+                identities.push(n.to_string());
+            }
+        }
+        regex::Regex::new(&self.authz_exclude).map_err(|e| Error::InvalidInput(format!("--authz-exclude: {e}")))?;
+        if self.authz_rate.is_nan() || self.authz_rate < 0.0 {
+            return Err(Error::InvalidInput("--authz-rate must be 0 or more".into()));
+        }
+        Ok(LiveAuthz {
+            enabled: !self.authz.iter().all(|n| n.trim().is_empty()),
+            anonymous: self.authz.iter().any(|n| n.trim() == ANONYMOUS),
+            identities,
+            rate: (self.authz_rate > 0.0).then_some(self.authz_rate),
+            queue: self.authz_queue.max(1),
+            exclude: self.authz_exclude.clone(),
+            keep_cookies: self.authz_keep_cookie.clone(),
+            run_id: None,
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -363,7 +418,14 @@ pub(crate) fn running(store: &Store) -> Result<Option<ProxyState>, Error> {
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
     let Some(Saved { state, start_time }) = current(store)? else { return Ok(None) };
     process::request_stop(store, STOP_KEY, state.pid)?;
-    let forced = process::terminate(state.pid, start_time, "proxy")?;
+    let wait = if state.authz_run.is_some() { STOP_WAIT_AUTHZ } else { STOP_WAIT };
+    let forced = process::terminate(state.pid, start_time, "proxy", wait)?;
+    // Killed, it couldn't save its run; the rows recorded so far stay.
+    if let Some(id) = state.authz_run.filter(|_| forced) {
+        if !is_finished(&store.job_state(id)?) {
+            store.job_set_state(id, "failed", None, Some("the proxy was killed before the run was saved"), true)?;
+        }
+    }
     store.meta_set(STATE_KEY, None)?;
     store.meta_set(STOP_KEY, None)?;
     Ok(Some((state.pid, forced)))
@@ -411,6 +473,14 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
             let intercept: InterceptSettings = store.setting(INTERCEPT_KEY)?;
             let rules: Vec<Rule> = store.setting(RULES_KEY)?;
             let scope: Scope = store.setting(SCOPE_KEY)?;
+            let authz = match state.as_ref().and_then(|s| s.authz_run) {
+                Some(id) => {
+                    let job = store.job_get(id)?;
+                    json!({"run_id": id, "state": job["state"], "progress": job["progress"],
+                        "next": format!("brainproxy authz matrix {id}")})
+                }
+                None => Value::Null,
+            };
             let data = json!({
                 "running": state.is_some(),
                 "proxy": state.as_ref().map(state_json),
@@ -419,9 +489,15 @@ pub fn proxy(project: &Path, home: &Path, cmd: ProxyCmd, out: &Out) -> Result<()
                 "intercept_enabled": intercept.enabled,
                 "rules_enabled": rules.iter().filter(|r| r.enabled).count(),
                 "scope": scope,
+                "authz": authz,
             });
             out.ok(data, || match &state {
-                Some(s) => format!("running on {} (pid {}), {captures} captures, {pending} pending", s.listen, s.pid),
+                Some(s) => format!(
+                    "running on {} (pid {}), {captures} captures, {pending} pending{}",
+                    s.listen,
+                    s.pid,
+                    live_text(s.authz_run)
+                ),
                 None => "not running".into(),
             });
             Ok(())
@@ -466,6 +542,16 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
         store.auth_profile(name)?; // Fail fast on an unknown profile.
         cmd.args(["--auth", name]);
     }
+    let live = args.live_authz()?;
+    if live.enabled {
+        crate::authz_cmd::require_profiles(&project, &live.identities)?;
+        cmd.arg("--authz").arg(args.authz.join(","));
+        cmd.args(["--authz-rate", &args.authz_rate.to_string(), "--authz-queue", &args.authz_queue.to_string()]);
+        cmd.arg("--authz-exclude").arg(&args.authz_exclude);
+        if !args.authz_keep_cookie.is_empty() {
+            cmd.arg("--authz-keep-cookie").arg(args.authz_keep_cookie.join(","));
+        }
+    }
     process::detach(&mut cmd);
     let mut child =
         cmd.stdin(Stdio::null()).stdout(Stdio::from(log_file.try_clone()?)).stderr(Stdio::from(log_file)).spawn()?;
@@ -478,7 +564,9 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
             return Err(crate::jobs_cmd::child_failure("proxy", status, &new));
         }
         if let Some(Saved { state, .. }) = read_state(&store)?.filter(|s| s.state.pid == child.id()) {
-            out.ok(state_json(&state), || format!("proxy listening on http://{} (pid {})", state.listen, state.pid));
+            out.ok(state_json(&state), || {
+                format!("proxy listening on http://{} (pid {}){}", state.listen, state.pid, live_text(state.authz_run))
+            });
             return Ok(());
         }
         if Instant::now() > deadline {
@@ -487,6 +575,18 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn live_text(run: Option<i64>) -> String {
+    run.map(|id| format!("; live authz run {id} (brainproxy authz matrix {id})")).unwrap_or_default()
+}
+
+/// Live access-control testing for one proxy run: the job and what it needs to start.
+struct LiveRun {
+    run_id: i64,
+    cfg: AuthzConfig,
+    opts: LiveOptions,
+    ctl: JobControl,
 }
 
 fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(), Error> {
@@ -504,7 +604,65 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
         guard: Some(guard),
         http2: false,
     };
-    let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &upstream)?;
+    let live = args.live_authz()?;
+    let stored: LiveAuthz = store.setting(AUTHZ_KEY)?;
+    if !live.enabled {
+        if stored.enabled {
+            store.set_setting(AUTHZ_KEY, &LiveAuthz { enabled: false, ..stored })?;
+        }
+        let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &upstream)?;
+        return serve(project, &args, ca, info, upstream, auth, None, out).map(|_| ());
+    }
+    let profiles = crate::authz_cmd::require_profiles(project, &live.identities)?;
+    let exclude = regex::Regex::new(&live.exclude).map_err(|e| Error::InvalidInput(format!("--authz-exclude: {e}")))?;
+    let run_id = store.job_create("authz", "queued", &crate::jobs_cmd::child_args())?;
+    store.set_setting(AUTHZ_KEY, &LiveAuthz { run_id: Some(run_id), ..live.clone() })?;
+    // The run lasts as long as the proxy: it completes when the proxy stops, or stops
+    // early on `job stop RUN` while the proxy carries on.
+    crate::jobs_cmd::run_job(project, Some(run_id), |ctl| {
+        // The --auth profile logs in too: the proxy and the tests share its session, so a
+        // re-login by either is the other's as well.
+        let needed: Vec<String> = live.identities.iter().chain(&args.auth).cloned().collect();
+        let known = crate::authz_cmd::load_sessions(project, &profiles, &needed, &upstream)?;
+        let find = |n: &String| known.iter().find(|s| &s.profile.name == n).cloned().expect("loaded above");
+        let auth = args.auth.as_ref().map(find);
+        let cfg = AuthzConfig {
+            identities: live.identities.iter().map(find).collect(),
+            anonymous: live.anonymous,
+            owner: None,
+            known: known.clone(),
+            keep_cookies: live.keep_cookies.clone(),
+            send: upstream.clone(),
+            concurrency: 2,
+            rate: live.rate,
+        };
+        let opts = LiveOptions { queue: live.queue, concurrency: 2, exclude };
+        let summary =
+            serve(project, &args, ca, info, upstream.clone(), auth, Some(LiveRun { run_id, cfg, opts, ctl }), out);
+        // serve saved the --auth session.
+        for s in &known {
+            if live.identities.contains(&s.profile.name) && args.auth.as_ref() != Some(&s.profile.name) {
+                s.save()?;
+            }
+        }
+        summary
+    })?;
+    Ok(())
+}
+
+/// Runs the proxy until it is asked to stop. Returns the live testing summary, if on.
+#[allow(clippy::too_many_arguments)]
+fn serve(
+    project: &Path,
+    args: &ProxyRunArgs,
+    ca: CertAuthority,
+    info: brainproxy_core::proxy::CaInfo,
+    upstream: SendOptions,
+    auth: Option<std::sync::Arc<brainproxy_core::auth::AuthSession>>,
+    live: Option<LiveRun>,
+    out: &Out,
+) -> Result<Value, Error> {
+    let store = Store::open(project)?;
     let redirect = args.redirect.as_deref().map(Target::from_url).transpose()?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
@@ -512,6 +670,13 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
             .await
             .map_err(|e| Error::Conflict(format!("cannot listen on {}: {e}", args.listen)))?;
         let addr = listener.local_addr()?;
+        let (authz, worker) = match live {
+            Some(l) => {
+                let (live, worker) = Live::start(project, l.run_id, l.cfg, l.opts, l.ctl)?;
+                (Some(live), Some(worker))
+            }
+            None => (None, None),
+        };
         let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let state = ProxyState {
             pid: std::process::id(),
@@ -519,11 +684,13 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
             started: started.to_string(),
             ca_cert: info.cert_path.clone(),
             log: args.log.clone(),
+            authz_run: authz.as_ref().map(|l| l.run_id()),
+            args: crate::jobs_cmd::child_args(),
         };
         let saved = Saved { state, start_time: process::start_time(std::process::id()) };
         store.meta_set(STATE_KEY, Some(&serde_json::to_string(&saved).unwrap_or_default()))?;
         let state = saved.state;
-        out.ok(state_json(&state), || format!("proxy listening on http://{addr}"));
+        out.ok(state_json(&state), || format!("proxy listening on http://{addr}{}", live_text(state.authz_run)));
 
         let shutdown = process::shutdown(&store, STOP_KEY);
         let opts = ProxyOptions {
@@ -533,15 +700,22 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
             http2: !args.no_http2,
             invisible: args.invisible,
             redirect: redirect.clone(),
+            authz,
         };
         let result = brainproxy_core::proxy::run(listener, std::sync::Arc::new(ca), opts, shutdown).await;
+        // The proxy has recorded (and offered) everything by now.
+        let summary = match worker {
+            Some(w) => w.finish().await,
+            None => Ok(Value::Null),
+        };
         if read_state(&store)?.is_some_and(|s| s.state.pid == std::process::id()) {
             store.meta_set(STATE_KEY, None)?;
         }
         if let Some(a) = &auth {
             a.save()?;
         }
-        result
+        result?;
+        summary
     })
 }
 

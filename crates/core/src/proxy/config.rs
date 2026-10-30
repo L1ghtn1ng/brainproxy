@@ -15,6 +15,60 @@ use crate::http::{parse_response_head, RawRequest};
 pub const SCOPE_KEY: &str = "scope";
 pub const RULES_KEY: &str = "rules";
 pub const INTERCEPT_KEY: &str = "intercept";
+pub const AUTHZ_KEY: &str = "authz";
+
+/// Live access-control testing (`proxy start --authz`): each in-scope request the proxy
+/// records that carries credentials, uses a safe method and isn't excluded is also sent
+/// as these identities. Read when the proxy starts, which writes what it uses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveAuthz {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Auth profiles to send each request as.
+    #[serde(default)]
+    pub identities: Vec<String>,
+    /// Also send without credentials.
+    #[serde(default)]
+    pub anonymous: bool,
+    /// Requests per second the tester sends at most.
+    #[serde(default)]
+    pub rate: Option<f64>,
+    /// Requests waiting to be tested at most; more are dropped and counted.
+    #[serde(default = "default_queue")]
+    pub queue: usize,
+    /// Regex on paths not to test.
+    #[serde(default = "default_exclude")]
+    pub exclude: String,
+    /// Cookies that aren't credentials and stay on the request.
+    #[serde(default)]
+    pub keep_cookies: Vec<String>,
+    /// The authz run (job id) of the proxy that last started with live testing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<i64>,
+}
+
+fn default_queue() -> usize {
+    100
+}
+
+fn default_exclude() -> String {
+    crate::authz::DEFAULT_EXCLUDE.to_string()
+}
+
+impl Default for LiveAuthz {
+    fn default() -> Self {
+        LiveAuthz {
+            enabled: false,
+            identities: vec![],
+            anonymous: false,
+            rate: None,
+            queue: default_queue(),
+            exclude: default_exclude(),
+            keep_cookies: vec![],
+            run_id: None,
+        }
+    }
+}
 
 /// Host-based scope. Patterns are regexes matched against the host name.
 /// An empty include list means every host is in scope.

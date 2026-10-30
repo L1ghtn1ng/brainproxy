@@ -97,7 +97,7 @@ fn text(j: &Value) -> String {
 
 /// Marks a job whose process died as failed. One that died while still queued (before
 /// it marked itself running) failed setting up: its error is the last one in its log.
-fn reap(project: &Path, store: &Store, id: i64) -> Result<(), Error> {
+pub(crate) fn reap(project: &Path, store: &Store, id: i64) -> Result<(), Error> {
     let j = store.job_get(id)?;
     let state = j["state"].as_str().unwrap_or("");
     if !matches!(state, "queued" | "running" | "stopping") {
