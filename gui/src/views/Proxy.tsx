@@ -6,9 +6,10 @@ import { HttpView } from "../ui/HttpView";
 import { Menu, useMenu } from "../ui/Menu";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
+import { WebSockets } from "./WebSockets";
 
 export function ProxyView() {
-  const [sub, setSub] = useState<"history" | "intercept">("history");
+  const [sub, setSub] = useState<"history" | "intercept" | "ws">("history");
   return (
     <div className="col fill">
       <div className="subtabs">
@@ -18,12 +19,18 @@ export function ProxyView() {
         <button className={sub === "history" ? "on" : ""} onClick={() => setSub("history")}>
           Traffic
         </button>
+        <button className={sub === "ws" ? "on" : ""} onClick={() => setSub("ws")}>
+          WebSockets
+        </button>
       </div>
       <div className="fill" hidden={sub !== "history"}>
         <History />
       </div>
       <div className="fill" hidden={sub !== "intercept"}>
         <Intercept active={sub === "intercept"} />
+      </div>
+      <div className="fill" hidden={sub !== "ws"}>
+        <WebSockets active={sub === "ws"} />
       </div>
     </div>
   );
@@ -69,7 +76,7 @@ const COLUMNS: Column<HistoryItem>[] = [
   },
 ];
 
-const SOURCES = ["proxy", "send", "crawl", "fuzz", "scan", "import", "auth"];
+const SOURCES = ["proxy", "send", "crawl", "fuzz", "scan", "import", "auth", "ws"];
 
 function History() {
   const app = useApp();
@@ -220,7 +227,7 @@ function History() {
 interface Held {
   id: number;
   time: string;
-  direction: "request" | "response";
+  direction: "request" | "response" | "ws-to-server" | "ws-to-client";
   state: string;
   method: string;
   url: string;
@@ -232,6 +239,8 @@ export interface InterceptSettings {
   enabled: boolean;
   requests: boolean;
   responses: boolean;
+  ws_to_server?: boolean;
+  ws_to_client?: boolean;
   host?: string;
   path?: string;
   method?: string;
@@ -248,6 +257,8 @@ export function interceptEnableArgs(s: InterceptSettings): string[] {
     "enable",
     ...(s.requests ? ["--requests"] : []),
     ...(s.responses ? ["--responses"] : []),
+    ...(s.ws_to_server ? ["--ws-to-server"] : []),
+    ...(s.ws_to_client ? ["--ws-to-client"] : []),
     ...opt("--host", s.host),
     ...opt("--path", s.path),
     ...opt("--method", s.method),
@@ -257,6 +268,13 @@ export function interceptEnableArgs(s: InterceptSettings): string[] {
     s.timeout_action,
   ];
 }
+
+const HELD_TITLE: Record<Held["direction"], string> = {
+  request: "Request to",
+  response: "Response from",
+  "ws-to-server": "WebSocket message to",
+  "ws-to-client": "WebSocket message from",
+};
 
 function Intercept({ active }: { active: boolean }) {
   const app = useApp();
@@ -312,7 +330,10 @@ function Intercept({ active }: { active: boolean }) {
   return (
     <div className="col fill">
       <div className="toolbar">
-        <button className={`btn ${s?.enabled ? "primary" : ""}`} onClick={() => s && toggle({ enabled: !s.enabled, requests: s.enabled ? s.requests : s.requests || !s.responses })}>
+        <button
+          className={`btn ${s?.enabled ? "primary" : ""}`}
+          onClick={() => s && toggle({ enabled: !s.enabled, requests: s.enabled ? s.requests : s.requests || !(s.responses || s.ws_to_server || s.ws_to_client) })}
+        >
           Intercept is {s?.enabled ? "on" : "off"}
         </button>
         <label className="check">
@@ -320,6 +341,12 @@ function Intercept({ active }: { active: boolean }) {
         </label>
         <label className="check">
           <input type="checkbox" checked={!!s?.responses} disabled={!s?.enabled} onChange={(e) => toggle({ responses: e.target.checked })} /> Responses
+        </label>
+        <label className="check" title="WebSocket messages from the browser (text and binary)">
+          <input type="checkbox" checked={!!s?.ws_to_server} disabled={!s?.enabled} onChange={(e) => toggle({ ws_to_server: e.target.checked })} /> WS to server
+        </label>
+        <label className="check" title="WebSocket messages from the server (text and binary)">
+          <input type="checkbox" checked={!!s?.ws_to_client} disabled={!s?.enabled} onChange={(e) => toggle({ ws_to_client: e.target.checked })} /> WS to client
         </label>
         <span className="sep" />
         <button className="btn primary" disabled={!message} onClick={() => decide("forward")}>
@@ -361,7 +388,7 @@ function Intercept({ active }: { active: boolean }) {
           empty={s?.enabled ? "Waiting for traffic through the proxy…" : "Intercept is off. Turn it on to hold requests before they are sent."}
         />
         <HttpView
-          title={item ? `${item.direction === "request" ? "Request to" : "Response from"} ${hostOf(item.url)}` : "Message"}
+          title={item ? `${HELD_TITLE[item.direction]} ${hostOf(item.url.replace(/^ws/, "http"))}` : "Message"}
           value={message?.text ?? ""}
           binary={message?.binary}
           onChange={message && !message.truncated ? (text) => setMessage({ ...message, text }) : undefined}

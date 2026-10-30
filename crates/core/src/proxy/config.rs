@@ -359,6 +359,12 @@ pub struct InterceptSettings {
     pub enabled: bool,
     pub requests: bool,
     pub responses: bool,
+    /// Hold WebSocket messages from the client.
+    #[serde(default)]
+    pub ws_to_server: bool,
+    /// Hold WebSocket messages from the server.
+    #[serde(default)]
+    pub ws_to_client: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,6 +382,8 @@ impl Default for InterceptSettings {
             enabled: false,
             requests: true,
             responses: false,
+            ws_to_server: false,
+            ws_to_client: false,
             host: None,
             path: None,
             method: None,
@@ -418,6 +426,19 @@ impl CompiledIntercept {
             && self.host.as_ref().is_none_or(|r| r.is_match(host))
             && self.path.as_ref().is_none_or(|r| r.is_match(path))
             && self.method.as_ref().is_none_or(|r| r.is_match(method))
+    }
+
+    /// Whether a WebSocket data message going `direction` on a connection upgraded from a
+    /// request to `host` and `path` should be held. The method filter doesn't apply.
+    pub fn matches_ws(&self, direction: crate::ws::Direction, host: &str, path: &str) -> bool {
+        let s = &self.settings;
+        s.enabled
+            && match direction {
+                crate::ws::Direction::ToServer => s.ws_to_server,
+                crate::ws::Direction::ToClient => s.ws_to_client,
+            }
+            && self.host.as_ref().is_none_or(|r| r.is_match(host))
+            && self.path.as_ref().is_none_or(|r| r.is_match(path))
     }
 }
 

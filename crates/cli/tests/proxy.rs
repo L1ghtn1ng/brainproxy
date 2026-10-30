@@ -167,7 +167,11 @@ fn proxy_end_to_end() {
     assert_eq!(status, 200);
     assert!(body.starts_with("POST /secure HTTP/1.1\r\n") && body.ends_with("\r\n\r\na=1"), "{body}");
 
-    std::thread::sleep(Duration::from_millis(300));
+    // Captures are written in the background, after the first passive scan (~300 ms in debug builds).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while env.count("SELECT count(*) FROM history WHERE source = 'proxy'") < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(env.count("SELECT count(*) FROM history WHERE source = 'proxy'"), 2);
     assert_eq!(
         env.count("SELECT count(*) FROM history WHERE scheme = 'https' AND path = '/secure' AND req_body_text = 'a=1'"),

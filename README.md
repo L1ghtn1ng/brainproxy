@@ -29,6 +29,9 @@ Only use it against systems you are authorized to test.
   PDF.
 - **See what a retest fixed.** Compare findings with a scan: new in it, still found, or
   not found again (likely fixed), counting only what that scan actually covered.
+- **WebSockets.** The proxy records every WebSocket connection and message (fragments
+  joined, permessage-deflate undone), can hold messages in Intercept for you to edit or
+  drop, and Replay opens new connections with a recorded handshake to send messages again.
 - **Scan rules from OWASP ZAP, plus about 10,000 Nuclei templates**, all run inside a
   write-once engagement scope that every request is checked against.
 
@@ -212,6 +215,19 @@ brainproxy intercept list --wait 30               # block until something is hel
 brainproxy intercept show 4 --raw > msg.http      # edit it...
 brainproxy intercept forward 4 --file msg.http    # ...and release it (or: intercept drop 4)
 brainproxy intercept disable
+
+# WebSockets: the proxy records each connection (its upgrade request is a history entry) and
+# every message, both ways, decompressed and with fragments joined
+brainproxy ws list                                # connections: url, state, message count, close code
+brainproxy ws messages 3 --direction to-client --contains token
+brainproxy query "SELECT connection_id, payload_text FROM ws_messages WHERE id IN
+  (SELECT rowid FROM ws_messages_fts WHERE ws_messages_fts MATCH 'admin')"
+# Replay: a new connection with the recorded handshake (new key; --auth applies), send
+# messages, print replies until one matches or --wait seconds of quiet
+brainproxy ws send --from 3 -m '{"op":"get","id":2}' --until '"id":2' --auth admin
+brainproxy ws send --url wss://target.test/socket --resend 41 --wait 5
+# Hold WebSocket messages (text and binary) like requests; forward --file replaces the payload as is
+brainproxy intercept enable --ws-to-server --ws-to-client --path '^/socket'
 
 # Fuzzing (Intruder): mark positions with §value§
 brainproxy fuzz run --url 'https://target.test/api/user?id=§1§' -p range:1-500 --grep 'api_key'

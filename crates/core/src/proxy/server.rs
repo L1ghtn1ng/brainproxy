@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 use crate::auth::AuthSession;
 use crate::authz::live::Live as LiveAuthz;
@@ -37,9 +38,16 @@ use crate::proxy::config::{
 use crate::proxy::h2 as h2p;
 use crate::session::Tool;
 use crate::store::Store;
+use crate::ws::db::WsEvent;
+use crate::ws::relay::{Hold, Hooks};
+use crate::ws::{Deflate, Direction, Message};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTINGS_REFRESH: Duration = Duration::from_millis(300);
+/// Bytes of captures and WebSocket messages that may wait for the recorder thread.
+const RECORD_BUDGET: usize = 64 * 1024 * 1024;
+/// What a queued record counts for besides its bodies, so small ones are bounded too.
+const RECORD_OVERHEAD: usize = 1024;
 
 pub struct ProxyOptions {
     pub project: PathBuf,
@@ -78,14 +86,66 @@ struct Ctx {
     client: Client,
     control: Mutex<Store>,
     live: RwLock<Arc<Live>>,
-    recorder: Mutex<mpsc::Sender<Recorded>>,
+    recorder: Recorder,
     authz: Option<Arc<LiveAuthz>>,
+    /// Names WebSocket connections for the recorder.
+    ws_keys: AtomicU64,
     stats: Stats,
     http2: bool,
     /// Whether each https origin negotiated HTTP/2 (tried for HTTP/2 clients).
     h2_origins: Mutex<HashMap<String, bool>>,
     invisible: bool,
     redirect: Option<Target>,
+}
+
+/// What the recorder thread writes, in order.
+enum Record {
+    Capture(Box<Recorded>),
+    Ws(WsEvent),
+}
+
+/// The queue to the recorder thread, bounded by bytes (each record holds its permits until it
+/// is written). HTTP captures and connection open/close wait for room, so none is lost: the
+/// request that made one is delayed instead. WebSocket messages never wait, so a slow disk
+/// can't stall the relay: one that doesn't fit is left out and the connection says so.
+struct Recorder {
+    tx: Mutex<mpsc::Sender<(Record, u32)>>,
+    budget: Arc<Semaphore>,
+}
+
+impl Recorder {
+    fn new() -> (Self, mpsc::Receiver<(Record, u32)>) {
+        let (tx, rx) = mpsc::channel();
+        (Self { tx: Mutex::new(tx), budget: Arc::new(Semaphore::new(RECORD_BUDGET)) }, rx)
+    }
+
+    fn cost(bytes: usize) -> u32 {
+        bytes.saturating_add(RECORD_OVERHEAD).min(RECORD_BUDGET) as u32
+    }
+
+    /// Queues a record, waiting for room.
+    async fn send(&self, record: Record, bytes: usize) {
+        let cost = Self::cost(bytes);
+        if let Ok(permits) = self.budget.acquire_many(cost).await {
+            permits.forget();
+        }
+        self.push(record, cost);
+    }
+
+    /// Queues a record if there is room now; `make` runs only then. Returns whether it did.
+    fn try_send(&self, bytes: usize, make: impl FnOnce() -> Record) -> bool {
+        let cost = Self::cost(bytes);
+        let Ok(permits) = self.budget.try_acquire_many(cost) else { return false };
+        permits.forget();
+        self.push(make(), cost);
+        true
+    }
+
+    fn push(&self, record: Record, cost: u32) {
+        if self.tx.lock().unwrap().send((record, cost)).is_err() {
+            self.budget.add_permits(cost as usize);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -102,17 +162,22 @@ pub async fn run(
     opts: ProxyOptions,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    const STALE_WS: &str = "the proxy stopped before the connection closed";
     let control = Store::open(&opts.project)?;
-    let (tx, rx) = mpsc::channel::<Recorded>();
+    control.ws_close_stale("proxy", STALE_WS)?;
+    let (recorder, rx) = Recorder::new();
+    let budget = recorder.budget.clone();
     let mut writer_store = Store::open(&opts.project)?;
     let authz = opts.authz.clone();
     let writer = std::thread::spawn(move || {
+        let mut ws_ids = HashMap::new();
         while let Ok(first) = rx.recv() {
-            let mut batch = vec![first];
-            while let Ok(c) = rx.try_recv() {
-                batch.push(c);
-                if batch.len() >= 256 {
-                    break;
+            let (mut batch, mut ws, mut cost) = (Vec::new(), Vec::new(), 0);
+            for (r, c) in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv().ok()).take(255)) {
+                cost += c as usize;
+                match r {
+                    Record::Capture(c) => batch.push(*c),
+                    Record::Ws(e) => ws.push(e),
                 }
             }
             let (captures, offers): (Vec<Capture>, Vec<_>) = batch.into_iter().map(|r| (r.capture, r.authz)).unzip();
@@ -129,9 +194,18 @@ pub async fn run(
                 }
                 Err(e) => eprintln!("brainproxy: failed to record {} captures: {e}", captures.len()),
             }
+            if let Err(e) = writer_store.ws_record(&ws, &mut ws_ids) {
+                eprintln!("brainproxy: failed to record {} WebSocket events: {e}", ws.len());
+            }
+            // Written (or given up on): their room is free again.
+            drop((captures, ws));
+            budget.add_permits(cost);
             if let Err(e) = crate::scan::passive::scan_pending(&mut writer_store) {
                 eprintln!("brainproxy: passive scan failed: {e}");
             }
+        }
+        if let Err(e) = writer_store.ws_close_stale("proxy", STALE_WS) {
+            eprintln!("brainproxy: WebSocket connections left open: {e}");
         }
     });
 
@@ -142,8 +216,9 @@ pub async fn run(
         client: Client::new(opts.upstream),
         control: Mutex::new(control),
         live: RwLock::new(Arc::new(Live { version: -1, ..Default::default() })),
-        recorder: Mutex::new(tx),
+        recorder,
         authz: opts.authz,
+        ws_keys: AtomicU64::new(0),
         stats: Stats::default(),
         http2: opts.http2,
         h2_origins: Mutex::default(),
@@ -184,7 +259,7 @@ pub async fn run(
     }
     refresher.abort();
     // Dropping the last sender ends the writer thread once queued captures are written.
-    drop(std::mem::replace(&mut *ctx.recorder.lock().unwrap(), mpsc::channel().0));
+    drop(std::mem::replace(&mut *ctx.recorder.tx.lock().unwrap(), mpsc::channel().0));
     drop(ctx);
     let _ = tokio::task::spawn_blocking(move || writer.join()).await;
     Ok(())
@@ -317,7 +392,7 @@ async fn pass_through<S: AsyncRead + AsyncWrite + Unpin>(ctx: &Arc<Ctx>, mut cli
     };
     let https = Target { scheme: "https".into(), ..target.clone() };
     let duration = Some(started.elapsed().as_millis() as i64);
-    send_capture(ctx, Capture::new("proxy", &https, request.as_bytes(), None, duration, Some(&note)), None);
+    send_capture(ctx, Capture::new("proxy", &https, request.as_bytes(), None, duration, Some(&note)), None).await;
     result.map(|_| ())
 }
 
@@ -480,17 +555,12 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 }
                 continue;
             }
-            // WebSocket and other upgrades: hand the raw streams to each other.
-            Reply::Response(response, Some(mut upstream_conn)) => {
-                client.write_all(&response).await?;
-                let pending_to_upstream = reader.into_leftover();
-                let pending_to_client = upstream_conn.reader.into_leftover();
-                upstream_conn.stream.write_all(&pending_to_upstream).await?;
-                client.write_all(&pending_to_client).await?;
-                tokio::io::copy_bidirectional(&mut client, &mut upstream_conn.stream).await?;
-                return Ok(());
+            Reply::Upgrade(upgrade) => {
+                client.write_all(&upgrade.response).await?;
+                client.flush().await?;
+                return relay_upgrade(ctx, client, reader.into_leftover(), *upgrade).await;
             }
-            Reply::Response(response, None) => response,
+            Reply::Response(response) => response,
         };
         client.write_all(&response).await?;
         client.flush().await?;
@@ -557,7 +627,14 @@ async fn serve_h2_stream(
         }
         let request = h2p::request_text(&parts, &data, target);
         match handle_request(ctx, target, request, true).await? {
-            Reply::Response(response, _) | Reply::Error(response, _) => response,
+            Reply::Response(response) | Reply::Error(response, _) => response,
+            // Upgrades don't exist in HTTP/2; an HTTP/1.1 origin that answers 101 anyway gets nothing.
+            Reply::Upgrade(u) => {
+                if let Some(c) = u.capture {
+                    send_capture(ctx, c, None).await;
+                }
+                u.response
+            }
         }
     };
     let (head, body) = match h2p::response_parts(&response, &method) {
@@ -573,11 +650,24 @@ async fn serve_h2_stream(
 
 /// What goes back to the client for one request.
 enum Reply {
-    /// The response, after rules and intercept; with the upstream connection
-    /// when it is a 101 upgrade (sent as received).
-    Response(Vec<u8>, Option<Conn>),
+    /// The response, after rules and intercept.
+    Response(Vec<u8>),
+    /// A 101 response (sent as received) and the connection to relay from then on.
+    Upgrade(Box<Upgrade>),
     /// A brainproxy error response; `true` ends the client connection.
     Error(Vec<u8>, bool),
+}
+
+struct Upgrade {
+    response: Vec<u8>,
+    conn: Option<Conn>,
+    /// The upgrade exchange, when it is to be recorded.
+    capture: Option<Capture>,
+    /// Intercept may apply (as to the upgrade request).
+    in_scope: bool,
+    host: String,
+    path: String,
+    url: String,
 }
 
 /// One request through scope, rules, auth, and intercept, forwarded upstream
@@ -639,7 +729,8 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
         Err(e) => {
             ctx.stats.errors.fetch_add(1, Ordering::Relaxed);
             if record {
-                send_capture(ctx, Capture::new("proxy", target, &request, None, None, Some(&e.to_string())), None);
+                send_capture(ctx, Capture::new("proxy", target, &request, None, None, Some(&e.to_string())), None)
+                    .await;
             }
             let status = if matches!(e, Error::OutOfScope(_)) { 403 } else { 502 };
             return Ok(Reply::Error(error_response(status, e.kind(), &e.to_string()), false));
@@ -647,13 +738,15 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
     };
     let duration = started.elapsed().as_millis() as i64;
     let status = parse_response_head(final_response(&response)).ok().map(|h| h.status);
-    if record {
+    let capture = record.then(|| Capture::new("proxy", target, &sent, Some(&response), Some(duration), None));
+    if status == Some(101) {
+        let upgrade = Upgrade { response, conn, capture, in_scope, host: target.host.clone(), path, url };
+        return Ok(Reply::Upgrade(Box::new(upgrade)));
+    }
+    if let Some(c) = capture {
         // Live access-control testing gets the in-scope requests, as sent.
         let authz = (in_scope && ctx.authz.is_some()).then(|| (target.clone(), sent.clone()));
-        send_capture(ctx, Capture::new("proxy", target, &sent, Some(&response), Some(duration), None), authz);
-    }
-    if status == Some(101) {
-        return Ok(Reply::Response(response, conn));
+        send_capture(ctx, c, authz).await;
     }
     if let Some(conn) = conn.filter(|_| !close_after(&sent, &response, &method)) {
         ctx.client.checkin(target, conn);
@@ -666,7 +759,119 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
             None => return Ok(Reply::Error(error_response(502, "dropped", "response dropped by brainproxy"), true)),
         }
     }
-    Ok(Reply::Response(response, None))
+    Ok(Reply::Response(response))
+}
+
+/// Relays a connection after a 101: WebSocket frames are parsed, recorded and may be held in
+/// intercept; any other protocol is relayed as raw bytes.
+async fn relay_upgrade<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    ctx: &Arc<Ctx>,
+    mut client: S,
+    from_client: Vec<u8>,
+    upgrade: Upgrade,
+) -> Result<()> {
+    let Upgrade { response, conn, capture, in_scope, host, path, url } = upgrade;
+    let Some(mut conn) = conn else { return Ok(()) };
+    let from_server = std::mem::take(&mut conn.reader).into_leftover();
+    // After any 1xx interim responses (103 Early Hints).
+    let head = parse_response_head(final_response(&response)).ok().filter(crate::ws::is_upgrade_response);
+    let Some(head) = head else {
+        if let Some(c) = capture {
+            send_capture(ctx, c, None).await;
+        }
+        conn.stream.write_all(&from_client).await?;
+        client.write_all(&from_server).await?;
+        tokio::io::copy_bidirectional(&mut client, &mut conn.stream).await?;
+        return Ok(());
+    };
+    let key = ctx.ws_keys.fetch_add(1, Ordering::Relaxed);
+    let recording = capture.is_some();
+    let url = crate::ws::ws_url(&url);
+    if let Some(capture) = capture {
+        let bytes = capture_bytes(&capture);
+        let open = WsEvent::Open {
+            key,
+            capture: Box::new(capture),
+            source: "proxy",
+            url: url.clone(),
+            time: crate::ws::now_iso(),
+        };
+        ctx.recorder.send(Record::Ws(open), bytes).await;
+    }
+    let hooks = WsHooks { ctx: ctx.clone(), key, recording, in_scope, host, path, url, unrecorded: AtomicU64::new(0) };
+    let ended =
+        crate::ws::relay::relay(client, from_client, conn.stream, from_server, Deflate::from_response(&head), &hooks)
+            .await;
+    if recording {
+        let unrecorded = hooks.unrecorded.load(Ordering::Relaxed);
+        let backlog = (unrecorded > 0).then(|| format!("{unrecorded} messages not recorded: the recorder was behind"));
+        let error = match (ended.error, backlog) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (a, b) => a.or(b),
+        };
+        let close = WsEvent::Close {
+            key,
+            time: crate::ws::now_iso(),
+            code: ended.close_code,
+            reason: ended.close_reason,
+            error,
+        };
+        ctx.recorder.send(Record::Ws(close), 0).await;
+    }
+    Ok(())
+}
+
+/// The proxy's side of a relayed WebSocket connection: recording and intercept.
+struct WsHooks {
+    /// Messages left out because the recorder's queue was full.
+    unrecorded: AtomicU64,
+    ctx: Arc<Ctx>,
+    key: u64,
+    recording: bool,
+    in_scope: bool,
+    host: String,
+    path: String,
+    url: String,
+}
+
+impl Hooks for WsHooks {
+    fn record(&self, direction: Direction, message: &Message, intercept: Option<&'static str>) {
+        if self.recording {
+            let queued = self.ctx.recorder.try_send(message.payload.len(), || {
+                Record::Ws(WsEvent::Message { key: self.key, direction, message: message.clone(), intercept })
+            });
+            if !queued {
+                self.unrecorded.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn should_hold(&self, direction: Direction) -> bool {
+        self.in_scope && live(&self.ctx).intercept.matches_ws(direction, &self.host, &self.path)
+    }
+
+    async fn hold(&self, direction: Direction, message: &Message) -> Hold {
+        let live = live(&self.ctx);
+        let held = hold(
+            &self.ctx,
+            &live.intercept,
+            direction.intercept_direction(),
+            "WS",
+            &self.url,
+            None,
+            message.payload.clone(),
+        )
+        .await;
+        match held {
+            Ok(Some(p)) if p == message.payload => Hold::Forward,
+            Ok(Some(p)) => Hold::Edited(p),
+            Ok(None) => Hold::Drop,
+            Err(e) => {
+                eprintln!("brainproxy: {}: WebSocket message not held: {e}", self.url);
+                Hold::Forward
+            }
+        }
+    }
 }
 
 /// Works out the upstream target and rewrites absolute-form requests to origin-form.
@@ -767,6 +972,28 @@ async fn forward(ctx: &Arc<Ctx>, target: &Target, request: &[u8], method: &str, 
     Ok(Upstream { conn: Some(conn), sent: request, response })
 }
 
+/// A row in the intercept queue that someone is waiting on. If the wait is abandoned (the
+/// WebSocket connection it belongs to ended), nothing would ever resolve the row: it goes
+/// from pending to dropped here, since the message won't be delivered.
+struct HeldRow {
+    ctx: Arc<Ctx>,
+    id: i64,
+    decided: bool,
+}
+
+impl Drop for HeldRow {
+    fn drop(&mut self) {
+        if !self.decided {
+            let (ctx, id) = (self.ctx.clone(), self.id);
+            // Not on this thread: drop may run on the async runtime, and the write can wait for a lock.
+            std::thread::spawn(move || {
+                // It may have been resolved at the same moment; then there is nothing to do.
+                let _ = ctx.control.lock().unwrap().intercept_resolve(id, "dropped", None);
+            });
+        }
+    }
+}
+
 /// Holds a message in the intercept queue until it is forwarded (possibly
 /// edited), dropped, or times out. Returns `None` when it should be dropped.
 async fn hold(
@@ -786,6 +1013,7 @@ async fn hold(
         .await
         .map_err(|e| Error::Protocol(e.to_string()))??
     };
+    let mut row = HeldRow { ctx: ctx.clone(), id, decided: false };
     let deadline = Instant::now() + Duration::from_secs(intercept.settings.timeout_secs);
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -794,8 +1022,14 @@ async fn hold(
             .await
             .map_err(|e| Error::Protocol(e.to_string()))??;
         match state.as_str() {
-            "forwarded" => return Ok(Some(edited.unwrap_or(message))),
-            "dropped" => return Ok(None),
+            "forwarded" => {
+                row.decided = true;
+                return Ok(Some(edited.unwrap_or(message)));
+            }
+            "dropped" => {
+                row.decided = true;
+                return Ok(None);
+            }
             _ if Instant::now() >= deadline => {
                 let c = ctx.clone();
                 // The CLI may resolve it at the same moment; whoever wins decides.
@@ -807,6 +1041,7 @@ async fn hold(
                 if expired.is_err() {
                     continue;
                 }
+                row.decided = true;
                 return Ok(match intercept.settings.timeout_action {
                     TimeoutAction::Forward => Some(message),
                     TimeoutAction::Drop => None,
@@ -817,8 +1052,20 @@ async fn hold(
     }
 }
 
-fn send_capture(ctx: &Ctx, capture: Capture, authz: Option<(Target, Vec<u8>)>) {
-    let _ = ctx.recorder.lock().unwrap().send(Recorded { capture, authz });
+async fn send_capture(ctx: &Ctx, capture: Capture, authz: Option<(Target, Vec<u8>)>) {
+    // A request waiting to be offered for live testing takes room too.
+    let bytes = capture_bytes(&capture) + authz.as_ref().map_or(0, |(_, r)| r.len());
+    ctx.recorder.send(Record::Capture(Box::new(Recorded { capture, authz })), bytes).await;
+}
+
+fn capture_bytes(c: &Capture) -> usize {
+    let text = |t: &Option<String>| t.as_ref().map_or(0, String::len);
+    c.request.len()
+        + c.response.len()
+        + c.req_body.len()
+        + c.resp_body.as_ref().map_or(0, Vec::len)
+        + text(&c.req_body_text)
+        + text(&c.resp_body_text)
 }
 
 fn wants_close(version: &str, headers: &[(String, String)]) -> bool {
@@ -978,5 +1225,32 @@ mod tests {
             let (raw, handshake) = read_client_hello(&mut tcp).await.unwrap();
             assert_eq!((raw, sni_from_client_hello(&handshake).as_deref()), (records, Some("app.test")));
         });
+    }
+
+    #[tokio::test]
+    async fn a_full_recorder_leaves_out_ws_messages_but_keeps_captures() {
+        let (recorder, rx) = Recorder::new();
+        let capture = || Record::Capture(Box::new(Recorded { capture: Capture::default(), authz: None }));
+        // Fill the budget with messages nobody is writing yet.
+        let mut queued = 0;
+        while recorder.try_send(1024 * 1024, capture) {
+            queued += 1;
+        }
+        assert!(queued > 0 && queued <= RECORD_BUDGET / (1024 * 1024));
+        assert!(!recorder.try_send(1024 * 1024, || panic!("nothing is built for a message left out")));
+
+        // A capture waits for room rather than being lost.
+        let waiting = recorder.send(capture(), 1024 * 1024);
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiting).await.is_err());
+        let (_, cost) = rx.recv().unwrap();
+        recorder.budget.add_permits(cost as usize);
+        tokio::time::timeout(Duration::from_secs(5), &mut waiting).await.unwrap();
+        assert_eq!(rx.try_iter().count(), queued);
+
+        // Larger than the whole budget: it still gets through once the queue is empty.
+        recorder.budget.add_permits(RECORD_BUDGET - recorder.budget.available_permits());
+        tokio::time::timeout(Duration::from_secs(5), recorder.send(capture(), RECORD_BUDGET * 2)).await.unwrap();
+        assert_eq!(rx.try_iter().count(), 1);
     }
 }

@@ -4,6 +4,8 @@ import { useApp, type RepeaterTab } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { autoEncodeRequest } from "../ui/urlencode";
+import { BLANK_HANDSHAKE } from "./ws";
+import { WsReplayTab } from "./WebSockets";
 
 type SendResult = Pick<HistoryEntry, "id" | "url" | "duration_ms" | "response">;
 
@@ -37,6 +39,7 @@ export function RepeaterView() {
   const active = tabs.find((t) => t.key === app.repeaterActive) ?? tabs[tabs.length - 1];
 
   const newTab = () => app.sendToRepeater({ raw: BLANK, target: "" });
+  const newWsTab = () => app.sendToRepeater({ raw: BLANK_HANDSHAKE, target: "", ws: [], title: `WS ${tabs.length + 1}` });
   const closeTab = (key: number) => {
     app.setRepeater((ts) => ts.filter((t) => t.key !== key));
     if (key === active?.key) {
@@ -66,15 +69,21 @@ export function RepeaterView() {
         <button onClick={newTab} title="New tab">
           +
         </button>
+        <button onClick={newWsTab} title="New WebSocket tab">
+          + WS
+        </button>
       </div>
       {active ? (
         // key: each tab has its own editor state and send history.
-        <RepeaterTabView key={active.key} tab={active} />
+        active.ws ? <WsReplayTab key={active.key} tab={active} /> : <RepeaterTabView key={active.key} tab={active} />
       ) : (
         <div className="blank">
           <p>Send a request here from Traffic (right-click → Send to Replay, or double-click), or</p>
           <button className="btn primary" onClick={newTab}>
             Start a blank request
+          </button>
+          <button className="btn" onClick={newWsTab}>
+            Start a WebSocket connection
           </button>
         </div>
       )}

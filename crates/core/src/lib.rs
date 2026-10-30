@@ -26,5 +26,6 @@ pub mod session;
 pub mod store;
 pub mod update;
 pub mod wordlists;
+pub mod ws;
 
 pub use error::{Error, Result};

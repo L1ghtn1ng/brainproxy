@@ -151,6 +151,25 @@ The sidebar groups the tools by what you are doing.
     default).
   - **Viewer:** select a row to see the request and response (Raw, Pretty, Hex, search).
   - **Actions:** right-click to send to Replay, Fuzzer, or Diff, add a note, or highlight.
+- **WebSockets:** every WebSocket connection a browser opened through the proxy, and the
+  ones Replay opened. Select a connection to see its messages in both directions (→ to the
+  server, ← to the client), with pings, pongs and the close; select a message to read its
+  payload. Compressed messages (permessage-deflate) are shown decompressed and fragmented
+  ones joined. Right-click a connection or a message to send it to Replay.
+  - **Fragmented messages** are buffered until their last fragment arrives, even with
+    Intercept off, so the other side gets them all at once rather than piece by piece.
+  - **Size limit:** a frame or message over 16 MB is relayed unchanged but not recorded, and
+    neither is anything after it in that direction; messages that way can't be held any more
+    either. The connection's note says so. A message can also be left out when the disk can't
+    keep up: it still goes through, and the note counts what is missing.
+  - **Intercept** holds WebSocket messages too: tick **WS to server** and/or **WS to client**.
+    Edit the payload and Forward it, or Drop it (it is never delivered). Control frames are
+    never held, and pings and pongs keep flowing while a message waits, so the connection's
+    heartbeat doesn't time out; later messages wait behind the held one. Once a full message's
+    worth (about 17 MB) is waiting, brainproxy stops reading from that side until the decision
+    or the timeout, and pings and pongs from that side wait too. The other direction isn't
+    affected. A message still held when its connection ends is marked dropped. The host and
+    path filters apply to the request that opened the connection.
 
 ### Replay
 Edit a raw request and send it as often as you like, in separate tabs.
@@ -161,6 +180,11 @@ Edit a raw request and send it as often as you like, in separate tabs.
   `?q=x'%20OR%201=1--`.
 - **Selection:** ⌘U URL-encodes the selected text completely and ⌘⇧U decodes it. This
   works in every request editor.
+- **WebSocket tabs** (**+ WS**, or Send to Replay from Proxy › WebSockets): edit the
+  handshake and the messages to send (text, separated by a line with `---`), then
+  **Connect and send**. brainproxy opens a new connection (with a fresh key), sends the
+  messages, and lists what comes back for **Listen** seconds after the last one, or until a
+  reply matches **Until**. Each run is recorded like proxied traffic.
 
 ### Fuzzer
 Mark payload positions with `§value§` (*Add §*, *Auto §* for every parameter), choose an
@@ -398,7 +422,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 126 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 130 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -426,6 +450,11 @@ brainproxy job wait 1
 
 brainproxy fuzz run --url 'https://app.acme.test/search?q=§x§' -p wordlist:sqli --grep 'SQL syntax'
 brainproxy wordlists list
+
+brainproxy ws list                                        # WebSocket connections seen by the proxy
+brainproxy ws messages 3 --contains token                 # their messages, both ways
+brainproxy ws send --from 3 -m '{"op":"whoami"}' --until whoami   # replay with a new connection
+echo '{"messages":["token=..."]}' | brainproxy ws send --from 3 --input-json   # messages off the command line
 
 brainproxy findings list
 brainproxy findings show 12

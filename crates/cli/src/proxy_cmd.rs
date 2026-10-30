@@ -209,19 +209,25 @@ pub enum RulesCmd {
 
 #[derive(Subcommand)]
 pub enum InterceptCmd {
-    /// Start holding matching messages in the queue. With neither flag, requests are held.
+    /// Start holding matching messages in the queue. With no direction flag, requests are held.
     Enable {
         #[arg(long)]
         requests: bool,
         #[arg(long)]
         responses: bool,
+        /// Hold WebSocket messages from the client (text and binary; control frames pass).
+        #[arg(long)]
+        ws_to_server: bool,
+        /// Hold WebSocket messages from the server.
+        #[arg(long)]
+        ws_to_client: bool,
         /// Only hold messages for hosts matching this regex.
         #[arg(long)]
         host: Option<String>,
-        /// Only hold messages for paths matching this regex.
+        /// Only hold messages for paths matching this regex (WebSocket: the upgrade request's path).
         #[arg(long)]
         path: Option<String>,
-        /// Only hold these methods (regex alternation, e.g. "POST|PUT").
+        /// Only hold these methods (regex alternation, e.g. "POST|PUT"). Not applied to WebSocket messages.
         #[arg(long)]
         method: Option<String>,
         /// Seconds a held message waits for a decision.
@@ -257,13 +263,14 @@ pub enum InterceptCmd {
     /// Release a held message, optionally replaced by an edited version.
     Forward {
         id: i64,
-        /// Replacement message file ('-' for stdin). Line endings and Content-Length are fixed unless --verbatim.
+        /// Replacement message file ('-' for stdin). Line endings and Content-Length are fixed unless
+        /// --verbatim; a WebSocket message's payload is always taken as is.
         #[arg(long)]
         file: Option<String>,
         #[arg(long)]
         verbatim: bool,
     },
-    /// Drop a held message; the client receives a 502.
+    /// Drop a held message; the client receives a 502 (a dropped WebSocket message is just not delivered).
     Drop { id: i64 },
 }
 
@@ -787,11 +794,23 @@ pub fn rules(project: &Path, cmd: RulesCmd, out: &Out) -> Result<(), Error> {
 pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Error> {
     let store = Store::open(project)?;
     match cmd {
-        InterceptCmd::Enable { requests, responses, host, path, method, timeout, timeout_action } => {
+        InterceptCmd::Enable {
+            requests,
+            responses,
+            ws_to_server,
+            ws_to_client,
+            host,
+            path,
+            method,
+            timeout,
+            timeout_action,
+        } => {
             let settings = InterceptSettings {
                 enabled: true,
-                requests: requests || !responses,
+                requests: requests || !(responses || ws_to_server || ws_to_client),
                 responses,
+                ws_to_server,
+                ws_to_client,
                 host,
                 path,
                 method,
@@ -859,6 +878,7 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
             out.ok(data, || String::from_utf8_lossy(&original).into_owned());
         }
         InterceptCmd::Forward { id, file, verbatim } => {
+            let websocket = store.intercept_get(id)?.0.direction.starts_with("ws-");
             let edited = match file.as_deref() {
                 None => None,
                 Some(path) => {
@@ -868,7 +888,10 @@ pub fn intercept(project: &Path, cmd: InterceptCmd, out: &Out) -> Result<(), Err
                         std::fs::read(path).map_err(|e| Error::InvalidInput(format!("cannot read {path:?}: {e}")))?
                     };
                     let msg = RawRequest::from_bytes(bytes);
-                    Some(if verbatim { msg } else { msg.normalize_line_endings().update_content_length() }.into_bytes())
+                    Some(
+                        if verbatim || websocket { msg } else { msg.normalize_line_endings().update_content_length() }
+                            .into_bytes(),
+                    )
                 }
             };
             store.intercept_resolve(id, "forwarded", edited.as_deref())?;
