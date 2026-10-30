@@ -288,6 +288,30 @@ brainproxy scan active --auth app --background
 brainproxy auth status app                        # live check against --check-url
 brainproxy auth headers app --raw                 # Cookie/Authorization lines for sqlmap, ffuf, ...
 
+# Session handling (macros and session rules) on top of a profile. A macro is requests run in
+# order with the session (cookies carry through); each step can extract values (regex group 1, JSON
+# path, header, Set-Cookie, HTML <input> by name) that later steps use as {{name}}, and their parameters
+# of that name get them too. Steps are history ids (pick them from Traffic) or raw request files.
+brainproxy auth macro add app csrf --step 42 --extract '1:csrf=input:csrf_token'
+brainproxy auth macro add app chain --step 42 --step https://app.example.com=exchange.txt \
+    --extract '1:csrf=input:csrf' --extract '2:api=json:data.token'
+brainproxy auth macro run app chain               # each step, status, history id, values (masked)
+# Session rules run before each matching request of --auth app, in order: check[:N] (the profile's
+# check URL, every Nth request; valid skips the rest), macro:NAME[:each|:N] (cached until stale by
+# default), update[:PARAM[=VAR],...] (query, form, JSON, multipart, headers, cookies; no list: the
+# values of this rule's macros, by name), login. Without --url, a value only goes to its macro's origins;
+# with --url, also to requests matching it. `auth macro add` on a new name makes a profile with no login.
+# A fresh, single-use CSRF token for every request of an active scan or fuzz run:
+brainproxy auth rule add app --tool scan,checks,fuzz --url https://app.example.com/ \
+    --action macro:csrf:each --action update:csrf
+# One token for many requests, refreshed when the site rejects it (and logged-out responses):
+brainproxy auth rule add app --action macro:csrf --action update:csrf --invalid 'invalid csrf token'
+brainproxy auth rule add app --action check:20 --action login   # re-login when a check every 20 fails
+brainproxy auth rule list app
+# Extracted values never reach history: requests hold «auth:app:var:csrf#7» placeholders, filled on the
+# wire (each macro run its own, so concurrent requests each send their own token). Macro requests are
+# scope-checked like everything else.
+
 # Reports: findings grouped by alert type with description, solution, references, and the
 # request/response from history as evidence. False positives are left out by default.
 brainproxy report html -o report.html             # self-contained, no external assets

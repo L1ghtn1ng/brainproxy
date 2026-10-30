@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use brainproxy_core::auth::{AuthProfile, AuthSession, Secret, SessionState};
 use brainproxy_core::auth_record::{Mode, Recorded};
-use brainproxy_core::http::{Client, SendOptions};
+use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
+use brainproxy_core::session::{Action, ExtractFrom, Extractor, Macro, MacroStep, SessionRule, Tool};
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
 use clap::Subcommand;
@@ -18,7 +19,7 @@ use crate::output::Out;
 #[derive(Subcommand)]
 pub enum AuthCmd {
     /// Add or replace a profile. Use it with `--auth NAME` on send, fuzz, crawl,
-    /// scan active, and proxy start.
+    /// scan active, and proxy start. For a session with no login, start with `auth macro add`.
     #[command(after_help = "Form login: --login-url URL --login-body 'user={{username}}&pass={{password}}' \
         --username alice --password-env APP_PW. JSON bodies (starting with '{') are sent as application/json.\n\
         CSRF: --csrf-url PAGE --csrf-regex 'name=\"csrf\" value=\"([^\"]+)\"' fills {{csrf}}.\n\
@@ -66,6 +67,97 @@ pub enum AuthCmd {
     /// open a page only a logged-in user sees, then `record finish NAME --save`.
     #[command(subcommand)]
     Record(RecordCmd),
+    /// A profile's macros: requests run in order that extract values (a CSRF token, a
+    /// one-time code) for later steps and for session rules.
+    #[command(subcommand)]
+    Macro(MacroCmd),
+    /// A profile's session rules: what to do before requests of some tools to some URLs
+    /// go out with `--auth NAME` (check the session, run a macro, update the request, log in).
+    #[command(subcommand)]
+    Rule(RuleCmd),
+}
+
+#[derive(Subcommand)]
+pub enum MacroCmd {
+    /// Add or replace a macro. A profile that doesn't exist yet is made, with no login.
+    #[command(after_help = "Steps run in the order given, with the profile's session; cookies carry \
+        through. --step takes a history id, a raw request FILE (sent to its Host over --scheme), or \
+        ORIGIN=FILE (e.g. https://app.test:8443=req.txt).\n\
+        --extract STEP:VAR=KIND:EXPR takes a value from step STEP's response into VAR. KIND is regex \
+        (group 1), json (a path like data.token or items.0.id), header, cookie (a Set-Cookie), or input \
+        (an HTML <input name=EXPR>, or <meta name=EXPR content=...>).\n\
+        Later steps use a value as {{VAR}} (also {{username}} and {{password}}), and their parameters \
+        named VAR get it too. Example:\n  \
+        brainproxy auth macro add app csrf --step 12 --extract '1:csrf=input:csrf'")]
+    Add {
+        profile: String,
+        /// Macro name.
+        name: String,
+        /// A step: history id, FILE, or ORIGIN=FILE. Repeatable, in order.
+        #[arg(long = "step", required = true)]
+        steps: Vec<String>,
+        /// STEP:VAR=KIND:EXPR. Repeatable.
+        #[arg(long = "extract")]
+        extract: Vec<String>,
+        /// Scheme for FILE steps whose request line has no absolute URL.
+        #[arg(long, default_value = "https")]
+        scheme: String,
+    },
+    /// The profile's macros.
+    List { profile: String },
+    /// One macro with its requests and extractors.
+    Show { profile: String, name: String },
+    /// Run a macro now: each step's request, status, history id, and the values it
+    /// extracted (masked). The values become the session's latest.
+    Run {
+        profile: String,
+        name: String,
+        #[command(flatten)]
+        net: NetArgs,
+    },
+    /// Delete a macro (refused while a session rule runs it).
+    Remove { profile: String, name: String },
+}
+
+#[derive(Subcommand)]
+pub enum RuleCmd {
+    /// Add a session rule; its actions run in order before each matching request.
+    #[command(after_help = "Actions (--action, repeatable, in order):\n  \
+        check[:N]               fetch the profile's check URL (every Nth request); valid skips the rest\n  \
+        macro:NAME[:each|:N]    run a macro: once and again when its values go stale (default), on \
+        every request, or every Nth\n  \
+        update[:P[=VAR],...]    put macro values into the request: each query, form, JSON or multipart \
+        parameter, header or cookie P gets VAR (default: the variables of this rule's macros, into \
+        parameters of their names)\n  \
+        login                   log in again with the profile if the session is not logged in\n\
+        A response that looks logged out, or matches --invalid, refreshes the rule's macros (and \
+        logs in again) and the request is sent once more.\n\
+        Fresh CSRF token per request during a scan or fuzz run:\n  \
+        brainproxy auth rule add app --tool scan,fuzz --action macro:csrf:each --action update:csrf\n\
+        Re-login when a check every 20 requests fails:\n  \
+        brainproxy auth rule add app --action check:20 --action login")]
+    Add {
+        profile: String,
+        /// check[:N], macro:NAME[:each|:N], update[:PARAM[=VAR],...], or login. Repeatable, in order.
+        #[arg(long = "action", required = true)]
+        actions: Vec<String>,
+        /// Only for these tools: proxy, send, fuzz, crawl (also import), scan, checks (default: all).
+        #[arg(long = "tool", value_delimiter = ',')]
+        tools: Vec<String>,
+        /// Only for requests to this host pattern (*.example.com) or URL prefix (https://example.com/api/).
+        /// Without it, macro values only go to the origins of the macro that extracted them.
+        #[arg(long)]
+        url: Option<String>,
+        /// Regex marking a response rejected for stale values (e.g. "invalid csrf"): refresh and resend.
+        #[arg(long)]
+        invalid: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// The profile's session rules, in the order they run.
+    List { profile: String },
+    /// Delete a session rule by id.
+    Remove { profile: String, id: u32 },
 }
 
 #[derive(Subcommand)]
@@ -218,12 +310,15 @@ fn state_json(state: &SessionState) -> serde_json::Value {
         "token": state.token.is_some(),
         "last_login": state.last_login,
         "last_error": state.last_error,
+        "vars": state.vars.iter().map(|v| &v.name).collect::<Vec<_>>(),
     })
 }
 
 pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), Error> {
     match cmd {
         AuthCmd::Record(cmd) => record(project, home, cmd, out)?,
+        AuthCmd::Macro(cmd) => macro_cmd(project, cmd, out)?,
+        AuthCmd::Rule(cmd) => rule_cmd(project, cmd, out)?,
         AuthCmd::Add(a) => {
             let parse = |list: &[String]| {
                 list.iter().map(|h| crate::request_args::parse_header(h)).collect::<Result<Vec<_>, _>>()
@@ -366,8 +461,15 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
             });
         }
         AuthCmd::Show { name } => {
-            let (profile, state) = Store::open(project)?.auth_profile(&name)?;
-            let data = json!({"profile": profile.redacted(), "session": state_json(&state)});
+            let store = Store::open(project)?;
+            let (profile, state) = store.auth_profile(&name)?;
+            let handling = store.auth_handling(&name)?;
+            let data = json!({
+                "profile": profile.redacted(),
+                "session": state_json(&state),
+                "macros": handling.macros.iter().map(macro_summary).collect::<Vec<_>>(),
+                "rules": handling.rules,
+            });
             out.ok(data.clone(), || serde_json::to_string_pretty(&data).unwrap_or_default());
         }
         AuthCmd::Remove { name } => {
@@ -456,6 +558,259 @@ fn record(project: &Path, home: &Path, cmd: RecordCmd, out: &Out) -> Result<(), 
                 lines.extend(p.warnings.iter().map(|w| format!("  note:  {w}")));
                 lines.join("\n")
             });
+        }
+    }
+    Ok(())
+}
+
+fn macro_summary(m: &Macro) -> serde_json::Value {
+    json!({
+        "name": m.name,
+        "steps": m.steps.len(),
+        "vars": m.vars(),
+        "requests": m.steps.iter().map(step_line).collect::<Vec<_>>(),
+    })
+}
+
+/// "METHOD URL" of a macro step.
+fn step_line(s: &MacroStep) -> String {
+    let line = s.request.lines().next().unwrap_or("");
+    let mut parts = line.split(' ');
+    let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    if path.starts_with("http://") || path.starts_with("https://") {
+        format!("{method} {path}")
+    } else {
+        format!("{method} {}{path}", s.target.trim_end_matches('/'))
+    }
+}
+
+/// A macro step from `--step`: a history id, FILE, or ORIGIN=FILE.
+fn read_step(store: &Store, spec: &str, scheme: &str) -> Result<MacroStep, Error> {
+    if let Ok(id) = spec.trim().parse::<i64>() {
+        let h = store.get(id)?;
+        return Ok(MacroStep {
+            target: h.target.origin(),
+            request: String::from_utf8_lossy(&h.request).into_owned(),
+            history_id: Some(id),
+            extract: vec![],
+        });
+    }
+    let (origin, file) = match spec.split_once('=') {
+        Some((o, f)) if o.starts_with("http://") || o.starts_with("https://") => (Some(o), f),
+        _ => (None, spec),
+    };
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| Error::InvalidInput(format!("cannot read macro step {file:?}: {e}")))?;
+    let target = match origin {
+        Some(o) => Target::from_url(o)?,
+        None => RawRequest::from_bytes(text.clone().into_bytes()).infer_target(scheme)?,
+    };
+    Ok(MacroStep { target: target.origin(), request: text, history_id: None, extract: vec![] })
+}
+
+/// `STEP:VAR=KIND:EXPR`.
+fn parse_extract(spec: &str) -> Result<(usize, Extractor), Error> {
+    let bad =
+        || Error::InvalidInput(format!("--extract {spec:?}: expected STEP:VAR=KIND:EXPR, e.g. 1:csrf=input:csrf"));
+    let (step, rest) = spec.split_once(':').ok_or_else(bad)?;
+    let (var, rest) = rest.split_once('=').ok_or_else(bad)?;
+    let (kind, expr) = rest.split_once(':').ok_or_else(bad)?;
+    let step = step.trim().parse::<usize>().map_err(|_| bad())?;
+    let x = Extractor { var: var.trim().to_string(), from: ExtractFrom::parse(kind)?, expr: expr.to_string() };
+    Ok((step, x))
+}
+
+fn macro_cmd(project: &Path, cmd: MacroCmd, out: &Out) -> Result<(), Error> {
+    let store = Store::open(project)?;
+    match cmd {
+        MacroCmd::Add { profile, name, steps, extract, scheme } => {
+            let mut h = store.auth_handling(&profile)?;
+            let mut m = Macro {
+                name: name.clone(),
+                steps: steps.iter().map(|s| read_step(&store, s, &scheme)).collect::<Result<_, _>>()?,
+            };
+            for spec in &extract {
+                let (step, x) = parse_extract(spec)?;
+                let n = m.steps.len();
+                let s = step
+                    .checked_sub(1)
+                    .and_then(|i| m.steps.get_mut(i))
+                    .ok_or_else(|| Error::InvalidInput(format!("--extract {spec:?}: the macro has steps 1 to {n}")))?;
+                s.extract.push(x);
+            }
+            let replaced = h.macros.iter().any(|o| o.name == name);
+            h.macros.retain(|o| o.name != name);
+            h.macros.push(m.clone());
+            // A macro can start a profile with no login; `auth add` can set its options after.
+            let created = matches!(store.auth_profile(&profile), Err(Error::NotFound(_)));
+            if created {
+                store.auth_create_for_macros(&profile, &h)?;
+            } else {
+                store.auth_save_handling(&profile, &h)?;
+            }
+            let summary = macro_summary(&m);
+            out.ok(
+                json!({"profile": profile, "profile_created": created, "macro": summary, "replaced": replaced}),
+                || {
+                    format!(
+                    "macro {name:?} {} for {}{profile} ({} steps); try it: brainproxy auth macro run {profile} {name}",
+                    if replaced { "replaced" } else { "saved" },
+                    if created { "new profile " } else { "" },
+                    m.steps.len()
+                )
+                },
+            );
+        }
+        MacroCmd::List { profile } => {
+            store.auth_profile(&profile)?;
+            let items: Vec<_> = store.auth_handling(&profile)?.macros.iter().map(macro_summary).collect();
+            out.ok(json!({"profile": profile, "macros": items}), || {
+                items
+                    .iter()
+                    .map(|m| {
+                        format!("{:<20} {} steps  vars: {}", m["name"].as_str().unwrap_or(""), m["steps"], m["vars"])
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+        }
+        MacroCmd::Show { profile, name } => {
+            let h = store.auth_handling(&profile)?;
+            let m = h
+                .macros
+                .iter()
+                .find(|m| m.name == name)
+                .ok_or_else(|| Error::NotFound(format!("macro {name:?} of profile {profile:?}")))?;
+            let data = json!({"profile": profile, "macro": m});
+            out.ok(data.clone(), || serde_json::to_string_pretty(&data).unwrap_or_default());
+        }
+        MacroCmd::Run { profile, name, net } => {
+            let session = AuthSession::load(project, &profile, Client::new(net.send_options(project)?))?;
+            let run = runtime()?.block_on(session.run_macro(&name))?;
+            session.save()?;
+            let lines: Vec<String> = run
+                .steps
+                .iter()
+                .map(|s| {
+                    let mut line = format!(
+                        "{}. {} {} -> {}{}",
+                        s.step,
+                        s.method,
+                        s.url,
+                        s.status.map_or("no response".to_string(), |c| c.to_string()),
+                        s.history_id.map(|id| format!(" (history #{id})")).unwrap_or_default()
+                    );
+                    if let Some(e) = &s.error {
+                        line.push_str(&format!(" error: {e}"));
+                    }
+                    for x in &s.extracted {
+                        line.push_str(&format!("\n     {} = {}", x.var, x.value.as_deref().unwrap_or("(not found)")));
+                    }
+                    line
+                })
+                .collect();
+            if !run.complete() {
+                return Err(Error::InvalidInput(format!(
+                    "macro {name:?} did not complete (missing: {}):\n{}",
+                    run.missing.join(", "),
+                    lines.join("\n")
+                )));
+            }
+            out.ok(json!({"profile": profile, "run": run}), || lines.join("\n"));
+        }
+        MacroCmd::Remove { profile, name } => {
+            let mut h = store.auth_handling(&profile)?;
+            if !h.macros.iter().any(|m| m.name == name) {
+                return Err(Error::NotFound(format!("macro {name:?} of profile {profile:?}")));
+            }
+            let users: Vec<u32> = h
+                .rules
+                .iter()
+                .filter(|r| r.actions.iter().any(|a| matches!(a, Action::RunMacro { name: n, .. } if n == &name)))
+                .map(|r| r.id)
+                .collect();
+            if !users.is_empty() {
+                return Err(Error::InvalidInput(format!(
+                    "session rules {users:?} run macro {name:?}; remove them first (auth rule remove {profile} ID)"
+                )));
+            }
+            h.macros.retain(|m| m.name != name);
+            store.auth_save_handling(&profile, &h)?;
+            out.ok(json!({"profile": profile, "name": name, "removed": true}), || format!("macro {name:?} removed"));
+        }
+    }
+    Ok(())
+}
+
+fn rule_line(r: &SessionRule) -> String {
+    let tools = if r.tools.is_empty() {
+        "all tools".to_string()
+    } else {
+        r.tools.iter().map(|t| t.name()).collect::<Vec<_>>().join(",")
+    };
+    let actions: Vec<String> = r
+        .actions
+        .iter()
+        .map(|a| match a {
+            Action::Check { every } if *every > 1 => format!("check every {every}"),
+            Action::Check { .. } => "check".into(),
+            Action::RunMacro { name, every: 0 } => format!("macro {name}"),
+            Action::RunMacro { name, every: 1 } => format!("macro {name} each request"),
+            Action::RunMacro { name, every } => format!("macro {name} every {every}"),
+            Action::Update { params } if params.is_empty() => "update all".into(),
+            Action::Update { params } => format!(
+                "update {}",
+                params
+                    .iter()
+                    .map(|(p, v)| if p == v { p.clone() } else { format!("{p}={v}") })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Action::Login => "login".into(),
+        })
+        .collect();
+    format!("#{:<3} {:<28} {:<24} {}", r.id, tools, r.url.as_deref().unwrap_or("any URL"), actions.join(" -> "))
+}
+
+fn rule_cmd(project: &Path, cmd: RuleCmd, out: &Out) -> Result<(), Error> {
+    let store = Store::open(project)?;
+    match cmd {
+        RuleCmd::Add { profile, actions, tools, url, invalid, description } => {
+            let mut h = store.auth_handling(&profile)?;
+            let mut tools = tools.iter().map(|t| Tool::parse(t)).collect::<Result<Vec<_>, _>>()?;
+            tools.dedup();
+            let rule = SessionRule {
+                id: h.rules.iter().map(|r| r.id).max().unwrap_or(0) + 1,
+                description: description.unwrap_or_default(),
+                tools,
+                url,
+                actions: actions.iter().map(|a| Action::parse(a)).collect::<Result<_, _>>()?,
+                invalid,
+            };
+            h.rules.push(rule.clone());
+            store.auth_save_handling(&profile, &h)?;
+            out.ok(json!({"profile": profile, "rule": rule}), || format!("session rule added: {}", rule_line(&rule)));
+        }
+        RuleCmd::List { profile } => {
+            store.auth_profile(&profile)?;
+            let rules = store.auth_handling(&profile)?.rules;
+            out.ok(json!({"profile": profile, "rules": rules}), || {
+                if rules.is_empty() {
+                    format!("{profile} has no session rules")
+                } else {
+                    rules.iter().map(rule_line).collect::<Vec<_>>().join("\n")
+                }
+            });
+        }
+        RuleCmd::Remove { profile, id } => {
+            let mut h = store.auth_handling(&profile)?;
+            let before = h.rules.len();
+            h.rules.retain(|r| r.id != id);
+            if h.rules.len() == before {
+                return Err(Error::NotFound(format!("session rule {id} of profile {profile:?}")));
+            }
+            store.auth_save_handling(&profile, &h)?;
+            out.ok(json!({"profile": profile, "id": id, "removed": true}), || format!("session rule {id} removed"));
         }
     }
     Ok(())

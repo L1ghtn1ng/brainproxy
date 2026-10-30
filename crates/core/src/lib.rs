@@ -21,6 +21,7 @@ pub mod oob;
 pub mod proxy;
 pub mod race;
 pub mod scan;
+pub mod session;
 pub mod store;
 pub mod update;
 pub mod wordlists;

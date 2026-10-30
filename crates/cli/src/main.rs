@@ -398,6 +398,18 @@ fn command_name(cmd: &Cmd) -> String {
             auth_cmd::AuthCmd::Remove { .. } => "auth remove",
             auth_cmd::AuthCmd::Record(auth_cmd::RecordCmd::Start { .. }) => "auth record start",
             auth_cmd::AuthCmd::Record(auth_cmd::RecordCmd::Finish { .. }) => "auth record finish",
+            auth_cmd::AuthCmd::Macro(c) => match c {
+                auth_cmd::MacroCmd::Add { .. } => "auth macro add",
+                auth_cmd::MacroCmd::List { .. } => "auth macro list",
+                auth_cmd::MacroCmd::Show { .. } => "auth macro show",
+                auth_cmd::MacroCmd::Run { .. } => "auth macro run",
+                auth_cmd::MacroCmd::Remove { .. } => "auth macro remove",
+            },
+            auth_cmd::AuthCmd::Rule(c) => match c {
+                auth_cmd::RuleCmd::Add { .. } => "auth rule add",
+                auth_cmd::RuleCmd::List { .. } => "auth rule list",
+                auth_cmd::RuleCmd::Remove { .. } => "auth rule remove",
+            },
         },
         Cmd::Job(_) => "job",
         Cmd::Oob(c) => match c {
@@ -535,7 +547,11 @@ fn send(project: &Path, args: SendArgs, out: &Out) -> Result<(), Error> {
     if let Some(n) = args.race {
         // Every racing request carries the same session, applied once.
         let req = match &session {
-            Some(s) => RawRequest::from_bytes(s.apply(req.as_bytes(), &[])),
+            Some(s) => {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(Error::Io)?;
+                let tool = brainproxy_core::session::Tool::Send;
+                RawRequest::from_bytes(rt.block_on(s.prepare(tool, &target, req.as_bytes(), &[], &[])).request)
+            }
             None => req,
         };
         return race(project, &args, req, target, client, n, out);

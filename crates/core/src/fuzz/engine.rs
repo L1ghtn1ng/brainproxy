@@ -17,6 +17,7 @@ use crate::fuzz::plan::{Plan, Template};
 use crate::http::client::final_response;
 use crate::http::request::split_head_body;
 use crate::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
+use crate::session::Tool;
 use crate::store::Store;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -127,17 +128,30 @@ pub async fn run(
     let matched_stop = Arc::new(AtomicBool::new(false));
     let limiter = cfg.rate.filter(|r| *r > 0.0).map(|r| Arc::new(Limiter::new(r)));
     let client = Arc::new(Client::new(cfg.send.clone()));
-    // Cookies that carry a payload must keep it rather than get the session's value.
-    let fuzzed_cookies: Arc<Vec<String>> = Arc::new(if cfg.auth.is_some() {
+    // Cookies and parameters that carry a payload must keep it rather than get the
+    // session's value or a session rule's.
+    let fuzzed: Arc<(Vec<String>, Vec<String>)> = Arc::new(if cfg.auth.is_some() {
         const SENTINEL: &str = "BPFUZZSENTINEL7q";
         let values = vec![SENTINEL.as_bytes(); template.positions()];
-        request_cookies(&template.render(&values))
+        let rendered = template.render(&values);
+        let cookies =
+            request_cookies(&rendered).into_iter().filter(|(_, v)| v.contains(SENTINEL)).map(|(k, _)| k).collect();
+        let mut params: Vec<String> = crate::scan::active::points::points(&rendered, &Default::default())
             .into_iter()
-            .filter(|(_, v)| v.contains(SENTINEL))
-            .map(|(k, _)| k)
-            .collect()
+            .filter(|p| p.value.contains(SENTINEL))
+            .map(|p| p.name.rsplit('.').next().unwrap_or(&p.name).to_string())
+            .collect();
+        for (name, range) in crate::session::multipart_fields(&rendered) {
+            if String::from_utf8_lossy(&rendered[range]).contains(SENTINEL) {
+                params.push(name);
+            }
+        }
+        if let Ok(h) = RawRequest::from_bytes(rendered).head() {
+            params.extend(h.headers.into_iter().filter(|(_, v)| v.contains(SENTINEL)).map(|(k, _)| k));
+        }
+        (cookies, params)
     } else {
-        Vec::new()
+        Default::default()
     });
     let (template, plan, target, cfg) = (Arc::new(template), Arc::new(plan), Arc::new(target), Arc::new(cfg));
 
@@ -165,8 +179,8 @@ pub async fn run(
         let (next, stop, matched_stop, limiter, client, tx) =
             (next.clone(), stop.clone(), matched_stop.clone(), limiter.clone(), client.clone(), tx.clone());
         let url_positions = url_positions.clone();
-        let (template, plan, target, cfg, compiled, fuzzed_cookies) =
-            (template.clone(), plan.clone(), target.clone(), cfg.clone(), compiled.clone(), fuzzed_cookies.clone());
+        let (template, plan, target, cfg, compiled, fuzzed) =
+            (template.clone(), plan.clone(), target.clone(), cfg.clone(), compiled.clone(), fuzzed.clone());
         workers.push(tokio::spawn(async move {
             loop {
                 if stop.load(Ordering::Relaxed) {
@@ -192,20 +206,23 @@ pub async fn run(
                 if cfg.update_content_length {
                     request = RawRequest::from_bytes(request).update_content_length().into_bytes();
                 }
-                let keep: Vec<&str> = fuzzed_cookies.iter().map(String::as_str).collect();
+                let keep_cookies: Vec<&str> = fuzzed.0.iter().map(String::as_str).collect();
+                let keep_params: Vec<&str> = fuzzed.1.iter().map(String::as_str).collect();
                 let rendered = request.clone();
-                let generation = cfg.auth.as_ref().map(|a| a.generation()).unwrap_or(0);
+                let mut prepared = None;
                 if let Some(a) = &cfg.auth {
-                    request = a.apply(&rendered, &keep);
+                    let p = a.prepare(Tool::Fuzz, &target, &rendered, &keep_cookies, &keep_params).await;
+                    request = p.request.clone();
+                    prepared = Some(p);
                 }
 
                 let mut started = Instant::now();
                 let mut result = exchange(&client, &target, &request).await;
-                if let (Some(a), Ok(response)) = (&cfg.auth, &result) {
-                    a.observe(response);
-                    // Session lost: log in again (once across workers) and retry this payload.
-                    if a.is_logged_out(response) && a.relogin(generation).await {
-                        request = a.apply(&rendered, &keep);
+                if let (Some(a), Some(p), Ok(response)) = (&cfg.auth, &prepared, &result) {
+                    // Session lost or stale session values: log in again or refresh them
+                    // (once across workers) and retry this payload.
+                    if a.after_response(p, response).await {
+                        request = a.prepare(Tool::Fuzz, &target, &rendered, &keep_cookies, &keep_params).await.request;
                         started = Instant::now();
                         result = exchange(&client, &target, &request).await;
                         if let Ok(r) = &result {

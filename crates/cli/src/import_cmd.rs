@@ -9,6 +9,7 @@ use brainproxy_core::auth::AuthSession;
 use brainproxy_core::capture::decode_body;
 use brainproxy_core::http::request::split_head_body;
 use brainproxy_core::http::{parse_response_head, Client, RawRequest, SendOptions, Target};
+use brainproxy_core::session::Tool;
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
 use clap::Subcommand;
@@ -320,7 +321,7 @@ impl Fetcher<'_> {
         let (req, target): (RawRequest, Target) = RawRequest::build(method, url, &headers, body)?;
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let ex = match self.auth {
-            Some(a) => rt.block_on(a.send(&req, &target))?,
+            Some(a) => rt.block_on(a.send_as(Tool::Crawl, &req, &target))?,
             None => rt.block_on(Client::new(self.send.clone()).send(&req, &target))?,
         };
         Store::open(self.project)?.record_exchange(apiimport::SOURCE, &ex)?;

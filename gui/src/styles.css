@@ -2307,3 +2307,57 @@ button.chip {
   padding-left: 20px;
   line-height: 1.8;
 }
+
+/* Settings › Auth profiles: macros and session rules */
+.sh-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  max-width: 900px;
+  /* Long URLs and wide rows wrap or scroll inside; they don't widen the profile pane. */
+  contain: inline-size;
+}
+.sh-steps {
+  margin: 6px 0;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sh-pick {
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin: 6px 0;
+}
+.sh-n {
+  min-width: 1.5em;
+  font-weight: 600;
+}
+.sh-kind {
+  min-width: 7em;
+}
+.sh-num {
+  width: 5em;
+}
+.sh-extract {
+  margin: 4px 0;
+  flex-wrap: wrap;
+}
+.sh-card .row {
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.sh-card .row > .input {
+  flex: 0 1 140px;
+  min-width: 0;
+}
+.sh-card .row > .input.grow {
+  flex: 1 1 200px;
+}
+.detail h4 {
+  margin: 10px 0 4px;
+  font-size: 12px;
+}

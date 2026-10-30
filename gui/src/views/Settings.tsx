@@ -26,6 +26,8 @@ import {
   type PlatformForm,
   type UpstreamForm,
 } from "./connection";
+import { MacroBuilder, SessionHandling } from "./SessionHandling";
+import type { MacroSummary, SessionRule } from "./sessionHandling";
 import NOTICE from "../../../NOTICE?raw";
 
 type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "data" | "project" | "licenses";
@@ -125,6 +127,8 @@ interface Session {
   token: boolean;
   last_login: string | null;
   last_error: string | null;
+  /** Names of the values its macros extracted. */
+  vars?: string[];
 }
 
 interface Profile {
@@ -274,16 +278,24 @@ function SessionState({ s }: { s: Session }) {
   );
 }
 
+interface Shown {
+  profile: Profile;
+  session: Session;
+  macros: MacroSummary[];
+  rules: SessionRule[];
+}
+
 function Auth() {
   const app = useApp();
   const exec = useRunner();
   const [list, setList] = useState<ProfileItem[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [shown, setShown] = useState<{ profile: Profile; session: Session } | null>(null);
+  const [shown, setShown] = useState<Shown | null>(null);
   const [check, setCheck] = useState<{ url: string; status: number | null; logged_in: boolean } | null>(null);
   const [form, setForm] = useState<Form | null>(null);
   const [editing, setEditing] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [macroProfile, setMacroProfile] = useState<string | null>(null);
   const [busy, setBusy] = useState("");
 
   const load = async () => {
@@ -291,7 +303,7 @@ function Auth() {
     if (d) setList(d.profiles);
   };
   const show = async (name: string) => {
-    const d = await exec<{ profile: Profile; session: Session }>(["auth", "show", "--", name]);
+    const d = await exec<Shown>(["auth", "show", "--", name]);
     if (d) setShown(d);
   };
   useEffect(() => {
@@ -346,6 +358,7 @@ function Auth() {
             title="Log in once in a browser; brainproxy works out the profile"
             onClick={() => {
               setForm(null);
+              setMacroProfile(null);
               setRecording(true);
             }}
           >
@@ -355,11 +368,23 @@ function Auth() {
             className="btn"
             onClick={() => {
               setRecording(false);
+              setMacroProfile(null);
               setEditing(false);
               setForm({ ...EMPTY_FORM });
             }}
           >
             New profile
+          </button>
+          <button
+            className="btn"
+            title="A session with no login: its macros and rules make it"
+            onClick={() => {
+              setRecording(false);
+              setForm(null);
+              setMacroProfile("");
+            }}
+          >
+            New macro profile
           </button>
           <span className="grow" />
           <span className="muted">{list.length} profiles</span>
@@ -375,6 +400,7 @@ function Auth() {
               onClick={() => {
                 setForm(null);
                 setRecording(false);
+                setMacroProfile(null);
                 setSelected(p.name);
               }}
             >
@@ -397,6 +423,29 @@ function Auth() {
             load();
           }}
         />
+      ) : macroProfile !== null ? (
+        <div className="detail">
+          <div className="detail-head">
+            <h2>New macro profile</h2>
+          </div>
+          <p className="muted small">A profile with no login: its macros and session rules make the session. Edit it afterwards to add a check URL or username.</p>
+          <div className="form">
+            <Field label="Profile name">
+              <input className="input" value={macroProfile} onChange={(e) => setMacroProfile(e.target.value)} />
+            </Field>
+          </div>
+          <MacroBuilder
+            profile={macroProfile.trim()}
+            onCancel={() => setMacroProfile(null)}
+            onSaved={() => {
+              const name = macroProfile.trim();
+              setMacroProfile(null);
+              setSelected(name);
+              show(name);
+              load();
+            }}
+          />
+        </div>
       ) : form ? (
         <div className="detail">
           <div className="detail-head">
@@ -562,6 +611,12 @@ function Auth() {
             <dd className="mono">{shown.session.cookies.join(", ") || "none"}</dd>
             <dt>Token</dt>
             <dd>{shown.session.token ? "captured" : "none"}</dd>
+            {!!shown.session.vars?.length && (
+              <>
+                <dt>Macro values</dt>
+                <dd className="mono">{shown.session.vars.join(", ")}</dd>
+              </>
+            )}
             <dt>Last login</dt>
             <dd>{shown.session.last_login ?? "never"}</dd>
             {shown.session.last_error && (
@@ -607,6 +662,14 @@ function Auth() {
                 </Fragment>
               ))}
           </dl>
+          <SessionHandling
+            profile={shown.profile.name}
+            macros={shown.macros ?? []}
+            rules={shown.rules ?? []}
+            hasCheckUrl={!!shown.profile.check_url}
+            hasLogin={!!shown.profile.login_url}
+            onChange={() => show(shown.profile.name)}
+          />
           <p className="muted small">
             Use it with <span className="mono">--auth {shown.profile.name}</span> on send, fuzz, crawl, scan active, and proxy start.
           </p>

@@ -33,6 +33,7 @@ use crate::jobs::JobControl;
 use crate::oob::{self, Endpoint, Payload, ScanPayload};
 use crate::scan::active::source_sink::{Sink, SourceSink};
 use crate::scan::{AlertDef, Finding, Message};
+use crate::session::Tool;
 use crate::store::Store;
 pub use points::{InsertionPoint, PointKind, PointOptions};
 
@@ -238,6 +239,8 @@ pub struct Cx {
     base: Arc<Base>,
     point: Option<InsertionPoint>,
     shared: Arc<Shared>,
+    /// Which session rules apply: a ported rule's (scan) or a declarative check's (checks).
+    tool: Tool,
 }
 
 impl Cx {
@@ -349,13 +352,17 @@ impl Cx {
             let ex = self.shared.client.send(&RawRequest::from_bytes(request), target).await?;
             return Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms));
         };
-        let attacked_cookie = self.point.as_ref().filter(|p| p.kind == PointKind::Cookie).map(|p| p.name.as_str());
-        let keep: Vec<&str> = attacked_cookie.into_iter().collect();
-        let generation = auth.generation();
-        let mut ex = self.shared.client.send(&RawRequest::from_bytes(auth.apply(&request, &keep)), target).await?;
-        auth.observe(&ex.response);
-        if auth.is_logged_out(&ex.response) && auth.relogin(generation).await {
-            ex = self.shared.client.send(&RawRequest::from_bytes(auth.apply(&request, &keep)), target).await?;
+        // The attacked cookie or parameter keeps its payload.
+        let (cookie, param): (Vec<&str>, Vec<&str>) = match &self.point {
+            Some(p) if p.kind == PointKind::Cookie => (vec![p.name.as_str()], vec![]),
+            Some(p) => (vec![], vec![p.name.rsplit('.').next().unwrap_or(&p.name)]),
+            None => (vec![], vec![]),
+        };
+        let prepared = auth.prepare(self.tool, target, &request, &cookie, &param).await;
+        let mut ex = self.shared.client.send(&RawRequest::from_bytes(prepared.request.clone()), target).await?;
+        if auth.after_response(&prepared, &ex.response).await {
+            let again = auth.prepare(self.tool, target, &request, &cookie, &param).await;
+            ex = self.shared.client.send(&RawRequest::from_bytes(again.request), target).await?;
             auth.observe(&ex.response);
         }
         Response::parse(ex.request, ex.response, Duration::from_millis(ex.duration_ms))
@@ -702,6 +709,8 @@ pub async fn run(
     let ids: HashSet<u32> = rules.iter().map(|r| r.id()).collect();
     rules.retain(|r| r.depends_on().iter().all(|d| ids.contains(d)));
     rules.extend(cfg.checks.iter().copied());
+    // Session rules tell the ported rules (scan) from declarative checks (checks).
+    let check_ids: HashSet<u32> = cfg.checks.iter().map(|c| c.id()).collect();
     if rules.is_empty() {
         return Err(Error::InvalidInput("no active rules or checks selected".into()));
     }
@@ -804,6 +813,7 @@ pub async fn run(
     let mut tasks = Vec::with_capacity(units.len());
     for (base, rule, point) in units {
         let (shared, sem, done, ctl, left) = (shared.clone(), sem.clone(), done.clone(), ctl.clone(), left.clone());
+        let tool = if check_ids.contains(&rule.id()) { Tool::Checks } else { Tool::Scan };
         tasks.push(tokio::spawn(async move {
             // Counts the unit as finished even when the rule panics.
             let _finished = Finished(&left[&rule.id()]);
@@ -813,7 +823,7 @@ pub async fn run(
                 }
             }
             let Ok(_permit) = sem.acquire().await else { return };
-            let cx = Cx { base, point, shared: shared.clone() };
+            let cx = Cx { base, point, shared: shared.clone(), tool };
             if !cx.stopped() {
                 rule.scan(&cx).await;
             }
