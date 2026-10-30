@@ -5,8 +5,8 @@
 //! they start.
 //!
 //! None of them widens the engagement scope. Every target is still resolved and
-//! checked by the [`crate::guard::Guard`] (an override replaces DNS, and the
-//! overridden address is checked like a DNS answer), and an upstream proxy is told
+//! checked by the [`crate::guard::Guard`] (an override replaces DNS, its address is
+//! checked, and an internal one must be listed by address), and an upstream proxy is told
 //! to connect to the checked address, never the name, so it can't reach an address
 //! the guard didn't check. The proxy itself must be on this machine or listed in
 //! every scope's `proxies` (see [`crate::guard::Guard::resolve_proxy`]).
@@ -243,7 +243,7 @@ impl ConnectionSettings {
     }
 }
 
-fn valid_name(h: &str) -> bool {
+pub(crate) fn valid_name(h: &str) -> bool {
     !h.is_empty()
         && h.len() <= 253
         && h.split('.').all(|l| {

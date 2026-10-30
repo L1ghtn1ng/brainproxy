@@ -300,7 +300,11 @@ async fn pass_through<S: AsyncRead + AsyncWrite + Unpin>(ctx: &Arc<Ctx>, mut cli
 /// comes from the ClientHello's SNI (or the redirect target), port 443.
 async fn serve_invisible_tls(ctx: &Arc<Ctx>, mut tcp: TcpStream) -> Result<()> {
     let (hello, handshake) = read_client_hello(&mut tcp).await?;
+    // From the client, so checked before it is used for routing or a certificate.
     let sni = sni_from_client_hello(&handshake);
+    if let Some(name) = sni.as_deref().filter(|n| !valid_client_host(n) || n.parse::<std::net::IpAddr>().is_ok()) {
+        return Err(Error::Protocol(format!("invisible proxy: bad TLS server name {name:?}")));
+    }
     let target = match (&ctx.redirect, &sni) {
         (Some(r), _) => r.clone(),
         (None, Some(name)) => Target::from_url(&format!("https://{name}:443"))
@@ -653,6 +657,9 @@ fn resolve_target(raw: Vec<u8>, default_target: Option<&Target>, by_host: bool) 
             .map(|(_, v)| v.trim().to_string())
             .filter(|h| !h.is_empty())
             .ok_or_else(|| Error::InvalidInput("invisible proxy: the request has no Host header".into()))?;
+        if !valid_authority(&host) {
+            return Err(Error::InvalidInput(format!("invisible proxy: bad Host header {host:?}")));
+        }
         let target = Target::from_url(&format!("http://{host}"))
             .map_err(|_| Error::InvalidInput(format!("invisible proxy: bad Host header {host:?}")))?;
         return Ok((target, req.into_bytes()));
@@ -672,6 +679,26 @@ fn resolve_target(raw: Vec<u8>, default_target: Option<&Target>, by_host: bool) 
     out.extend_from_slice(&bytes[line_end..]);
     let req = RawRequest::from_bytes(out).remove_header("Proxy-Connection").remove_header("Proxy-Authorization");
     Ok((target, req.into_bytes()))
+}
+
+/// A host name from a client (SNI, Host header): DNS characters only, with at most one
+/// trailing dot. The URL parser would otherwise read `a@b` as host `b` and `a/b` as host `a`.
+fn valid_client_host(host: &str) -> bool {
+    crate::connection::valid_name(host.strip_suffix('.').unwrap_or(host))
+}
+
+/// A Host header value: `host`, `host:port`, `[v6]`, or `[v6]:port`.
+fn valid_authority(value: &str) -> bool {
+    let port_ok = |p: &str| p.parse::<u16>().is_ok();
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((ip, after)) = rest.split_once(']') else { return false };
+        return ip.parse::<std::net::Ipv6Addr>().is_ok()
+            && (after.is_empty() || after.strip_prefix(':').is_some_and(port_ok));
+    }
+    match value.split_once(':') {
+        Some((host, port)) => valid_client_host(host) && port_ok(port),
+        None => valid_client_host(value),
+    }
 }
 
 /// An upstream exchange: the HTTP/1.1 connection to pool (none for HTTP/2),
@@ -861,6 +888,28 @@ mod tests {
         let (t, _) = resolve_target(b"GET /x HTTP/1.1\r\nHost: b.test:81\r\n\r\n".to_vec(), None, true).unwrap();
         assert_eq!(t.origin(), "http://b.test:81");
         assert!(resolve_target(b"GET /x HTTP/1.1\r\n\r\n".to_vec(), None, true).is_err());
+        for good in ["b.test", "b.test.", "b.test:81", "10.0.0.5:80", "[::1]", "[::1]:81"] {
+            assert!(valid_authority(good), "{good}");
+        }
+        for bad in [
+            "a@b.test",
+            "a/b",
+            "a b",
+            "b.test:99999",
+            "b.test:1:2",
+            "[::1",
+            "[nope]",
+            "[::1]x",
+            "b.test:",
+            "é.test",
+            "a?b",
+            "a#b",
+            "",
+        ] {
+            assert!(!valid_authority(bad), "{bad}");
+            let req = format!("GET /x HTTP/1.1\r\nHost: {bad}\r\n\r\n").into_bytes();
+            assert!(resolve_target(req, None, true).is_err(), "{bad}");
+        }
     }
 
     #[test]

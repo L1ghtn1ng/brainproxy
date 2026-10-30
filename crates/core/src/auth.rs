@@ -130,7 +130,7 @@ impl AuthProfile {
             return Err(Error::InvalidInput("profile needs --login-url, --platform, or at least one --header".into()));
         }
         if let Some(p) = &self.platform {
-            p.validate()?;
+            p.validate(self.username.as_deref(), self.password.as_ref())?;
         }
         for (what, re) in [
             ("csrf", &self.csrf_regex),

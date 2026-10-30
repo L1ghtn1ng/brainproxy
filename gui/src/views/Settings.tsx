@@ -710,7 +710,8 @@ function Connections() {
 
       <h3>Host overrides</h3>
       <p className="muted small">
-        Like /etc/hosts: connect to this address for the name. The scope is checked on the address as on a DNS answer;
+        Like /etc/hosts: connect to this address for the name. The name must be in scope, and a private, loopback, or
+        link-local address must also be listed in the scope by address. A public address needs no listing;
         TLS SNI and the Host header stay the name.
       </p>
       <table className="set-table">

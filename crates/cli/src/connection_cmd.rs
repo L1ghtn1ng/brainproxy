@@ -38,8 +38,9 @@ pub enum ConnectionCmd {
     /// Host name overrides (like /etc/hosts): connect to IP for HOST without asking DNS.
     #[command(
         subcommand,
-        after_help = "The scope is checked on the overridden address exactly as on a DNS answer: a name allowed by a \
-        wildcard still can't reach a private or loopback address unless the scope lists it. SNI and Host stay the name."
+        after_help = "The name must be in scope, and an internal address (private, loopback, link-local) must be listed \
+        in the scope by address, also for a name listed exactly. Public addresses need no listing. SNI and Host stay \
+        the name."
     )]
     Hosts(HostsCmd),
     /// Client TLS certificates for mutual TLS, by host pattern (first match wins).
@@ -245,11 +246,11 @@ fn view(store: &Store, s: &ConnectionSettings) -> Result<Value, Error> {
         }
     }
     if let Ok(guard) = store.guard() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         for r in &s.upstream {
             let Some(url) = &r.proxy else { continue };
             let p = UpstreamProxy::parse(url, r.username.clone(), r.password_env.clone())?;
-            if let Err(e) = rt.block_on(guard.resolve_proxy(&p.host, p.port)) {
+            // No DNS here (this is what `connection show` runs): `connection route` does the full check.
+            if let Err(e) = guard.precheck_proxy(&p.host, p.port) {
                 warnings.push(format!("upstream {}: {e}", r.host));
             }
         }

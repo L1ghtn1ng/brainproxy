@@ -12,7 +12,7 @@ use md5::Md5;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::auth::AuthProfile;
+use crate::auth::{AuthProfile, Secret};
 use crate::connection::HostPattern;
 use crate::error::{Error, Result};
 use crate::http::parse_response_head;
@@ -55,9 +55,17 @@ pub struct PlatformAuth {
 }
 
 impl PlatformAuth {
-    pub fn validate(&self) -> Result<()> {
+    /// Checks the section with the profile's credentials, which it needs: without
+    /// them a challenge would be answered with an empty login.
+    pub fn validate(&self, username: Option<&str>, password: Option<&Secret>) -> Result<()> {
         if self.hosts.is_empty() {
             return Err(Error::InvalidInput("platform authentication needs at least one --platform-host".into()));
+        }
+        if username.is_none_or(|u| u.rsplit('\\').next().unwrap_or_default().trim().is_empty()) {
+            return Err(Error::InvalidInput("platform authentication needs --username".into()));
+        }
+        if password.is_none_or(|p| matches!(p, Secret::Literal(s) | Secret::Env(s) if s.is_empty())) {
+            return Err(Error::InvalidInput("platform authentication needs --password-env or --password".into()));
         }
         for h in &self.hosts {
             HostPattern::parse(h)?;
@@ -67,7 +75,6 @@ impl PlatformAuth {
 }
 
 /// Platform credentials ready to use.
-#[derive(Debug)]
 pub struct PlatformCred {
     pub profile: String,
     pub scheme: PlatformScheme,
@@ -76,6 +83,20 @@ pub struct PlatformCred {
     domain: String,
     /// The password, or why it isn't available (variable unset).
     password: std::result::Result<String, String>,
+}
+
+/// Without the password: this ends up in any debug output of the connection options.
+impl std::fmt::Debug for PlatformCred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlatformCred")
+            .field("profile", &self.profile)
+            .field("scheme", &self.scheme)
+            .field("hosts", &self.hosts)
+            .field("username", &self.username)
+            .field("domain", &self.domain)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 impl PlatformCred {
@@ -90,9 +111,17 @@ impl PlatformCred {
                 (None, Some((d, u))) => (d.to_string(), u.to_string()),
                 (None, None) => (String::new(), raw_user.clone()),
             };
+            // Never answer a challenge with an empty login, whatever a stored profile says.
             let password = match &p.password {
-                Some(s) => s.resolve().map_err(|e| e.to_string()),
-                None => Ok(String::new()),
+                Some(_) if username.is_empty() => Err("no username".to_string()),
+                Some(s) => s.resolve().map_err(|e| e.to_string()).and_then(|pw| {
+                    if pw.is_empty() {
+                        Err("the password is empty".to_string())
+                    } else {
+                        Ok(pw)
+                    }
+                }),
+                None => Err("no password".to_string()),
             };
             Ok(Self { profile: p.name.clone(), scheme: platform.scheme, hosts, username, domain, password })
         })())

@@ -263,7 +263,7 @@ async fn proxies_off_this_machine_need_every_scope_to_list_them() {
 }
 
 #[tokio::test]
-async fn host_overrides_are_checked_like_dns_answers() {
+async fn host_overrides_to_internal_addresses_must_be_listed() {
     let server = echo_server().await;
     let overrides = |ip: &str| {
         ConnectionSettings {
@@ -280,9 +280,56 @@ async fn host_overrides_are_checked_like_dns_answers() {
     let names = Guard::from_specs(vec![spec(&["app.test", "*.wild.test"])]).unwrap();
     names.net.set(overrides("127.0.0.1"));
     let e = names.resolve("app.test", server).await.unwrap_err();
-    assert!(e.to_string().contains("internal address 127.0.0.1"), "{e}");
+    assert!(e.to_string().contains("host override app.test -> 127.0.0.1"), "{e}");
     // A wildcard can't reach a private address through an override either.
     assert!(names.resolve("x.wild.test", 80).await.is_err());
+    // Nor can an exact name, though a DNS answer for it may be private: whoever runs
+    // brainproxy chooses an override, so every internal kind must be listed by address.
+    for ip in [
+        "10.0.0.7",
+        "172.16.0.1",
+        "192.168.1.1",
+        "fd12::1",
+        "::ffff:10.0.0.7",
+        "64:ff9b::a00:7",
+        "127.0.0.1",
+        "::1",
+        "::ffff:127.0.0.1",
+        "0.0.0.0",
+        "169.254.169.254",
+        "fe80::1",
+        "fd00:ec2::254",
+        "100.100.100.200",
+    ] {
+        names.net.set(overrides(ip));
+        let e = names.resolve("app.test", 443).await.unwrap_err();
+        assert!(matches!(e, Error::OutOfScope(_)) && e.to_string().contains("host override"), "{ip}: {e}");
+    }
+    // `localhost` by name means this machine for DNS, not any loopback address by override.
+    let local = Guard::from_specs(vec![spec(&["localhost"])]).unwrap();
+    let to_loopback = ConnectionSettings {
+        hosts: vec![HostOverride { host: "localhost".into(), ip: "127.0.0.2".parse().unwrap() }],
+        ..Default::default()
+    };
+    local.net.set(to_loopback.compile(vec![]).unwrap());
+    assert!(local.resolve("localhost", 80).await.is_err());
+    // Listed by address, on that entry's port only, and by every scope.
+    let listed = Guard::from_specs(vec![spec(&["app.test", "10.0.0.0/24:443"])]).unwrap();
+    listed.net.set(overrides("10.0.0.7"));
+    assert_eq!(listed.resolve("app.test", 443).await.unwrap(), vec!["10.0.0.7:443".parse().unwrap()]);
+    assert!(listed.resolve("app.test", 80).await.is_err());
+    let one_scope = Guard::from_specs(vec![spec(&["app.test", "10.0.0.7"]), spec(&["app.test"])]).unwrap();
+    one_scope.net.set(overrides("10.0.0.7"));
+    assert!(one_scope.resolve("app.test", 443).await.is_err());
+    // An override can't redirect a proxy listed by name either.
+    let by_name =
+        Guard::from_specs_with_proxies(vec![(spec(&["app.test"]), vec!["proxy.invalid:3128".into()])]).unwrap();
+    let redirect = ConnectionSettings {
+        hosts: vec![HostOverride { host: "proxy.invalid".into(), ip: "93.184.216.34".parse().unwrap() }],
+        ..Default::default()
+    };
+    by_name.net.set(redirect.compile(vec![]).unwrap());
+    assert!(by_name.resolve_proxy("proxy.invalid", 3128).await.is_err(), "not sent to the overridden address");
     // Public address, exact name: allowed, without DNS.
     names.net.set(overrides("93.184.216.34"));
     assert_eq!(names.resolve("APP.test.", 443).await.unwrap(), vec!["93.184.216.34:443".parse().unwrap()]);
@@ -439,6 +486,44 @@ fn platform_cred(scheme: PlatformScheme, user: &str, password: &str) -> Platform
         ..Default::default()
     };
     PlatformCred::from_profile(&p).unwrap().unwrap()
+}
+
+#[test]
+fn debug_output_has_no_platform_password() {
+    let cred = platform_cred(PlatformScheme::Basic, "alice", "hunter2-secret");
+    assert!(!format!("{cred:?}").contains("hunter2-secret"));
+    let compiled = ConnectionSettings::default().compile(vec![cred]).unwrap();
+    let shown = format!("{compiled:?}");
+    assert!(shown.contains("alice") && !shown.contains("hunter2-secret"), "{shown}");
+}
+
+#[test]
+fn platform_profiles_need_a_username_and_password() {
+    use crate::auth::{AuthProfile, Secret};
+    let profile = |user: Option<&str>, password: Option<Secret>| AuthProfile {
+        name: "corp".into(),
+        username: user.map(str::to_string),
+        password,
+        platform: Some(PlatformAuth { scheme: PlatformScheme::Basic, hosts: vec!["*".into()], domain: None }),
+        ..Default::default()
+    };
+    let pw = || Some(Secret::Env("PW".into()));
+    assert!(profile(Some("alice"), pw()).validate().is_ok());
+    assert!(profile(Some("CORP\\alice"), Some(Secret::Literal("x".into()))).validate().is_ok());
+    for bad in [
+        profile(None, pw()),
+        profile(Some(""), pw()),
+        profile(Some("CORP\\"), pw()),
+        profile(Some("alice"), None),
+        profile(Some("alice"), Some(Secret::Literal(String::new()))),
+        profile(Some("alice"), Some(Secret::Env(String::new()))),
+        profile(None, None),
+    ] {
+        assert!(bad.validate().is_err(), "{:?} {:?}", bad.username, bad.password);
+        // A profile stored without them still never answers with an empty login.
+        let cred = PlatformCred::from_profile(&bad).unwrap().unwrap();
+        assert!(cred.basic().is_err());
+    }
 }
 
 #[derive(Default)]

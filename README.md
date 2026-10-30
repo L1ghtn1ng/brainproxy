@@ -134,7 +134,7 @@ brainproxy connection upstream add --host '*' --proxy socks5://127.0.0.1:1080
 brainproxy connection upstream add --host '*.corp.test' --proxy http://127.0.0.1:3128 \
     --username alice --password-env PROXY_PW --first      # password read at connect time, never stored
 brainproxy connection upstream add --host intranet.corp.test --direct --first
-# Host override, like /etc/hosts (the scope is checked on the address, as on a DNS answer)
+# Host override, like /etc/hosts (the name must be in scope; a private or loopback address must be listed too)
 brainproxy connection hosts add app.example.com 10.0.0.5
 # Client certificate for mutual TLS (HTTP/1.1 and HTTP/2): PEM pair, or PKCS#12
 brainproxy connection cert add --host api.example.com --cert client.pem --key client.key
@@ -151,11 +151,15 @@ brainproxy connection route https://app.example.com/ # address, proxy, certifica
   Host stay the name. The trade-off: the proxy sees and logs IP addresses (a proxy that
   filters by host name won't match), and plain-HTTP targets go through a CONNECT tunnel too
   (a proxy that only allows CONNECT to port 443 can't carry them). `socks5h` is refused.
-- **Which proxies may be used.** A proxy on this machine (loopback: Burp, `ssh -D`, Tor) works
+- **Which proxies may be used.** A proxy on this machine (loopback: another local intercepting proxy) works
   as it is. Any other proxy could read what passes through it (TLS isn't verified by
   default), so the scope decides, not the changeable settings: list it when the engagement
   starts, `engagement start --target ... --proxy 10.0.0.1:3128`, and, when there is a system
   scope file, under `"proxies": ["10.0.0.1:3128"]` there too.
+- **Host overrides can't reach internal addresses on their own.** Anyone running brainproxy
+  can set one, so a private, loopback, or link-local address must be listed in the scope by
+  address, even for a name listed exactly (a DNS answer for such a name may be private).
+  A public address isn't restricted: the override then sends that name's traffic there.
 - **Platform authentication** (HTTP Basic, Digest, NTLMv2) lives in auth profiles:
   `brainproxy auth add corp --platform ntlm --platform-host '*.corp.test' --username 'CORP\alice' --password-env CORP_PW`.
   It answers those hosts' 401 challenges on every command and through the proxy, without

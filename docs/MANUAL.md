@@ -308,10 +308,15 @@ byte, side by side or unified.
     therefore sees IP addresses, and plain-HTTP targets go through a CONNECT tunnel too.
     A proxy on this machine works as it is; any other one must be listed when the
     engagement starts (`--proxy HOST:PORT`) and, if there is a system scope file, under its
-    `"proxies"`, because a proxy could read what passes through it.
-  - *Host overrides:* like /etc/hosts, connect to an address for a name. The scope is
-    checked on that address exactly as on a DNS answer (a wildcard entry still can't reach
-    a private or loopback address); TLS SNI and Host stay the name.
+    `"proxies"`, because a proxy could read what passes through it. Proxy usernames and
+    passwords go in clear to the proxy (Basic for HTTP, plain for SOCKS5), so on a proxy
+    off this machine anyone on the network path can read them.
+  - *Host overrides:* like /etc/hosts, connect to an address for a name. The name must be
+    in scope. A private, loopback, or link-local address must also be listed in the scope
+    by address, even for a name listed exactly, because whoever runs brainproxy chooses the
+    override (an exact name's DNS answer may be private; an override's may not). A public
+    address needs no listing, and that name's traffic, logins included, then goes there.
+    TLS SNI and Host stay the name.
   - *Client certificates:* for mutual TLS, a PEM certificate and key or a PKCS#12 file (its
     password from an environment variable), by host pattern, over HTTP/1.1 and HTTP/2. A
     file that can't be read makes connections to its hosts fail with the reason, never go

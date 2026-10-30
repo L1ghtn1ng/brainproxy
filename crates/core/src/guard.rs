@@ -16,7 +16,8 @@
 //! Hostnames are compared in one canonical form (see [`norm_host`]).
 //!
 //! Connection options ([`crate::connection`]) never widen this: a host override
-//! takes the place of DNS and its address is checked the same way, and an upstream
+//! takes the place of DNS, its address is checked the same way and, because whoever
+//! sets it chooses the address, an internal one must be listed by address; an upstream
 //! proxy is only used when it runs on this machine or every scope lists it under
 //! `proxies` (see [`Guard::resolve_proxy`]).
 
@@ -384,8 +385,10 @@ impl Guard {
                 // Refuse names no scope could allow before touching DNS.
                 self.precheck_name(bare, port)?;
                 let named = self.scopes.iter().all(|sc| sc.include.iter().any(|e| e.matches_name(bare, port)));
-                // A host override stands in for DNS; its address is checked below like an answer.
+                // A host override stands in for DNS, but it's a setting anyone running brainproxy can
+                // change, not an answer from the name's owner: an internal address must be listed.
                 if let Some(ip) = net.host_override(bare) {
+                    self.check_override(bare, port, ip)?;
                     return self.check(bare, port, vec![ip]);
                 }
                 match tokio::net::lookup_host((lookup, port)).await {
@@ -402,6 +405,22 @@ impl Guard {
             }
         };
         self.check(bare, port, addrs)
+    }
+
+    /// Refuses a host override to an internal address unless every scope lists that
+    /// address: no exception for an exact name (private) or `localhost` (loopback).
+    fn check_override(&self, bare: &str, port: u16, ip: IpAddr) -> Result<()> {
+        if internal(ip).is_none() {
+            return Ok(());
+        }
+        match self.scopes.iter().find(|s| !s.include.iter().any(|e| e.matches_addr(ip, port))) {
+            Some(s) => Err(Error::OutOfScope(format!(
+                "host override {bare} -> {ip} is an internal address the {} doesn't list; it must list the address \
+                 (or its CIDR) for an override to reach it",
+                s.origin
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// The addresses of `bare:port` that every scope allows.
@@ -421,48 +440,54 @@ impl Guard {
     /// loopback (a proxy on this machine), or ones every scope lists under `proxies`.
     /// A proxy anywhere else could read what goes through it (TLS isn't verified by
     /// default), so the scopes, not the changeable connection settings, decide.
+    ///
+    /// Host overrides don't apply: an override of a proxy listed by name would let a
+    /// changeable setting choose who reads the traffic.
     pub async fn resolve_proxy(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-        self.resolve_proxy_with(host, port, &self.net.get()).await
-    }
-
-    /// [`Guard::resolve_proxy`] with the host overrides of this snapshot of the connection options.
-    pub async fn resolve_proxy_with(
-        &self,
-        host: &str,
-        port: u16,
-        net: &crate::connection::Compiled,
-    ) -> Result<Vec<SocketAddr>> {
+        self.precheck_proxy(host, port)?;
         let bare = norm_host(host);
-        let refused = || {
-            Error::OutOfScope(format!(
-                "upstream proxy {bare}:{port} is not allowed: use a proxy on this machine (loopback), or list it with \
-                 `engagement start --proxy HOST:PORT` (and under \"proxies\" in the system scope file, when there is one)"
-            ))
-        };
-        // As for targets, a name no scope could allow isn't looked up (DNS would carry it out).
-        let may_name =
-            |s: &Scope| s.proxies.iter().any(|e| e.matches_name(&bare, port) || matches!(e.pattern, Pattern::Net(..)));
         let addrs: Vec<IpAddr> = match bare.parse::<IpAddr>() {
             Ok(ip) => vec![ip],
-            Err(_) => match net.host_override(&bare) {
-                Some(ip) => vec![ip],
-                None if bare != "localhost" && !self.scopes.iter().all(may_name) => return Err(refused()),
-                None => tokio::net::lookup_host((host.trim_start_matches('[').trim_end_matches(']'), port))
-                    .await
-                    .map_err(|e| Error::Connect(format!("upstream proxy {bare}: {e}")))?
-                    .map(|a| a.ip())
-                    .collect(),
-            },
+            Err(_) => tokio::net::lookup_host((host.trim_start_matches('[').trim_end_matches(']'), port))
+                .await
+                .map_err(|e| Error::Connect(format!("upstream proxy {bare}: {e}")))?
+                .map(|a| a.ip())
+                .collect(),
         };
         let ok: Vec<SocketAddr> = addrs
             .into_iter()
-            .filter(|&ip| unwrap_v4(ip).is_loopback() || self.scopes.iter().all(|s| s.allows_proxy(&bare, port, ip)))
+            .filter(|&ip| self.proxy_addr_allowed(&bare, port, ip))
             .map(|ip| SocketAddr::new(ip, port))
             .collect();
         if ok.is_empty() {
-            return Err(refused());
+            return Err(proxy_refused(&bare, port));
         }
         Ok(ok)
+    }
+
+    /// The check of [`Guard::resolve_proxy`] that needs no DNS: fails when the proxy
+    /// can't be allowed whatever its name resolves to. As for targets, such a name
+    /// isn't looked up (DNS would carry it out).
+    pub fn precheck_proxy(&self, host: &str, port: u16) -> Result<()> {
+        let bare = norm_host(host);
+        let possible = match bare.parse::<IpAddr>() {
+            Ok(ip) => self.proxy_addr_allowed(&bare, port, ip),
+            Err(_) => {
+                bare == "localhost"
+                    || self.scopes.iter().all(|s| {
+                        s.proxies.iter().any(|e| e.matches_name(&bare, port) || matches!(e.pattern, Pattern::Net(..)))
+                    })
+            }
+        };
+        if possible {
+            Ok(())
+        } else {
+            Err(proxy_refused(&bare, port))
+        }
+    }
+
+    fn proxy_addr_allowed(&self, bare: &str, port: u16, ip: IpAddr) -> bool {
+        unwrap_v4(ip).is_loopback() || self.scopes.iter().all(|s| s.allows_proxy(bare, port, ip))
     }
 
     /// Quick name-only check (no DNS): false when no scope could ever allow it.
@@ -489,6 +514,13 @@ impl Guard {
             Err(_) => self.precheck_name(bare, port).is_ok(),
         }
     }
+}
+
+fn proxy_refused(bare: &str, port: u16) -> Error {
+    Error::OutOfScope(format!(
+        "upstream proxy {bare}:{port} is not allowed: use a proxy on this machine (loopback), or list it with \
+         `engagement start --proxy HOST:PORT` (and under \"proxies\" in the system scope file, when there is one)"
+    ))
 }
 
 fn system_scope_path() -> Option<PathBuf> {

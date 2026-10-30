@@ -236,6 +236,21 @@ fn upstream_proxies_off_this_machine_need_the_engagement_to_list_them() {
 }
 
 #[test]
+fn host_overrides_to_internal_addresses_need_the_scope_to_list_them() {
+    let env =
+        Env::new("override", &["--target", "app.corp.test", "--target", "listed.corp.test", "--target", "10.9.9.9"]);
+    env.ok(&["connection", "hosts", "add", "app.corp.test", "10.0.0.7"]);
+    let (code, v) = env.run(&["send", "--url", "http://app.corp.test/"]);
+    assert_eq!((code, v["error"]["kind"].as_str()), (6, Some("out_of_scope")), "{v}");
+    let route = env.ok(&["connection", "route", "http://app.corp.test/"]);
+    assert_eq!(route["allowed"], false, "{route}");
+    assert!(route["reason"].as_str().unwrap().contains("host override"), "{route}");
+    env.ok(&["connection", "hosts", "add", "listed.corp.test", "10.9.9.9"]);
+    let route = env.ok(&["connection", "route", "http://listed.corp.test/"]);
+    assert_eq!((&route["allowed"], &route["addresses"][0]), (&Value::Bool(true), &Value::from("10.9.9.9")), "{route}");
+}
+
+#[test]
 fn invisible_proxy_routes_by_host_and_redirects() {
     let env = Env::new("invisible", &[]);
     let http = spawn_echo(false, &env.dir);
@@ -323,6 +338,10 @@ fn platform_auth_from_an_auth_profile_on_every_command() {
     let proxy =
         env.ok(&["proxy", "start", "--listen", "127.0.0.1:0"])["usage"]["proxy_url"].as_str().unwrap().to_string();
     assert_eq!(curl(&["-x", &proxy, &url]), (200, "in".into()));
+    let (code, v) = env.run(&["auth", "add", "bad", "--platform", "basic", "--platform-host", "*"]);
+    assert_eq!(code, 2, "platform auth needs a username: {v}");
+    let (code, v) = env.run(&["auth", "add", "bad", "--platform", "basic", "--platform-host", "*", "--username", "u"]);
+    assert_eq!(code, 2, "platform auth needs a password: {v}");
     let (code, _) = env.run(&["auth", "add", "bad", "--platform", "ntlm", "--username", "u"]);
     assert_eq!(code, 2, "--platform needs --platform-host");
 }

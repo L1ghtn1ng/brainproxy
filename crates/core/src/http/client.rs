@@ -592,7 +592,7 @@ impl Client {
                 .await
                 .map_err(|e| Error::Connect(format!("{}:{}: {e}", target.host, target.port)))?,
             Route::Proxy(proxy) => {
-                let proxy_addrs = guard.resolve_proxy_with(&proxy.host, proxy.port, net).await?;
+                let proxy_addrs = guard.resolve_proxy(&proxy.host, proxy.port).await?;
                 let mut last = None;
                 let mut opened = None;
                 for addr in &addrs {
