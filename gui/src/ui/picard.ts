@@ -18,7 +18,7 @@ export const MISSION =
   "to explore strange new worlds, to seek out new life and new civilizations, to boldly go where no one " +
   "has gone before.";
 
-export const RIP = "Rest in peace, Sir Patrick Stewart.";
+export const RIP = "Sir Patrick Stewart, 1940–2026. Rest in peace.";
 
 /** The letters typed so far that could still spell the word, and whether `key` finished it. */
 export function typed(sofar: string, key: string): [string, boolean] {
