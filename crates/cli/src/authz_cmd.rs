@@ -10,6 +10,7 @@ use std::time::Duration;
 use brainproxy_core::auth::{AuthProfile, AuthSession};
 use brainproxy_core::authz::{self, AuthzConfig, AuthzTarget, ANONYMOUS, DEFAULT_EXCLUDE, SAFE_METHODS};
 use brainproxy_core::http::{Client, RawRequest, SendOptions, Target};
+use brainproxy_core::jobs::is_finished;
 use brainproxy_core::scan::Message;
 use brainproxy_core::store::Store;
 use brainproxy_core::Error;
@@ -163,7 +164,14 @@ pub fn authz(project: &Path, home: &Path, cmd: AuthzCmd, out: &Out) -> Result<()
             Ok(())
         }
         AuthzCmd::List { limit } => {
-            let runs = Store::open(project)?.authz_runs(limit)?;
+            let store = Store::open(project)?;
+            // A run whose process died (a killed proxy) isn't live any more.
+            for r in store.authz_runs(limit)? {
+                if let Some(id) = r["run_id"].as_i64().filter(|_| !is_finished(r["state"].as_str().unwrap_or(""))) {
+                    crate::jobs_cmd::reap(project, &store, id)?;
+                }
+            }
+            let runs = store.authz_runs(limit)?;
             out.ok(json!({"runs": runs}), || {
                 runs.iter()
                     .map(|r| {

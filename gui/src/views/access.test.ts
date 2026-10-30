@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cellKind, grid, hostOf, liveArgs, proxyOptions, runArgs, runLabel, type Matrix, type RunForm } from "./access.ts";
+import { cellKind, grid, hostOf, liveArgs, proxyOptions, runArgs, runLabel, withLive, type Matrix, type RunForm } from "./access.ts";
 
 const cell = (verdict: string, status: number | null, history_id: number, confidence: string | null = null) => ({ verdict, confidence, status, history_id });
 
@@ -109,7 +109,10 @@ test("live testing options, and the running proxy's options kept on a restart", 
   assert.throws(() => liveArgs({ ...form, rate: "-1" }), /Rate/);
   const args = ["proxy", "run", "--listen", "127.0.0.1:8080", "--timeout", "30", "--log", "/p.proxy.log", "--verify-tls", "--auth", "alice", "--authz", "bob", "--authz-rate=5", "--no-http2"];
   assert.deepEqual(proxyOptions(args), ["--timeout=30", "--verify-tls", "--auth=alice", "--authz=bob", "--authz-rate=5", "--no-http2"]);
-  assert.deepEqual(proxyOptions(args, false), ["--timeout=30", "--verify-tls", "--auth=alice", "--no-http2"]);
+  // What the form doesn't set stays; what it sets replaces the old value.
+  const live = proxyOptions([...args, "--authz-queue", "50", "--authz-exclude", "(?i)a=b"]);
+  assert.deepEqual(withLive(live, ["--authz=carol"]), ["--timeout=30", "--verify-tls", "--auth=alice", "--authz-rate=5", "--no-http2", "--authz-queue=50", "--authz-exclude=(?i)a=b", "--authz=carol"]);
+  assert.deepEqual(withLive(live, ["--authz=carol", "--authz-rate=2"]).filter((o) => o.startsWith("--authz-rate")), ["--authz-rate=2"]);
   assert.deepEqual(proxyOptions([]), []);
 });
 

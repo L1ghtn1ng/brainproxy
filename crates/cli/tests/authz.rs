@@ -75,6 +75,10 @@ fn handle(mut s: TcpStream, logouts: &AtomicUsize, counter: &AtomicUsize, flaky:
         format!(r#"{{"id":{id},"owner":"{owner}","email":"{owner}@shop.test","total":"{id}2.50","ts":{n}}}"#)
     };
     let resp = match (path.as_str(), user) {
+        ("/static/app.js", _) => {
+            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: 2\r\nConnection: close\r\n\r\n;;"
+                .into()
+        }
         ("/public/info", _) => json("200 OK", r#"{"shop":"Example","currency":"EUR"}"#.into()),
         (_, None) => json("401 Unauthorized", r#"{"error":"login required"}"#.into()),
         // The bug: any logged-in user may read order 1.
@@ -262,6 +266,9 @@ fn live_mode_tests_proxied_requests_as_other_identities() {
         assert_eq!(curl_as_alice(&proxy, &srv.url(path), &[]), 200, "{path}");
     }
     assert_eq!(curl_as_alice(&proxy, &srv.url("/api/me"), &["-X", "POST", "-d", "x=1"]), 200);
+    // Static assets and responses other than 2xx aren't tested either.
+    assert_eq!(curl_as_alice(&proxy, &srv.url("/static/app.js"), &[]), 200);
+    assert_eq!(curl_as_alice(&proxy, &srv.url("/no/such/page"), &[]), 404);
     // Requests without credentials aren't tested.
     let out = Command::new("curl")
         .args(["-sS", "--noproxy", "", "-x", &proxy, "-o", if cfg!(windows) { "NUL" } else { "/dev/null" }])
@@ -303,6 +310,8 @@ fn live_mode_tests_proxied_requests_as_other_identities() {
     assert_eq!(progress["skipped_excluded_paths"], 1, "{status}");
     assert_eq!(progress["skipped_methods"], 1, "{status}");
     assert_eq!(progress["skipped_no_credentials"], 1, "{status}");
+    assert_eq!(progress["skipped_static"], 1, "{status}");
+    assert_eq!(progress["skipped_status"], 1, "{status}");
     assert_eq!(progress["dropped_queue_full"], 0, "{status}");
 
     let f = ok(&p, &["findings", "list", "--source", "authz"]);
@@ -358,4 +367,25 @@ fn live_mode_shares_the_proxys_auth_session() {
     let started_with = status["proxy"]["args"].to_string();
     assert!(started_with.contains("\"--auth\",\"alice\"") && started_with.contains("\"--authz\",\"bob\""), "{status}");
     ok(&p, &["--home", home, "proxy", "stop"]);
+}
+
+/// A run whose proxy was killed isn't shown as live for ever.
+#[cfg(unix)]
+#[test]
+fn authz_list_reaps_a_run_whose_proxy_died() {
+    let p = tmp_project("live-killed");
+    let home = p.with_file_name("home");
+    let home = home.to_str().unwrap();
+    let started = ok(&p, &["--home", home, "proxy", "start", "--listen", "127.0.0.1:0", "--authz", "anonymous"]);
+    let pid = started["pid"].as_i64().unwrap().to_string();
+    assert!(Command::new("kill").args(["-9", &pid]).status().unwrap().success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let runs = ok(&p, &["authz", "list"]);
+        if runs["runs"][0]["state"] == "failed" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{runs}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }

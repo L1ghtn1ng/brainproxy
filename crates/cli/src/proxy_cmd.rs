@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use brainproxy_core::authz::live::{Live, LiveOptions};
 use brainproxy_core::authz::{AuthzConfig, ANONYMOUS, DEFAULT_EXCLUDE};
 use brainproxy_core::http::{RawRequest, SendOptions, Target};
-use brainproxy_core::jobs::JobControl;
+use brainproxy_core::jobs::{is_finished, JobControl};
 use brainproxy_core::proxy::config::{
     InterceptSettings, LiveAuthz, Rule, RuleLocation, Scope, TimeoutAction, AUTHZ_KEY, INTERCEPT_KEY, RULES_KEY,
     SCOPE_KEY,
@@ -23,6 +23,11 @@ use crate::process;
 
 /// `proxy stop` asks the proxy to exit through this key (see `process::shutdown`).
 const STOP_KEY: &str = "proxy.stop";
+
+/// How long a proxy may take to exit when asked to. With a live authz run it also has to
+/// finish its tests and save the run.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+const STOP_WAIT_AUTHZ: Duration = Duration::from_secs(30);
 
 #[derive(Subcommand)]
 pub enum CaCmd {
@@ -95,8 +100,9 @@ pub struct ProxyRunArgs {
     #[arg(long, value_name = "URL")]
     redirect: Option<String>,
     /// Live access-control testing: also send each in-scope GET/HEAD/OPTIONS request that
-    /// carries credentials as these auth profiles, and/or `anonymous` (no credentials),
-    /// in the background. Comma-separated or repeatable. Results: authz matrix RUN.
+    /// carries credentials and got a 2xx that isn't a static asset as these auth profiles,
+    /// and/or `anonymous` (no credentials), in the background. Comma-separated or
+    /// repeatable. Results: authz matrix RUN.
     #[arg(long, value_name = "NAMES", value_delimiter = ',')]
     authz: Vec<String>,
     /// Requests per second live testing sends at most (0: no limit).
@@ -412,7 +418,14 @@ pub(crate) fn running(store: &Store) -> Result<Option<ProxyState>, Error> {
 pub(crate) fn stop(store: &Store) -> Result<Option<(u32, bool)>, Error> {
     let Some(Saved { state, start_time }) = current(store)? else { return Ok(None) };
     process::request_stop(store, STOP_KEY, state.pid)?;
-    let forced = process::terminate(state.pid, start_time, "proxy")?;
+    let wait = if state.authz_run.is_some() { STOP_WAIT_AUTHZ } else { STOP_WAIT };
+    let forced = process::terminate(state.pid, start_time, "proxy", wait)?;
+    // Killed, it couldn't save its run; the rows recorded so far stay.
+    if let Some(id) = state.authz_run.filter(|_| forced) {
+        if !is_finished(&store.job_state(id)?) {
+            store.job_set_state(id, "failed", None, Some("the proxy was killed before the run was saved"), true)?;
+        }
+    }
     store.meta_set(STATE_KEY, None)?;
     store.meta_set(STOP_KEY, None)?;
     Ok(Some((state.pid, forced)))

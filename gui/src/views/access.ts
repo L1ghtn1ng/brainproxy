@@ -211,10 +211,9 @@ const VALUE_OPTIONS = ["--listen", "--timeout", "--wait", "--log", "--auth", "--
 
 /**
  * The options a running proxy was started with (its `proxy run` arguments, from `proxy status`), as
- * `--name=value`, to start it again with them: without the address and log, which the restart sets,
- * and without live testing when `live` is false.
+ * `--name=value`, to start it again with them: without the address and log, which the restart sets.
  */
-export function proxyOptions(args: string[], live = true): string[] {
+export function proxyOptions(args: string[]): string[] {
   const rest = args[0] === "proxy" ? args.slice(2) : args;
   const out: string[] = [];
   for (let i = 0; i < rest.length; i++) {
@@ -222,8 +221,14 @@ export function proxyOptions(args: string[], live = true): string[] {
     const eq = a.startsWith("--") ? a.indexOf("=") : -1;
     const name = eq > 0 ? a.slice(0, eq) : a;
     const value = eq > 0 ? a.slice(eq + 1) : VALUE_OPTIONS.includes(a) ? (rest[++i] ?? "") : null;
-    if (name === "--listen" || name === "--log" || name === "--wait" || (!live && name.startsWith("--authz"))) continue;
+    if (name === "--listen" || name === "--log" || name === "--wait") continue;
     out.push(value == null ? name : `${name}=${value}`);
   }
   return out;
+}
+
+/** `options` from `proxyOptions` with `live` from `liveArgs` on top: what `live` doesn't set (the queue, the exclude) stays. */
+export function withLive(options: string[], live: string[]): string[] {
+  const names = live.map((o) => o.split("=", 1)[0]);
+  return [...options.filter((o) => !names.includes(o.split("=", 1)[0])), ...live];
 }

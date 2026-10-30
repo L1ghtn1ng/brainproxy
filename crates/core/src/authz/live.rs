@@ -1,8 +1,9 @@
 //! Live mode: while the proxy runs, each in-scope request it records that carries
-//! credentials, uses a safe method and isn't a logout is also tested in the background
-//! as other identities, all under one authz run. Proxied traffic never waits for it:
-//! requests go through a bounded queue and are dropped (and counted) when it is full,
-//! and each method, URL and body is tested once.
+//! credentials, uses a safe method, isn't a logout and got a 2xx response that isn't a
+//! static asset is also tested in the background as other identities, all under one
+//! authz run. Proxied traffic never waits for it: requests go through a bounded queue
+//! and are dropped (and counted) when it is full, and each method, URL and body is
+//! tested once.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -26,6 +27,60 @@ use crate::jobs::JobControl;
 /// How long tests already under way may finish once the proxy stops.
 const GRACE: Duration = Duration::from_secs(2);
 
+/// Requests remembered as tested. Past this the memory starts over, so a long-running
+/// proxy stays small; the cost is testing some requests again.
+const MAX_SEEN: usize = 100_000;
+
+/// Content types and, when the response doesn't say, path extensions of static assets:
+/// in a browser session they all carry the session cookie and would fill the queue.
+const STATIC_TYPE_PREFIXES: &[&str] =
+    &["image/", "font/", "audio/", "video/", "application/font", "application/x-font"];
+const STATIC_TYPES: &[&str] = &[
+    "text/css",
+    "text/javascript",
+    "text/ecmascript",
+    "application/javascript",
+    "application/x-javascript",
+    "application/ecmascript",
+    "application/wasm",
+    "application/vnd.ms-fontobject",
+];
+const STATIC_EXTENSIONS: &[&str] = &[
+    "js", "mjs", "css", "map", "png", "jpg", "jpeg", "gif", "svg", "ico", "webp", "avif", "woff", "woff2", "ttf",
+    "otf", "eot", "mp3", "mp4", "webm", "wasm",
+];
+
+/// Whether a response is a static asset, by its content type or, without a useful one,
+/// the extension of the path.
+fn is_static(content_type: Option<&str>, path: &str) -> bool {
+    let kind = content_type.unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if STATIC_TYPES.contains(&kind.as_str()) || STATIC_TYPE_PREFIXES.iter().any(|p| kind.starts_with(p)) {
+        return true;
+    }
+    (kind.is_empty() || kind == "application/octet-stream")
+        && path
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .is_some_and(|(_, ext)| STATIC_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+/// Hashes of the requests already queued, of at most `max` entries.
+struct Seen {
+    set: HashSet<u64>,
+    max: usize,
+}
+
+impl Seen {
+    /// False when `key` is already there.
+    fn insert(&mut self, key: u64) -> bool {
+        if self.set.len() >= self.max && !self.set.contains(&key) {
+            self.set.clear();
+        }
+        self.set.insert(key)
+    }
+}
+
 pub struct LiveOptions {
     /// Requests waiting to be tested at most; more are dropped.
     pub queue: usize,
@@ -45,13 +100,15 @@ struct Counts {
     methods: AtomicU64,
     excluded: AtomicU64,
     no_credentials: AtomicU64,
+    status: AtomicU64,
+    assets: AtomicU64,
 }
 
 /// What the proxy offers recorded requests to. `offer` never blocks.
 pub struct Live {
     run_id: i64,
     tx: tokio::sync::mpsc::Sender<AuthzTarget>,
-    seen: Mutex<HashSet<u64>>,
+    seen: Mutex<Seen>,
     exclude: Regex,
     profiles: Vec<AuthProfile>,
     counts: Counts,
@@ -82,7 +139,7 @@ impl Live {
         let live = Arc::new(Live {
             run_id,
             tx,
-            seen: Mutex::default(),
+            seen: Mutex::new(Seen { set: HashSet::new(), max: MAX_SEEN }),
             exclude: opts.exclude,
             profiles: tester.profiles(),
             counts: Counts::default(),
@@ -108,8 +165,17 @@ impl Live {
     }
 
     /// Queues a recorded request for testing unless it is one not to test, already
-    /// tested, or the queue is full.
-    pub fn offer(&self, history_id: i64, target: &Target, request: &[u8]) {
+    /// tested, or the queue is full. `status` and `content_type` are its response's:
+    /// without a 2xx there is no baseline to compare with (a WebSocket handshake, an
+    /// error, a 304), and a later copy that gets one can still be tested.
+    pub fn offer(
+        &self,
+        history_id: i64,
+        target: &Target,
+        request: &[u8],
+        status: Option<u16>,
+        content_type: Option<&str>,
+    ) {
         if self.ctl.stopped() {
             return;
         }
@@ -125,6 +191,10 @@ impl Live {
             Some(&c.excluded)
         } else if !has_credentials(request, &self.profiles) {
             Some(&c.no_credentials)
+        } else if status.is_none_or(|s| !(200..300).contains(&s)) {
+            Some(&c.status)
+        } else if is_static(content_type, path) {
+            Some(&c.assets)
         } else {
             None
         };
@@ -149,7 +219,7 @@ impl Live {
         } else {
             // Not tested, so a later copy may be.
             c.dropped.fetch_add(1, Ordering::Relaxed);
-            self.seen.lock().unwrap().remove(&key);
+            self.seen.lock().unwrap().set.remove(&key);
         }
         self.progress();
     }
@@ -171,6 +241,8 @@ impl Live {
             "skipped_methods": n(&c.methods),
             "skipped_excluded_paths": n(&c.excluded),
             "skipped_no_credentials": n(&c.no_credentials),
+            "skipped_status": n(&c.status),
+            "skipped_static": n(&c.assets),
             "sent": self.tester.sent(),
         })
     }
@@ -244,5 +316,33 @@ impl LiveWorker {
         v["stopped"] = json!(live.ctl.stopped());
         live.progress();
         Ok(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_assets_by_type_or_extension() {
+        assert!(is_static(Some("text/javascript; charset=utf-8"), "/app"));
+        assert!(is_static(Some("IMAGE/PNG"), "/avatar"));
+        assert!(is_static(Some("font/woff2"), "/f"));
+        assert!(is_static(None, "/static/app.min.JS"));
+        assert!(is_static(Some("application/octet-stream"), "/a/b.woff2"));
+        assert!(!is_static(Some("application/json"), "/api/orders/1"));
+        assert!(!is_static(Some("text/html"), "/report.png"));
+        assert!(!is_static(None, "/api/orders/1"));
+        assert!(!is_static(None, "/v1.2/orders"));
+    }
+
+    #[test]
+    fn seen_stays_bounded() {
+        let mut seen = Seen { set: HashSet::new(), max: 2 };
+        assert!(seen.insert(1));
+        assert!(seen.insert(2));
+        assert!(!seen.insert(1), "already there, whether or not it is full");
+        assert!(seen.insert(3), "a new one starts over");
+        assert_eq!(seen.set.len(), 1);
     }
 }

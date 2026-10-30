@@ -120,9 +120,10 @@ pub async fn run(
                 Ok(ids) => {
                     // Offered once recorded, so results point at the history entry.
                     if let Some(live) = &authz {
-                        for (id, (target, request)) in ids.into_iter().zip(offers).filter_map(|(id, o)| Some((id, o?)))
-                        {
-                            live.offer(id, &target, &request);
+                        for ((id, offer), c) in ids.into_iter().zip(offers).zip(&captures) {
+                            if let Some((target, request)) = offer {
+                                live.offer(id, &target, &request, c.status, c.resp_content_type.as_deref());
+                            }
                         }
                     }
                 }

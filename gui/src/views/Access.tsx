@@ -8,7 +8,7 @@ import { useApp } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./access";
+import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./access";
 import { stateClass, type Job } from "./Scanner";
 
 const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", keepCookies: "", rate: "" };
@@ -326,7 +326,7 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
       if (s.running) await run(["proxy", "stop"]);
       let d: { authz_run?: number };
       try {
-        d = await run<{ authz_run?: number }>(["proxy", "start", listen, ...proxyOptions(before, false), ...live]);
+        d = await run<{ authz_run?: number }>(["proxy", "start", listen, ...withLive(before, live)]);
       } catch (e) {
         if (s.running) await run(["proxy", "start", listen, ...before]).catch(() => {});
         throw e;
@@ -426,10 +426,10 @@ function NewRun({ onStarted }: { onStarted: (id: number) => void }) {
         <button className="btn primary" disabled={busy} onClick={start}>
           Start run
         </button>
-        <button className="btn" disabled={busy || f.owner !== "" || f.select !== "all"} onClick={startLive} title="Restart the proxy so each request you browse is also tried as these identities (like Autorize)">
+        <button className="btn" disabled={busy || f.owner !== "" || f.select !== "all"} onClick={startLive} title="Restart the proxy so each request you browse is also tried as these identities">
           Test live while browsing
         </button>
-        <span className="muted small">Live testing restarts the proxy (same address and options) and tests in-scope GET, HEAD and OPTIONS requests as they are recorded.</span>
+        <span className="muted small">Live testing restarts the proxy (same address and options) and tests in-scope GET, HEAD and OPTIONS requests as they are recorded, leaving out static assets and responses other than 2xx.</span>
       </div>
     </div>
   );

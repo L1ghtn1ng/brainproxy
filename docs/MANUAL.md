@@ -233,7 +233,7 @@ Access control across users: does the app let bob read alice's data? See
   OPTIONS requests are replayed, and logout paths never are.
 - **Test live while browsing:** restarts the proxy on the same address, with the options it
   had (such as its login profile), so each in-scope request you browse is also tried as
-  those identities in the background (like Burp's Autorize). If it doesn't start, the
+  those identities in the background. If it doesn't start, the
   previous proxy is started again. Results fill the grid as you go; stopping the proxy ends
   the run.
 - **Grid:** one row per request, one column per identity. Cells are coloured by verdict:
@@ -562,11 +562,13 @@ engagement scope and is recorded in history with source `authz`.
 `authz run --background` returns a run id; `job wait|status|stop` work on it, and
 `authz list` shows recent runs. The rows are also in the `authz_results` table for `query`.
 
-**Live mode.** `proxy start --authz bob,anonymous` tests requests while you browse, the
-way Burp users use the Autorize extension. Each in-scope request the proxy records that
-carries credentials, uses GET, HEAD or OPTIONS and doesn't match `--authz-exclude`
-(default: logout and sign-off) is also sent, in the background, as each listed profile
-and/or with no credentials (`anonymous`), exactly as `authz run` does. All of it goes
+**Live mode.** `proxy start --authz bob,anonymous` tests requests while you browse. Each
+in-scope request the proxy records that carries credentials, uses GET, HEAD or OPTIONS,
+doesn't match `--authz-exclude` (default: logout and sign-off) and got a 2xx response that
+isn't a static asset (scripts, stylesheets, images, fonts, media) is also sent, in the
+background, as each listed profile and/or with no credentials (`anonymous`), exactly as
+`authz run` does. To test a request live mode leaves out, such as a private image, use
+`authz run --history-id`. All of it goes
 under one authz run, created when the proxy starts; `proxy start` and `proxy status` print
 its id, and `authz matrix|results|list` and the desktop app's **Access** view work on it
 while it fills up.
@@ -579,10 +581,13 @@ brainproxy authz matrix 12     # the live run's id
 
 Proxied traffic never waits for the tests. Each method, URL and body is tested once; the
 requests wait in a queue of `--authz-queue` (default 100), and when it is full new ones are
-dropped and counted (`dropped_queue_full` in `proxy status`). `--authz-rate` caps the
+dropped and counted (`dropped_queue_full` in `proxy status`, next to `skipped_status`,
+`skipped_static` and the other reasons a request wasn't queued). `--authz-rate` caps the
 requests per second the tests send (default 5, 0 for no limit); `--authz-keep-cookie`
 keeps a cookie that isn't a credential. The settings in use are stored in the project
-(setting `authz`). `proxy stop` and `project stop` end the run (state `completed`);
+(setting `authz`). `proxy stop` and `project stop` end the run (state `completed`), waiting
+up to 30 s for it to be saved; if the proxy has to be killed, or dies, the run is `failed`
+and the rows recorded so far stay;
 `job stop RUN` stops testing while the proxy carries on (`stopped` once the proxy stops).
 
 More detail: [README](../README.md), [MCP](MCP.md), [checks](CHECKS.md),

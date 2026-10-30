@@ -318,7 +318,7 @@ brainproxy auth add bob --login-url https://app.example.com/login ... --username
 brainproxy authz run --as bob --where "host = 'app.example.com'"   # owner worked out per request
 brainproxy authz matrix 7                         # request x identity: enforced, bypass, public, different, ...
 brainproxy authz results 7 --verdict bypass       # with baseline/replay history ids for `diff`
-brainproxy proxy start --auth alice --authz bob,anonymous   # live, like Autorize: browse as alice,
+brainproxy proxy start --auth alice --authz bob,anonymous   # live: browse as alice,
                                                   # each request is also tried as bob and with no session
 
 # Reports: findings grouped by alert type with description, solution, references, and the
