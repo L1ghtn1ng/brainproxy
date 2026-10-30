@@ -28,6 +28,10 @@ pub enum EngagementCmd {
         /// Label for the engagement.
         #[arg(long)]
         name: Option<String>,
+        /// Upstream proxy (HOST:PORT, IP, or CIDR) connections may go through besides ones on this
+        /// machine (see `connection upstream`). Write-once like the targets. Repeatable.
+        #[arg(long = "proxy")]
+        proxies: Vec<String>,
     },
     /// Show the scopes in force.
     Show,
@@ -41,20 +45,22 @@ pub fn engagement(project: &Path, cmd: EngagementCmd, out: &Out) -> Result<(), E
     let store =
         if matches!(cmd, EngagementCmd::Start { .. }) { Store::create(project)? } else { Store::open(project)? };
     match cmd {
-        EngagementCmd::Start { targets, exclude, name } => {
+        EngagementCmd::Start { targets, exclude, name, proxies } => {
             let spec = ScopeSpec { name, include: targets, exclude };
-            store.engagement_start(&spec)?;
-            out.ok(json!({"engagement": spec, "locked": true}), || {
+            store.engagement_start_with_proxies(&spec, &proxies)?;
+            out.ok(json!({"engagement": spec, "proxies": proxies, "locked": true}), || {
                 format!("engagement scope locked: {}", spec.include.join(", "))
             });
         }
         EngagementCmd::Show => {
-            let system = guard::load_system_scope()?;
+            let system = guard::load_system()?;
             let engagement = store.engagement()?;
             let data = json!({
-                "system": system,
+                "system": system.as_ref().map(|(s, _)| s),
+                "system_proxies": system.as_ref().map(|(_, p)| p),
                 "system_file": guard::system_scope_location(),
                 "engagement": engagement,
+                "engagement_proxies": store.engagement_proxies()?,
                 "enforced": system.is_some() || engagement.is_some(),
                 "rule": "A request is allowed only if every scope shown allows it. Neither scope can be changed from the CLI once set.",
             });

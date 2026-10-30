@@ -675,6 +675,11 @@ impl Store {
     pub fn set_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let json = serde_json::to_string(value).map_err(|e| Error::InvalidInput(e.to_string()))?;
         self.meta_set(&format!("setting.{key}"), Some(&json))?;
+        self.bump_settings_version()
+    }
+
+    /// Makes running proxies reload their settings.
+    pub fn bump_settings_version(&self) -> Result<()> {
         self.conn.execute(
             "INSERT INTO meta (key, value) VALUES ('settings_version', '1')
              ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",

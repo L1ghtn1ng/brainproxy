@@ -1,6 +1,12 @@
 //! The intercepting proxy: HTTP/1.x forward proxy with CONNECT, TLS
 //! interception for in-scope hosts (HTTP/2 to clients that offer it), match-and-replace rules, an intercept queue
 //! resolved through the project database, and capture recording.
+//!
+//! Connection options: TLS pass-through hosts are tunnelled without being
+//! decrypted (still scope-checked, and recorded as a connection), and with
+//! `invisible` the listener also serves clients that don't know they're proxied:
+//! origin-form requests are routed by their Host header and TLS by its SNI. A
+//! `redirect` target sends everything from the listener to one origin.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -39,6 +45,10 @@ pub struct ProxyOptions {
     pub auth: Option<Arc<AuthSession>>,
     /// Offer HTTP/2 (ALPN `h2`) to clients on intercepted TLS connections.
     pub http2: bool,
+    /// Also accept clients that don't know they're proxied (route by Host / SNI).
+    pub invisible: bool,
+    /// Send every request from this listener to this origin (implies `invisible`).
+    pub redirect: Option<Target>,
 }
 
 /// Settings in effect, reloaded whenever the project's settings version changes.
@@ -62,6 +72,8 @@ struct Ctx {
     http2: bool,
     /// Whether each https origin negotiated HTTP/2 (tried for HTTP/2 clients).
     h2_origins: Mutex<HashMap<String, bool>>,
+    invisible: bool,
+    redirect: Option<Target>,
 }
 
 #[derive(Default)]
@@ -110,6 +122,8 @@ pub async fn run(
         stats: Stats::default(),
         http2: opts.http2,
         h2_origins: Mutex::default(),
+        invisible: opts.invisible || opts.redirect.is_some(),
+        redirect: opts.redirect,
     });
     reload(&ctx).await;
 
@@ -163,6 +177,10 @@ async fn reload(ctx: &Arc<Ctx>) {
         let scope: Scope = store.setting(SCOPE_KEY)?;
         let rules: Vec<Rule> = store.setting(RULES_KEY)?;
         let intercept: InterceptSettings = store.setting(INTERCEPT_KEY)?;
+        // Connection options and platform credentials go to the guard every client shares.
+        if let Some(g) = &c.guard {
+            g.net.set(store.connection_compiled()?);
+        }
         Ok(Some(Live {
             version,
             scope: scope.compile()?,
@@ -184,6 +202,12 @@ fn live(ctx: &Ctx) -> Arc<Live> {
 }
 
 async fn handle_connection(ctx: &Arc<Ctx>, mut tcp: TcpStream, _peer: SocketAddr) -> Result<()> {
+    if ctx.invisible {
+        let mut first = [0u8; 1];
+        if tcp.peek(&mut first).await? == 1 && first[0] == 0x16 {
+            return serve_invisible_tls(ctx, tcp).await;
+        }
+    }
     let mut reader = WireReader::new();
     let Some(head) = reader.peek_request_head(&mut tcp).await? else { return Ok(()) };
     let head = RawRequest::from_bytes(head).head()?;
@@ -204,6 +228,9 @@ async fn handle_connection(ctx: &Arc<Ctx>, mut tcp: TcpStream, _peer: SocketAddr
     tcp.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
     let mut stream = Prefixed::new(reader.into_leftover(), tcp);
 
+    if passthrough(ctx, &target) {
+        return pass_through(ctx, stream, &target).await;
+    }
     if !live(ctx).scope.allows(&target.host) {
         return tunnel(ctx, stream, &target).await;
     }
@@ -231,12 +258,163 @@ async fn handle_connection(ctx: &Arc<Ctx>, mut tcp: TcpStream, _peer: SocketAddr
     serve_http(ctx, tls, WireReader::new(), Some(target)).await
 }
 
-/// Relays bytes without inspecting them (out-of-scope CONNECT).
+/// Relays bytes without inspecting them (out-of-scope CONNECT). The upstream
+/// connection goes through the guard (and the connection options) like any other.
 async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(ctx: &Arc<Ctx>, mut client: S, target: &Target) -> Result<()> {
+    let target = ctx.redirect.as_ref().unwrap_or(target);
     let plain = Target { scheme: "http".into(), ..target.clone() };
     let mut upstream = ctx.client.connect(&plain).await?;
     tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     Ok(())
+}
+
+/// Whether the connection options say to tunnel this host's TLS undecrypted.
+fn passthrough(ctx: &Ctx, target: &Target) -> bool {
+    ctx.guard.as_ref().is_some_and(|g| g.net.get().passthrough(&target.host, target.port))
+}
+
+/// A TLS pass-through connection: tunnelled like [`tunnel`] and recorded as a
+/// `CONNECT` entry (no response: nothing was decrypted) with the byte counts.
+async fn pass_through<S: AsyncRead + AsyncWrite + Unpin>(ctx: &Arc<Ctx>, mut client: S, target: &Target) -> Result<()> {
+    let upstream_target = ctx.redirect.as_ref().unwrap_or(target);
+    let authority = target.host_header();
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    let started = Instant::now();
+    let plain = Target { scheme: "http".into(), ..upstream_target.clone() };
+    let result = async {
+        let mut upstream = ctx.client.connect(&plain).await?;
+        Ok::<_, Error>(tokio::io::copy_bidirectional(&mut client, &mut upstream).await?)
+    }
+    .await;
+    let note = match &result {
+        Ok((up, down)) => format!("TLS pass-through, not decrypted: {up} bytes sent, {down} received"),
+        Err(e) => format!("TLS pass-through: {e}"),
+    };
+    let https = Target { scheme: "https".into(), ..target.clone() };
+    let duration = Some(started.elapsed().as_millis() as i64);
+    send_capture(ctx, Capture::new("proxy", &https, request.as_bytes(), None, duration, Some(&note)));
+    result.map(|_| ())
+}
+
+/// A client that sent TLS straight to the listener (invisible proxying): the host
+/// comes from the ClientHello's SNI (or the redirect target), port 443.
+async fn serve_invisible_tls(ctx: &Arc<Ctx>, mut tcp: TcpStream) -> Result<()> {
+    let (hello, handshake) = read_client_hello(&mut tcp).await?;
+    // From the client, so checked before it is used for routing or a certificate.
+    let sni = sni_from_client_hello(&handshake);
+    if let Some(name) = sni.as_deref().filter(|n| !valid_client_host(n) || n.parse::<std::net::IpAddr>().is_ok()) {
+        return Err(Error::Protocol(format!("invisible proxy: bad TLS server name {name:?}")));
+    }
+    let target = match (&ctx.redirect, &sni) {
+        (Some(r), _) => r.clone(),
+        (None, Some(name)) => Target::from_url(&format!("https://{name}:443"))
+            .map_err(|_| Error::Protocol(format!("bad TLS server name {name:?}")))?,
+        (None, None) => return Err(Error::Protocol("invisible proxy: TLS client sent no server name (SNI)".into())),
+    };
+    let name = sni.unwrap_or_else(|| target.host.clone());
+    let named = Target { host: name.clone(), port: 443, scheme: "https".into() };
+    let stream = Prefixed::new(hello, tcp);
+    if passthrough(ctx, &named) {
+        return pass_through(ctx, stream, &named).await;
+    }
+    if !live(ctx).scope.allows(&name) {
+        return tunnel(ctx, stream, &named).await;
+    }
+    let acceptor = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
+    let start = acceptor.await.map_err(|e| Error::Tls(format!("client hello: {e}")))?;
+    let mut config = ctx.ca.server_config(&name)?;
+    let offers_h2 = start.client_hello().alpn().is_some_and(|mut p| p.any(|p| p == b"h2"));
+    if ctx.http2 && offers_h2 {
+        let mut h2_config = (*config).clone();
+        h2_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config = Arc::new(h2_config);
+    }
+    let tls = start.into_stream(config).await.map_err(|e| Error::Tls(format!("client handshake: {e}")))?;
+    if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+        return serve_h2(ctx, tls, named).await;
+    }
+    serve_http(ctx, tls, WireReader::new(), Some(named)).await
+}
+
+/// Longest ClientHello read to find the SNI.
+const MAX_CLIENT_HELLO: usize = 64 * 1024;
+
+/// The ClientHello: the raw records (replayed to the acceptor or the pass-through
+/// tunnel) and the handshake message they carry, which may span several records.
+async fn read_client_hello(tcp: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>)> {
+    let (mut raw, mut handshake) = (Vec::new(), Vec::new());
+    loop {
+        let mut head = [0u8; 5];
+        tcp.read_exact(&mut head).await?;
+        if head[0] != 0x16 {
+            return Err(Error::Protocol("invisible proxy: expected a TLS handshake record".into()));
+        }
+        let len = u16::from_be_bytes([head[3], head[4]]) as usize;
+        let mut body = vec![0u8; len];
+        tcp.read_exact(&mut body).await?;
+        raw.extend_from_slice(&head);
+        raw.extend_from_slice(&body);
+        handshake.extend_from_slice(&body);
+        // Type (1 byte), length (3), then the message.
+        if handshake.len() >= 4 {
+            let want = 4 + u32::from_be_bytes([0, handshake[1], handshake[2], handshake[3]]) as usize;
+            if handshake.len() >= want || want > MAX_CLIENT_HELLO {
+                return Ok((raw, handshake));
+            }
+        }
+        if raw.len() > MAX_CLIENT_HELLO {
+            return Ok((raw, handshake));
+        }
+    }
+}
+
+/// The server_name extension of a ClientHello handshake message, if any.
+fn sni_from_client_hello(handshake: &[u8]) -> Option<String> {
+    let mut p = Parser(handshake);
+    if p.u8()? != 1 {
+        return None; // not a ClientHello
+    }
+    p.take(3)?; // handshake length
+    p.take(2 + 32)?; // version, random
+    let sid = p.u8()? as usize;
+    p.take(sid)?;
+    let suites = p.u16()? as usize;
+    p.take(suites)?;
+    let comp = p.u8()? as usize;
+    p.take(comp)?;
+    let ext_len = p.u16()? as usize;
+    let mut exts = Parser(p.take(ext_len)?);
+    while let (Some(kind), Some(len)) = (exts.u16(), exts.u16()) {
+        let body = exts.take(len as usize)?;
+        if kind == 0 {
+            let mut list = Parser(body);
+            list.u16()?;
+            while let Some(name_type) = list.u8() {
+                let n = list.u16()? as usize;
+                let name = list.take(n)?;
+                if name_type == 0 {
+                    return std::str::from_utf8(name).ok().map(str::to_string);
+                }
+            }
+        }
+    }
+    None
+}
+
+struct Parser<'a>(&'a [u8]);
+
+impl<'a> Parser<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let (a, b) = (self.0.get(..n)?, self.0.get(n..)?);
+        self.0 = b;
+        Some(a)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        self.take(1).map(|b| b[0])
+    }
+    fn u16(&mut self) -> Option<u16> {
+        self.take(2).map(|b| u16::from_be_bytes([b[0], b[1]]))
+    }
 }
 
 /// Serves HTTP/1.x requests from one client connection. With `default_target`
@@ -258,7 +436,7 @@ async fn serve_http<S: AsyncRead + AsyncWrite + Unpin + Send>(
         let Some(raw) = reader.read_request(&mut client).await? else { return Ok(()) };
         ctx.stats.requests.fetch_add(1, Ordering::Relaxed);
 
-        let (target, request) = match resolve_target(raw, default_target.as_ref()) {
+        let (target, request) = match resolve_target(raw, default_target.as_ref(), ctx.invisible) {
             Ok(v) => v,
             Err(e) => {
                 client.write_all(&error_response(400, "bad_request", &e.to_string())).await?;
@@ -382,6 +560,7 @@ enum Reply {
 /// `METHOD path HTTP/2`): it goes upstream over HTTP/2 when the origin
 /// negotiates it, else as HTTP/1.1.
 async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h2: bool) -> Result<Reply> {
+    let target = ctx.redirect.as_ref().unwrap_or(target);
     let req_head = RawRequest::from_bytes(request.clone()).head()?;
     let method = req_head.method.clone();
     let url = format!("{}{}", target.origin(), req_head.target);
@@ -462,11 +641,28 @@ async fn handle_request(ctx: &Arc<Ctx>, target: &Target, mut request: Vec<u8>, h
 }
 
 /// Works out the upstream target and rewrites absolute-form requests to origin-form.
-fn resolve_target(raw: Vec<u8>, default_target: Option<&Target>) -> Result<(Target, Vec<u8>)> {
+/// With `by_host` (invisible proxying), an origin-form request goes to its Host
+/// header's host and port over http.
+fn resolve_target(raw: Vec<u8>, default_target: Option<&Target>, by_host: bool) -> Result<(Target, Vec<u8>)> {
     let req = RawRequest::from_bytes(raw);
     let head = req.head()?;
     if let Some(t) = default_target {
         return Ok((t.clone(), req.into_bytes()));
+    }
+    if by_host && head.target.starts_with('/') {
+        let host = head
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| Error::InvalidInput("invisible proxy: the request has no Host header".into()))?;
+        if !valid_authority(&host) {
+            return Err(Error::InvalidInput(format!("invisible proxy: bad Host header {host:?}")));
+        }
+        let target = Target::from_url(&format!("http://{host}"))
+            .map_err(|_| Error::InvalidInput(format!("invisible proxy: bad Host header {host:?}")))?;
+        return Ok((target, req.into_bytes()));
     }
     if !(head.target.starts_with("http://") || head.target.starts_with("https://")) {
         return Err(Error::InvalidInput(
@@ -485,6 +681,26 @@ fn resolve_target(raw: Vec<u8>, default_target: Option<&Target>) -> Result<(Targ
     Ok((target, req.into_bytes()))
 }
 
+/// A host name from a client (SNI, Host header): DNS characters only, with at most one
+/// trailing dot. The URL parser would otherwise read `a@b` as host `b` and `a/b` as host `a`.
+fn valid_client_host(host: &str) -> bool {
+    crate::connection::valid_name(host.strip_suffix('.').unwrap_or(host))
+}
+
+/// A Host header value: `host`, `host:port`, `[v6]`, or `[v6]:port`.
+fn valid_authority(value: &str) -> bool {
+    let port_ok = |p: &str| p.parse::<u16>().is_ok();
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((ip, after)) = rest.split_once(']') else { return false };
+        return ip.parse::<std::net::Ipv6Addr>().is_ok()
+            && (after.is_empty() || after.strip_prefix(':').is_some_and(port_ok));
+    }
+    match value.split_once(':') {
+        Some((host, port)) => valid_client_host(host) && port_ok(port),
+        None => valid_client_host(value),
+    }
+}
+
 /// An upstream exchange: the HTTP/1.1 connection to pool (none for HTTP/2),
 /// the request as sent (the recorded form), and the response.
 struct Upstream {
@@ -496,7 +712,11 @@ struct Upstream {
 async fn forward(ctx: &Arc<Ctx>, target: &Target, request: &[u8], method: &str, h2: bool) -> Result<Upstream> {
     // HTTP/2 client requests use HTTP/2 upstream unless the origin is known not to.
     let origin = target.origin();
-    let try_h2 = h2 && target.is_tls() && ctx.h2_origins.lock().unwrap().get(&origin) != Some(&false);
+    // NTLM authenticates a connection, which HTTP/2 doesn't allow: such origins go over HTTP/1.1.
+    let try_h2 = h2
+        && target.is_tls()
+        && !ctx.client.needs_http1(target)
+        && ctx.h2_origins.lock().unwrap().get(&origin) != Some(&false);
     if try_h2 {
         // `Client::send` goes over HTTP/2 because the request line says `HTTP/2`.
         match ctx.client.send(&RawRequest::from_bytes(request.to_vec()), target).await {
@@ -658,10 +878,76 @@ mod tests {
             b"GET http://a.test:8080/x?y=1 HTTP/1.1\r\nHost: a.test:8080\r\nProxy-Connection: keep-alive\r\n\r\n"
                 .to_vec(),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(t.origin(), "http://a.test:8080");
         assert_eq!(out, b"GET /x?y=1 HTTP/1.1\r\nHost: a.test:8080\r\n\r\n");
-        assert!(resolve_target(b"GET /x HTTP/1.1\r\n\r\n".to_vec(), None).is_err());
+        assert!(resolve_target(b"GET /x HTTP/1.1\r\n\r\n".to_vec(), None, false).is_err());
+        // Invisible proxying routes origin-form requests by their Host header.
+        let (t, _) = resolve_target(b"GET /x HTTP/1.1\r\nHost: b.test:81\r\n\r\n".to_vec(), None, true).unwrap();
+        assert_eq!(t.origin(), "http://b.test:81");
+        assert!(resolve_target(b"GET /x HTTP/1.1\r\n\r\n".to_vec(), None, true).is_err());
+        for good in ["b.test", "b.test.", "b.test:81", "10.0.0.5:80", "[::1]", "[::1]:81"] {
+            assert!(valid_authority(good), "{good}");
+        }
+        for bad in [
+            "a@b.test",
+            "a/b",
+            "a b",
+            "b.test:99999",
+            "b.test:1:2",
+            "[::1",
+            "[nope]",
+            "[::1]x",
+            "b.test:",
+            "é.test",
+            "a?b",
+            "a#b",
+            "",
+        ] {
+            assert!(!valid_authority(bad), "{bad}");
+            let req = format!("GET /x HTTP/1.1\r\nHost: {bad}\r\n\r\n").into_bytes();
+            assert!(resolve_target(req, None, true).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn reads_sni_from_a_client_hello() {
+        // A ClientHello with only a server_name extension for "app.test".
+        let name = b"app.test";
+        let mut sni = vec![0x00, 0x00];
+        let list_len = (name.len() + 3) as u16;
+        sni.extend_from_slice(&(list_len + 2).to_be_bytes());
+        sni.extend_from_slice(&list_len.to_be_bytes());
+        sni.push(0);
+        sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni.extend_from_slice(name);
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.extend_from_slice(&[0, 0, 2, 0x13, 0x01, 1, 0]);
+        body.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        body.extend_from_slice(&sni);
+        let mut hs = vec![1, 0, 0, body.len() as u8];
+        hs.extend_from_slice(&body);
+        assert_eq!(sni_from_client_hello(&hs).as_deref(), Some("app.test"));
+        assert_eq!(sni_from_client_hello(&hs[..15]), None);
+        // Split over two records, as TLS allows: both are read before parsing.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut records = Vec::new();
+            for part in [&hs[..10], &hs[10..]] {
+                records.extend_from_slice(&[0x16, 3, 1]);
+                records.extend_from_slice(&(part.len() as u16).to_be_bytes());
+                records.extend_from_slice(part);
+            }
+            let sent = records.clone();
+            tokio::spawn(async move { TcpStream::connect(addr).await.unwrap().write_all(&sent).await.unwrap() });
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let (raw, handshake) = read_client_hello(&mut tcp).await.unwrap();
+            assert_eq!((raw, sni_from_client_hello(&handshake).as_deref()), (records, Some("app.test")));
+        });
     }
 }

@@ -7,6 +7,7 @@ pub mod auth_record;
 pub mod capture;
 pub mod checks;
 pub mod codec;
+pub mod connection;
 pub mod crawl;
 pub mod data;
 pub mod diff;

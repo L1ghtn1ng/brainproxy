@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use brainproxy_core::http::{RawRequest, SendOptions};
+use brainproxy_core::http::{RawRequest, SendOptions, Target};
 use brainproxy_core::proxy::config::{
     InterceptSettings, Rule, RuleLocation, Scope, TimeoutAction, INTERCEPT_KEY, RULES_KEY, SCOPE_KEY,
 };
@@ -82,6 +82,14 @@ pub struct ProxyRunArgs {
     /// Don't offer HTTP/2 to clients on intercepted TLS connections (HTTP/1.1 only).
     #[arg(long)]
     no_http2: bool,
+    /// Invisible proxying for clients that don't know they're proxied (pointed here by DNS
+    /// or /etc/hosts): route plain requests by their Host header and TLS by its SNI (port 443).
+    #[arg(long)]
+    invisible: bool,
+    /// Send every request from this listener to this origin (http://HOST:PORT or https://...),
+    /// like a reverse proxy. Implies --invisible.
+    #[arg(long, value_name = "URL")]
+    redirect: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -447,6 +455,13 @@ fn start(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) -> Result<(
     if args.no_http2 {
         cmd.arg("--no-http2");
     }
+    if args.invisible {
+        cmd.arg("--invisible");
+    }
+    if let Some(r) = &args.redirect {
+        Target::from_url(r)?;
+        cmd.args(["--redirect", r]);
+    }
     if let Some(name) = &args.auth {
         store.auth_profile(name)?; // Fail fast on an unknown profile.
         cmd.args(["--auth", name]);
@@ -490,6 +505,7 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
         http2: false,
     };
     let auth = crate::auth_cmd::maybe_session(project, args.auth.as_deref(), &upstream)?;
+    let redirect = args.redirect.as_deref().map(Target::from_url).transpose()?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&args.listen)
@@ -510,7 +526,14 @@ fn run_foreground(project: &Path, home: &Path, args: ProxyRunArgs, out: &Out) ->
         out.ok(state_json(&state), || format!("proxy listening on http://{addr}"));
 
         let shutdown = process::shutdown(&store, STOP_KEY);
-        let opts = ProxyOptions { project: project.to_path_buf(), upstream, auth: auth.clone(), http2: !args.no_http2 };
+        let opts = ProxyOptions {
+            project: project.to_path_buf(),
+            upstream,
+            auth: auth.clone(),
+            http2: !args.no_http2,
+            invisible: args.invisible,
+            redirect: redirect.clone(),
+        };
         let result = brainproxy_core::proxy::run(listener, std::sync::Arc::new(ca), opts, shutdown).await;
         if read_state(&store)?.is_some_and(|s| s.state.pid == std::process::id()) {
             store.meta_set(STATE_KEY, None)?;

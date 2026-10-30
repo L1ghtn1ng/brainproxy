@@ -121,6 +121,54 @@ Run the agent as a non-root user. On Windows the file is
 a standard user, who can read it but not change it. For defence in depth, also restrict the runner's egress
 with a firewall, since other tools on the box (curl, sqlmap, ...) aren't bound by brainproxy.
 
+## Connection options
+
+Upstream proxies, host overrides, client certificates, and TLS pass-through apply to every
+outbound request (send, race, fuzz, crawl, scans, checks, imports, logins, and the proxy's
+upstream side). They're stored in the project; a running proxy picks up a change within a
+second, other commands when they start. None of them widens the scope.
+
+```sh
+# Upstream proxy by host pattern (first match wins; no match: direct). HTTP CONNECT or SOCKS5.
+brainproxy connection upstream add --host '*' --proxy socks5://127.0.0.1:1080
+brainproxy connection upstream add --host '*.corp.test' --proxy http://127.0.0.1:3128 \
+    --username alice --password-env PROXY_PW --first      # password read at connect time, never stored
+brainproxy connection upstream add --host intranet.corp.test --direct --first
+# Host override, like /etc/hosts (the name must be in scope; a private or loopback address must be listed too)
+brainproxy connection hosts add app.example.com 10.0.0.5
+# Client certificate for mutual TLS (HTTP/1.1 and HTTP/2): PEM pair, or PKCS#12
+brainproxy connection cert add --host api.example.com --cert client.pem --key client.key
+brainproxy connection cert add --host '*.bank.test' --pkcs12 id.p12 --password-env P12_PW
+# Hosts whose TLS the proxy tunnels without decrypting (still scope-checked, recorded as a CONNECT)
+brainproxy connection passthrough add pinned.example.com
+brainproxy connection show                           # everything, with warnings
+brainproxy connection route https://app.example.com/ # address, proxy, certificate, platform auth for a target
+```
+
+- **Upstream proxies are asked for the checked address.** brainproxy resolves the target
+  and checks it against the scope as usual, then asks the proxy to connect to that IP, not
+  the name, so the proxy can't take a request somewhere the scope doesn't allow. SNI and
+  Host stay the name. The trade-off: the proxy sees and logs IP addresses (a proxy that
+  filters by host name won't match), and plain-HTTP targets go through a CONNECT tunnel too
+  (a proxy that only allows CONNECT to port 443 can't carry them). `socks5h` is refused.
+- **Which proxies may be used.** A proxy on this machine (loopback: another local intercepting proxy) works
+  as it is. Any other proxy could read what passes through it (TLS isn't verified by
+  default), so the scope decides, not the changeable settings: list it when the engagement
+  starts, `engagement start --target ... --proxy 10.0.0.1:3128`, and, when there is a system
+  scope file, under `"proxies": ["10.0.0.1:3128"]` there too.
+- **Host overrides can't reach internal addresses on their own.** Anyone running brainproxy
+  can set one, so a private, loopback, or link-local address must be listed in the scope by
+  address, even for a name listed exactly (a DNS answer for such a name may be private).
+  A public address isn't restricted: the override then sends that name's traffic there.
+- **Platform authentication** (HTTP Basic, Digest, NTLMv2) lives in auth profiles:
+  `brainproxy auth add corp --platform ntlm --platform-host '*.corp.test' --username 'CORP\alice' --password-env CORP_PW`.
+  It answers those hosts' 401 challenges on every command and through the proxy, without
+  `--auth`; the header is added on the wire only, so history never holds it.
+- **Invisible proxying** for clients that can't be told about a proxy (pointed at it by DNS
+  or `/etc/hosts`): `proxy start --listen 0.0.0.0:80 --invisible` routes plain requests by
+  their Host header and TLS by its SNI (to port 443). `--redirect https://app.example.com:8443`
+  sends everything from the listener to one origin.
+
 ## Usage
 
 ```sh
@@ -232,6 +280,8 @@ brainproxy auth add api --login-url https://app.example.com/api/login \
     --login-body '{"username":"{{username}}","password":"{{password}}"}' --username alice --password-env APP_PW \
     --token-regex '"token":"([^"]+)"' --token-header 'Authorization: Bearer {{token}}'
 brainproxy auth add key -H 'X-Api-Key: ...'       # static headers only
+brainproxy auth add corp --platform digest --platform-host intranet.example.com \
+    --username alice --password-env APP_PW        # Basic/Digest/NTLM, answered on every command
 brainproxy auth login app                         # verify; failures list the history ids to inspect
 brainproxy crawl https://app.example.com/ --auth app
 brainproxy scan active --auth app --background

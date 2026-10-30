@@ -24,6 +24,9 @@ pub enum AuthCmd {
         CSRF: --csrf-url PAGE --csrf-regex 'name=\"csrf\" value=\"([^\"]+)\"' fills {{csrf}}.\n\
         Bearer token: --token-regex '\"token\":\"([^\"]+)\"' --token-header 'Authorization: Bearer {{token}}'.\n\
         Static API key only: --header 'X-Api-Key: ...' (no --login-url).\n\
+        Platform auth (HTTP Basic, Digest, NTLM): --platform ntlm --platform-host '*.corp.test' --username 'CORP\\bob' \
+        --password-env BOB_PW. It answers those hosts' 401 challenges on every command, no --auth needed, and is added \
+        on the wire only (history keeps the request without it).\n\
         Logout detection: a 401, a redirect to the login path, or --logged-out REGEX triggers an automatic re-login.")]
     Add(Box<AddArgs>),
     /// Log in now and store the session.
@@ -153,6 +156,16 @@ pub struct AddArgs {
     /// Maximum automatic re-logins per command run.
     #[arg(long, default_value_t = 20)]
     max_relogins: u32,
+    /// Platform authentication with --username and the password: answer this scheme's 401
+    /// challenges from --platform-host hosts on every command.
+    #[arg(long, value_parser = ["basic", "digest", "ntlm"], requires = "platform_host")]
+    platform: Option<String>,
+    /// Host pattern platform auth is offered to (host, *.domain, *, optional :port). Repeatable.
+    #[arg(long, requires = "platform")]
+    platform_host: Vec<String>,
+    /// NTLM domain (else taken from a DOMAIN\user username).
+    #[arg(long, requires = "platform")]
+    domain: Option<String>,
 }
 
 /// Network options for commands that log in.
@@ -245,6 +258,17 @@ pub fn auth(project: &Path, home: &Path, cmd: AuthCmd, out: &Out) -> Result<(), 
                 headers: parse(&a.headers)?,
                 relogin_interval_secs: a.relogin_interval,
                 max_relogins: a.max_relogins,
+                platform: a
+                    .platform
+                    .as_deref()
+                    .map(|scheme| -> Result<_, Error> {
+                        Ok(brainproxy_core::connection::PlatformAuth {
+                            scheme: brainproxy_core::connection::PlatformScheme::parse(scheme)?,
+                            hosts: a.platform_host.clone(),
+                            domain: a.domain.clone(),
+                        })
+                    })
+                    .transpose()?,
             };
             let store = Store::open(project)?;
             // `auth show` redacts header values; re-saving one unchanged (the GUI's edit form does)

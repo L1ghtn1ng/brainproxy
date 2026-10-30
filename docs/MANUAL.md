@@ -286,10 +286,48 @@ byte, side by side or unified.
     placeholder; log in again or edit the request. Responses are stored as received, so
     session cookies the site sets still appear there. Projects recorded before this kept
     plaintext values in their older requests.
+  - **Platform authentication:** HTTP Basic, Digest, or NTLM for some hosts, with the
+    profile's username and password (for NTLM, the domain in its own field or as
+    `DOMAIN\user`). brainproxy answers those hosts' 401 challenges on every command and
+    through the proxy, without choosing the profile; the header is added on the wire only,
+    so history keeps the request without it. A request that brings its own Authorization
+    header is left alone. NTLM works over HTTP/1.1 only: the proxy sends those hosts'
+    requests upstream over HTTP/1.1 even when the browser speaks HTTP/2 to it.
 - **Match & replace:** rewrite requests and responses passing through the proxy.
 - **Intercept options:** which methods, hosts, and paths to hold, and the timeout.
 - **Proxy:** whether it runs (with a start button), its URL, and how to point a browser,
   Chromium, curl, or a shell at it.
+- **Connections:** options for every request brainproxy sends (also from scans, the crawler,
+  the fuzzer, logins, and the proxy's upstream side). A running proxy picks up a change
+  within a second. None of them widens the engagement scope.
+  - *Upstream proxies:* HTTP (CONNECT) or SOCKS5, with an optional username and a password
+    read from an environment variable, by host pattern (`app.test`, `*.corp.test`, `*`, with
+    an optional `:port`); the first match wins, a *direct* rule makes an exception, and no
+    match connects directly. The proxy is asked for the address brainproxy resolved and
+    checked, never the name, so it can't reach anything the scope doesn't allow. It
+    therefore sees IP addresses, and plain-HTTP targets go through a CONNECT tunnel too.
+    A proxy on this machine works as it is; any other one must be listed when the
+    engagement starts (`--proxy HOST:PORT`) and, if there is a system scope file, under its
+    `"proxies"`, because a proxy could read what passes through it. Proxy usernames and
+    passwords go in clear to the proxy (Basic for HTTP, plain for SOCKS5), so on a proxy
+    off this machine anyone on the network path can read them.
+  - *Host overrides:* like /etc/hosts, connect to an address for a name. The name must be
+    in scope. A private, loopback, or link-local address must also be listed in the scope
+    by address, even for a name listed exactly, because whoever runs brainproxy chooses the
+    override (an exact name's DNS answer may be private; an override's may not). A public
+    address needs no listing, and that name's traffic, logins included, then goes there.
+    TLS SNI and Host stay the name.
+  - *Client certificates:* for mutual TLS, a PEM certificate and key or a PKCS#12 file (its
+    password from an environment variable), by host pattern, over HTTP/1.1 and HTTP/2. A
+    file that can't be read makes connections to its hosts fail with the reason, never go
+    out without the certificate.
+  - *TLS pass-through:* hosts whose TLS the proxy tunnels without decrypting (certificate
+    pinning, traffic you mustn't see). Still scope-checked; each connection is recorded as a
+    `CONNECT` entry with the byte counts and no content.
+  - *Check a target:* the address and where it came from, the proxy, certificate, and
+    platform auth a request to it would use (`connection route`).
+  - Passwords are never stored: give the variable's name, and set it where the command or
+    the proxy runs (the proxy reads it in its own process).
 - **TLS / CA:** the certificate to trust in other tools, with per-OS instructions.
 - **Rules & data:** update the ZAP rule data and Nuclei templates; check for a new
   brainproxy daily, download it automatically, or check now.
@@ -304,7 +342,7 @@ byte, side by side or unified.
 
 Every app action is a command; `--format json` (the default when output isn't a terminal)
 gives one JSON object per call, with `ok`, the command, and `data` or an `error` with a
-`kind`. `brainproxy capabilities` describes all 90 commands, their flags, and exit codes.
+`kind`. `brainproxy capabilities` describes all 114 commands, their flags, and exit codes.
 
 When a command's output can contain anything from the target (bodies, headers, page
 titles, out-of-band interactions, finding evidence), the object also has
@@ -341,6 +379,29 @@ brainproxy report html -o acme-report.html
 brainproxy project save --output ~/work/acme-copy.bpdb   # consistent copy, safe while in use; never overwrites
 brainproxy project stop     # stop the project's proxy, OOB listener, jobs and fuzz runs (deletes nothing)
 ```
+
+Connection options (see Settings › Connections above for what each does):
+
+```sh
+brainproxy engagement start --target app.acme.test --proxy 10.0.0.1:3128   # allow a proxy off this machine
+brainproxy connection upstream add --host '*' --proxy http://10.0.0.1:3128 --username me --password-env PROXY_PW
+brainproxy connection upstream add --host '*.lab.acme.test' --proxy socks5://127.0.0.1:1080 --first
+brainproxy connection hosts add app.acme.test 10.20.0.5
+brainproxy connection cert add --host api.acme.test --pkcs12 me.p12 --password-env P12_PW
+brainproxy connection passthrough add login.acme.test
+brainproxy connection route https://app.acme.test/      # what a request there would use
+brainproxy connection show
+brainproxy auth add corp --platform ntlm --platform-host '*.acme.test' --username 'ACME\me' --password-env CORP_PW
+brainproxy proxy start --listen 0.0.0.0:8080 --invisible  # also serve clients that don't know they're proxied
+brainproxy proxy start --listen 127.0.0.1:8443 --redirect https://app.acme.test  # everything to one origin
+```
+
+With `--invisible`, plain requests in origin form (`GET /path`) go to their Host header's
+host and port, and a TLS client that connects directly gets a certificate for its SNI and
+goes to that name on port 443; ordinary proxy requests work on the same listener. A
+`--redirect URL` sends every request from the listener to that origin (implies
+`--invisible`). Pass-through hosts and hosts outside the proxy scope are tunnelled as with
+CONNECT.
 
 Crawl and active-scan scope and safety flags:
 

@@ -14,6 +14,12 @@
 //! refused unless the scope includes them by address (see [`Internal`] for the
 //! exceptions).
 //! Hostnames are compared in one canonical form (see [`norm_host`]).
+//!
+//! Connection options ([`crate::connection`]) never widen this: a host override
+//! takes the place of DNS, its address is checked the same way and, because whoever
+//! sets it chooses the address, an internal one must be listed by address; an upstream
+//! proxy is only used when it runs on this machine or every scope lists it under
+//! `proxies` (see [`Guard::resolve_proxy`]).
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -222,6 +228,8 @@ pub struct Scope {
     pub origin: String,
     include: Vec<Entry>,
     exclude: Vec<Entry>,
+    /// Upstream proxies (other than ones on this machine) connections may go through.
+    proxies: Vec<Entry>,
 }
 
 impl Scope {
@@ -231,7 +239,21 @@ impl Scope {
         }
         let include = spec.include.iter().map(|e| Entry::parse(e)).collect::<Result<Vec<_>>>()?;
         let exclude = spec.exclude.iter().map(|e| Entry::parse(e)).collect::<Result<Vec<_>>>()?;
-        Ok(Self { spec, origin: origin.to_string(), include, exclude })
+        Ok(Self { spec, origin: origin.to_string(), include, exclude, proxies: vec![] })
+    }
+
+    /// Allows these upstream proxies (scope entry syntax: host, IP, or CIDR, with optional :port).
+    pub fn with_proxies(mut self, proxies: &[String]) -> Result<Self> {
+        self.proxies = proxies.iter().map(|e| Entry::parse(e)).collect::<Result<Vec<_>>>()?;
+        Ok(self)
+    }
+
+    /// Whether this scope lets connections go through the proxy at `host:port` = `ip`.
+    /// A proxy listed by name may not be a link-local or metadata address unless
+    /// listed by address too.
+    fn allows_proxy(&self, host: &str, port: u16, ip: IpAddr) -> bool {
+        self.proxies.iter().any(|e| e.matches_addr(ip, port))
+            || (self.proxies.iter().any(|e| e.matches_name(host, port)) && internal(ip) != Some(Internal::Sensitive))
     }
 
     /// Whether connecting to `host:port`, resolved to `addrs`, is allowed. Returns
@@ -288,24 +310,32 @@ pub struct Guard {
     scopes: Vec<Scope>,
     /// Values behind auth placeholders, filled in as requests go out.
     pub vault: crate::auth::Vault,
+    /// Connection options (upstream proxies, host overrides, client certificates,
+    /// platform credentials) every client of the guard uses.
+    pub net: crate::connection::Live,
 }
 
 impl Guard {
     /// Loads the system scope plus the project's engagement scope.
     pub fn load(engagement: Option<ScopeSpec>) -> Result<Arc<Self>> {
+        Self::load_with_proxies(engagement, &[])
+    }
+
+    /// [`Guard::load`], with the upstream proxies the engagement allows.
+    pub fn load_with_proxies(engagement: Option<ScopeSpec>, engagement_proxies: &[String]) -> Result<Arc<Self>> {
         let mut scopes = Vec::new();
-        if let Some(spec) = load_system_scope()? {
-            scopes.push(Scope::compile(spec, "system scope")?);
+        if let Some((spec, proxies)) = load_system()? {
+            scopes.push(Scope::compile(spec, "system scope")?.with_proxies(&proxies)?);
         }
         if let Some(spec) = engagement {
-            scopes.push(Scope::compile(spec, "engagement scope")?);
+            scopes.push(Scope::compile(spec, "engagement scope")?.with_proxies(engagement_proxies)?);
         }
         if scopes.is_empty() {
             return Err(Error::OutOfScope(
                 "no engagement scope: run `brainproxy engagement start --target HOST ...` first".into(),
             ));
         }
-        Ok(Arc::new(Self { scopes, vault: Default::default() }))
+        Ok(Arc::new(Self { scopes, vault: Default::default(), net: Default::default() }))
     }
 
     /// A guard from explicit specs (no system file), for tests and embedding.
@@ -314,7 +344,19 @@ impl Guard {
         if scopes.is_empty() {
             return Err(Error::OutOfScope("no scope".into()));
         }
-        Ok(Arc::new(Self { scopes, vault: Default::default() }))
+        Ok(Arc::new(Self { scopes, vault: Default::default(), net: Default::default() }))
+    }
+
+    /// [`Guard::from_specs`] with allowed upstream proxies for each scope, for tests.
+    pub fn from_specs_with_proxies(specs: Vec<(ScopeSpec, Vec<String>)>) -> Result<Arc<Self>> {
+        let scopes = specs
+            .into_iter()
+            .map(|(s, p)| Scope::compile(s, "engagement scope")?.with_proxies(&p))
+            .collect::<Result<Vec<_>>>()?;
+        if scopes.is_empty() {
+            return Err(Error::OutOfScope("no scope".into()));
+        }
+        Ok(Arc::new(Self { scopes, vault: Default::default(), net: Default::default() }))
     }
 
     pub fn scopes(&self) -> &[Scope] {
@@ -323,6 +365,16 @@ impl Guard {
 
     /// Resolves `host` and returns the socket addresses every scope allows.
     pub async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        self.resolve_with(host, port, &self.net.get()).await
+    }
+
+    /// [`Guard::resolve`] with the host overrides of this snapshot of the connection options.
+    pub async fn resolve_with(
+        &self,
+        host: &str,
+        port: u16,
+        net: &crate::connection::Compiled,
+    ) -> Result<Vec<SocketAddr>> {
         // Look the name up as given (a trailing dot stops search-domain expansion),
         // but check it in canonical form.
         let lookup = host.trim_start_matches('[').trim_end_matches(']');
@@ -333,6 +385,12 @@ impl Guard {
                 // Refuse names no scope could allow before touching DNS.
                 self.precheck_name(bare, port)?;
                 let named = self.scopes.iter().all(|sc| sc.include.iter().any(|e| e.matches_name(bare, port)));
+                // A host override stands in for DNS, but it's a setting anyone running brainproxy can
+                // change, not an answer from the name's owner: an internal address must be listed.
+                if let Some(ip) = net.host_override(bare) {
+                    self.check_override(bare, port, ip)?;
+                    return self.check(bare, port, vec![ip]);
+                }
                 match tokio::net::lookup_host((lookup, port)).await {
                     Ok(addrs) => addrs.map(|a| a.ip()).collect(),
                     // A name that every scope lists by name is in scope; it just doesn't resolve.
@@ -346,7 +404,28 @@ impl Guard {
                 }
             }
         };
-        let mut allowed = addrs.clone();
+        self.check(bare, port, addrs)
+    }
+
+    /// Refuses a host override to an internal address unless every scope lists that
+    /// address: no exception for an exact name (private) or `localhost` (loopback).
+    fn check_override(&self, bare: &str, port: u16, ip: IpAddr) -> Result<()> {
+        if internal(ip).is_none() {
+            return Ok(());
+        }
+        match self.scopes.iter().find(|s| !s.include.iter().any(|e| e.matches_addr(ip, port))) {
+            Some(s) => Err(Error::OutOfScope(format!(
+                "host override {bare} -> {ip} is an internal address the {} doesn't list; it must list the address \
+                 (or its CIDR) for an override to reach it",
+                s.origin
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The addresses of `bare:port` that every scope allows.
+    fn check(&self, bare: &str, port: u16, addrs: Vec<IpAddr>) -> Result<Vec<SocketAddr>> {
+        let mut allowed = addrs;
         for scope in &self.scopes {
             let ok = scope.allowed_addrs(bare, port, &allowed).map_err(Error::OutOfScope)?;
             allowed.retain(|ip| ok.contains(ip));
@@ -355,6 +434,60 @@ impl Guard {
             return Err(Error::OutOfScope(format!("{bare}:{port} resolves only to addresses outside the scope")));
         }
         Ok(allowed.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
+    }
+
+    /// Resolves an upstream proxy and returns the addresses connections may go to:
+    /// loopback (a proxy on this machine), or ones every scope lists under `proxies`.
+    /// A proxy anywhere else could read what goes through it (TLS isn't verified by
+    /// default), so the scopes, not the changeable connection settings, decide.
+    ///
+    /// Host overrides don't apply: an override of a proxy listed by name would let a
+    /// changeable setting choose who reads the traffic.
+    pub async fn resolve_proxy(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        self.precheck_proxy(host, port)?;
+        let bare = norm_host(host);
+        let addrs: Vec<IpAddr> = match bare.parse::<IpAddr>() {
+            Ok(ip) => vec![ip],
+            Err(_) => tokio::net::lookup_host((host.trim_start_matches('[').trim_end_matches(']'), port))
+                .await
+                .map_err(|e| Error::Connect(format!("upstream proxy {bare}: {e}")))?
+                .map(|a| a.ip())
+                .collect(),
+        };
+        let ok: Vec<SocketAddr> = addrs
+            .into_iter()
+            .filter(|&ip| self.proxy_addr_allowed(&bare, port, ip))
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+        if ok.is_empty() {
+            return Err(proxy_refused(&bare, port));
+        }
+        Ok(ok)
+    }
+
+    /// The check of [`Guard::resolve_proxy`] that needs no DNS: fails when the proxy
+    /// can't be allowed whatever its name resolves to. As for targets, such a name
+    /// isn't looked up (DNS would carry it out).
+    pub fn precheck_proxy(&self, host: &str, port: u16) -> Result<()> {
+        let bare = norm_host(host);
+        let possible = match bare.parse::<IpAddr>() {
+            Ok(ip) => self.proxy_addr_allowed(&bare, port, ip),
+            Err(_) => {
+                bare == "localhost"
+                    || self.scopes.iter().all(|s| {
+                        s.proxies.iter().any(|e| e.matches_name(&bare, port) || matches!(e.pattern, Pattern::Net(..)))
+                    })
+            }
+        };
+        if possible {
+            Ok(())
+        } else {
+            Err(proxy_refused(&bare, port))
+        }
+    }
+
+    fn proxy_addr_allowed(&self, bare: &str, port: u16, ip: IpAddr) -> bool {
+        unwrap_v4(ip).is_loopback() || self.scopes.iter().all(|s| s.allows_proxy(bare, port, ip))
     }
 
     /// Quick name-only check (no DNS): false when no scope could ever allow it.
@@ -383,6 +516,13 @@ impl Guard {
     }
 }
 
+fn proxy_refused(bare: &str, port: u16) -> Error {
+    Error::OutOfScope(format!(
+        "upstream proxy {bare}:{port} is not allowed: use a proxy on this machine (loopback), or list it with \
+         `engagement start --proxy HOST:PORT` (and under \"proxies\" in the system scope file, when there is one)"
+    ))
+}
+
 fn system_scope_path() -> Option<PathBuf> {
     system_scope_at(Path::new(SYSTEM_SCOPE_PATH), std::env::var_os(SYSTEM_SCOPE_ENV))
 }
@@ -400,12 +540,25 @@ fn system_scope_at(fixed: &Path, env: Option<std::ffi::OsString>) -> Option<Path
 /// The system scope, if configured. A configured but unreadable or invalid file is
 /// an error, never "no scope".
 pub fn load_system_scope() -> Result<Option<ScopeSpec>> {
+    Ok(load_system()?.map(|(spec, _)| spec))
+}
+
+/// Upstream proxies a scope's JSON allows: its optional `"proxies"` list.
+#[derive(Deserialize)]
+struct ProxyList {
+    #[serde(default)]
+    proxies: Vec<String>,
+}
+
+/// The system scope and the upstream proxies it allows.
+pub fn load_system() -> Result<Option<(ScopeSpec, Vec<String>)>> {
     let Some(path) = system_scope_path() else { return Ok(None) };
     let text = std::fs::read_to_string(&path)
         .map_err(|e| Error::OutOfScope(format!("system scope {} unreadable: {e}", path.display())))?;
-    let spec: ScopeSpec = serde_json::from_str(&text)
-        .map_err(|e| Error::OutOfScope(format!("system scope {} invalid: {e}", path.display())))?;
-    Ok(Some(spec))
+    let invalid = |e: serde_json::Error| Error::OutOfScope(format!("system scope {} invalid: {e}", path.display()));
+    let spec: ScopeSpec = serde_json::from_str(&text).map_err(invalid)?;
+    let proxies: ProxyList = serde_json::from_str(&text).map_err(invalid)?;
+    Ok(Some((spec, proxies.proxies)))
 }
 
 pub fn system_scope_location() -> Option<PathBuf> {
@@ -585,10 +738,30 @@ impl crate::store::Store {
         }
     }
 
+    /// The upstream proxies the engagement allows (`engagement start --proxy`).
+    pub fn engagement_proxies(&self) -> Result<Vec<String>> {
+        match self.meta_get(ENGAGEMENT_KEY)? {
+            Some(v) => serde_json::from_str::<ProxyList>(&v)
+                .map(|p| p.proxies)
+                .map_err(|e| Error::OutOfScope(format!("stored engagement scope is invalid: {e}"))),
+            None => Ok(vec![]),
+        }
+    }
+
     /// Sets the engagement scope. Write-once: fails if one is already set.
     pub fn engagement_start(&self, spec: &ScopeSpec) -> Result<()> {
-        Scope::compile(spec.clone(), "engagement scope")?;
-        let json = serde_json::to_string(spec).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        self.engagement_start_with_proxies(spec, &[])
+    }
+
+    /// [`Store::engagement_start`], also allowing these upstream proxies. They are
+    /// stored with the scope, so they are write-once too.
+    pub fn engagement_start_with_proxies(&self, spec: &ScopeSpec, proxies: &[String]) -> Result<()> {
+        Scope::compile(spec.clone(), "engagement scope")?.with_proxies(proxies)?;
+        let mut value = serde_json::to_value(spec).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        if !proxies.is_empty() {
+            value["proxies"] = serde_json::json!(proxies);
+        }
+        let json = value.to_string();
         // INSERT (not upsert) so a concurrent or repeated start can't replace it.
         match self
             .conn
@@ -605,8 +778,9 @@ impl crate::store::Store {
     /// The guard for this project: system scope plus engagement scope, and the
     /// project's auth values for filling in placeholders of stored requests.
     pub fn guard(&self) -> Result<Arc<Guard>> {
-        let guard = Guard::load(self.engagement()?)?;
+        let guard = Guard::load_with_proxies(self.engagement()?, &self.engagement_proxies()?)?;
         self.auth_fill_vault(&guard.vault)?;
+        guard.net.set(self.connection_compiled()?);
         Ok(guard)
     }
 }

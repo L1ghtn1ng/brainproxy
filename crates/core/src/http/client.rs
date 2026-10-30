@@ -5,6 +5,11 @@
 //! whose options, guard included, never change; every pooled connection was
 //! opened by [`Client::connect`] for the same scheme, host, and port, so reuse
 //! never skips a scope decision.
+//!
+//! The guard's connection options apply to every connection: host overrides
+//! (through [`Guard::resolve`]), upstream proxies, client certificates, and
+//! platform authentication (answering 401 challenges). Their generation is part of
+//! the pool key, so a running proxy that reloads them opens new connections.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,6 +23,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use crate::connection::{ClientIdentity, Compiled, PlatformCred, PlatformScheme, Route};
 use crate::error::{Error, Result};
 use crate::guard::Guard;
 use crate::http::h2::{setup_error, H2Request};
@@ -71,11 +77,22 @@ pub struct Conn {
     /// Whether it came from the pool (so a failure may just mean the server
     /// closed it while idle).
     pub reused: bool,
+    /// The generation of the connection options it was opened with; it isn't
+    /// pooled again once they change.
+    pub generation: u64,
 }
 
 /// Sockets belong to the runtime that opened them (auth logs in on a short-lived
-/// one), so the runtime is part of the key.
-type PoolKey = (tokio::runtime::Id, String, String, u16);
+/// one), so the runtime is part of the key, and so is the generation of the
+/// connection options they were opened with.
+type PoolKey = (tokio::runtime::Id, u64, String, String, u16);
+
+/// What platform authentication learned about an origin, so later requests carry
+/// the header from the start instead of waiting for a 401 each time.
+enum Learned {
+    Basic,
+    Digest(crate::connection::platform::DigestChallenge, u32),
+}
 
 #[derive(Default)]
 struct Pool {
@@ -84,6 +101,12 @@ struct Pool {
     h2: Mutex<HashMap<PoolKey, h2::client::SendRequest<bytes::Bytes>>>,
     h2_connecting: tokio::sync::Mutex<()>,
     opened: std::sync::atomic::AtomicU64,
+    /// TLS configurations with a client certificate: (generation, certificate index, h2).
+    cert_tls: Mutex<HashMap<(u64, usize, bool), TlsConnector>>,
+    /// Keyed by generation and origin.
+    learned: Mutex<HashMap<(u64, String), Learned>>,
+    /// The latest generation seen; entries of older ones are dropped when it changes.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -94,33 +117,63 @@ pub struct Client {
     pool: Arc<Pool>,
 }
 
-fn pool_key(target: &Target) -> PoolKey {
-    let rt = tokio::runtime::Handle::current().id();
-    (rt, target.scheme.to_ascii_lowercase(), target.host.to_ascii_lowercase(), target.port)
+/// A TLS client configuration offering `alpn`, verifying certificates or not, and
+/// presenting `identity` when given.
+fn tls_config(verify: bool, alpn: &[u8], identity: Option<&ClientIdentity>) -> Result<ClientConfig> {
+    let builder = if verify {
+        let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+        ClientConfig::builder().with_root_certificates(roots)
+    } else {
+        ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerify))
+    };
+    let mut config = match identity {
+        None => builder.with_no_client_auth(),
+        Some(id) => builder
+            .with_client_auth_cert(id.chain.clone(), id.key()?)
+            .map_err(|e| Error::Tls(format!("client certificate: {e}")))?,
+    };
+    config.alpn_protocols = vec![alpn.to_vec()];
+    Ok(config)
 }
 
 impl Client {
     pub fn new(opts: SendOptions) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let config = if opts.verify_tls {
-            let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-            ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
-        } else {
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth()
-        };
-        let mut config = config;
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let mut h2_config = config.clone();
-        h2_config.alpn_protocols = vec![b"h2".to_vec()];
+        let config = tls_config(opts.verify_tls, b"http/1.1", None).expect("TLS configuration without a certificate");
+        let h2_config = tls_config(opts.verify_tls, b"h2", None).expect("TLS configuration without a certificate");
         Self {
             tls: TlsConnector::from(Arc::new(config)),
             tls_h2: TlsConnector::from(Arc::new(h2_config)),
             opts,
             pool: Arc::default(),
         }
+    }
+
+    /// The connection options in force (none without a guard). When they have
+    /// changed, pooled connections, TLS configurations, and learned platform auth
+    /// of older generations are dropped.
+    fn net(&self) -> Arc<Compiled> {
+        let net = self.opts.guard.as_ref().map(|g| g.net.get()).unwrap_or_default();
+        let gen = net.generation;
+        if self.pool.generation.swap(gen, std::sync::atomic::Ordering::Relaxed) != gen {
+            self.pool.idle.lock().unwrap().retain(|k, _| k.1 == gen);
+            self.pool.h2.lock().unwrap().retain(|k, _| k.1 == gen);
+            self.pool.cert_tls.lock().unwrap().retain(|k, _| k.0 == gen);
+            self.pool.learned.lock().unwrap().retain(|k, _| k.0 == gen);
+        }
+        net
+    }
+
+    fn pool_key(&self, target: &Target, generation: u64) -> PoolKey {
+        let rt = tokio::runtime::Handle::current().id();
+        (rt, generation, target.scheme.to_ascii_lowercase(), target.host.to_ascii_lowercase(), target.port)
+    }
+
+    /// A new connection, opened with the options in force now.
+    async fn fresh(&self, target: &Target) -> Result<Conn> {
+        let net = self.net();
+        let stream = self.connect_with(target, &net).await?;
+        Ok(Conn { stream, reader: WireReader::new(), reused: false, generation: net.generation })
     }
 
     pub fn options(&self) -> &SendOptions {
@@ -135,7 +188,8 @@ impl Client {
     /// A pooled connection to `target` idle for less than `max_idle`, or a new one from
     /// [`Client::connect`].
     pub async fn checkout(&self, target: &Target, max_idle: Duration) -> Result<Conn> {
-        let key = pool_key(target);
+        let generation = self.net().generation;
+        let key = self.pool_key(target, generation);
         let pooled = {
             let mut idle = self.pool.idle.lock().unwrap();
             let list = idle.entry(key).or_default();
@@ -144,19 +198,20 @@ impl Client {
             list.pop_if(|(_, at)| at.elapsed() < max_idle)
         };
         if let Some((stream, _)) = pooled {
-            return Ok(Conn { stream, reader: WireReader::new(), reused: true });
+            return Ok(Conn { stream, reader: WireReader::new(), reused: true, generation });
         }
-        Ok(Conn { stream: self.connect(target).await?, reader: WireReader::new(), reused: false })
+        self.fresh(target).await
     }
 
     /// Returns a connection to the pool after a complete exchange. Connections
     /// with unread bytes (a desynchronised server) are dropped.
+    /// Connections opened with connection options that have since changed are dropped too.
     pub fn checkin(&self, target: &Target, conn: Conn) {
-        if !conn.reader.is_empty() {
+        if !conn.reader.is_empty() || conn.generation != self.net().generation {
             return;
         }
         let mut idle = self.pool.idle.lock().unwrap();
-        let list = idle.entry(pool_key(target)).or_default();
+        let list = idle.entry(self.pool_key(target, conn.generation)).or_default();
         if list.len() < POOL_PER_TARGET {
             list.push((conn.stream, Instant::now()));
         }
@@ -175,8 +230,8 @@ impl Client {
         let method = req.head().map(|h| h.method).unwrap_or_else(|_| "GET".into());
         let started = Instant::now();
         if self.opts.http2 || req.head().is_ok_and(|h| h.version.eq_ignore_ascii_case("HTTP/2")) {
-            let h2req = H2Request::from_raw(&self.fill_auth(req.as_bytes(), target)?, target)?;
-            let response = tokio::time::timeout(self.opts.timeout, self.round_trip_h2(&h2req, target))
+            let filled = self.fill_auth(req.as_bytes(), target)?;
+            let response = tokio::time::timeout(self.opts.timeout, self.round_trip_h2_auth(&filled, target, &method))
                 .await
                 .map_err(|_| Error::Timeout(self.opts.timeout))??;
             return Ok(Exchange {
@@ -213,8 +268,19 @@ impl Client {
     /// have been processed before the connection dropped) are not, and only take a
     /// connection that was idle briefly. The caller decides whether to
     /// [`Client::checkin`] the connection afterwards.
+    ///
+    /// With platform credentials for the target (and no Authorization header in
+    /// the request), a 401 challenge of their scheme is answered here, NTLM's on the
+    /// same connection; the response returned is the last one.
     pub async fn exchange(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Conn, Vec<u8>)> {
         let bytes = &*self.fill_auth(bytes, target)?;
+        match self.platform_cred(target, bytes) {
+            Some(cred) => self.exchange_platform(&cred, bytes, target, method).await,
+            None => self.exchange_once(bytes, target, method).await,
+        }
+    }
+
+    async fn exchange_once(&self, bytes: &[u8], target: &Target, method: &str) -> Result<(Conn, Vec<u8>)> {
         let repeatable =
             ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"].iter().any(|m| method.eq_ignore_ascii_case(m));
         let mut c = self.checkout(target, if repeatable { POOL_IDLE } else { POOL_IDLE_UNSAFE }).await?;
@@ -228,18 +294,167 @@ impl Client {
             match result {
                 Ok(response) => return Ok((c, response)),
                 Err(e) if repeatable && c.reused && c.reader.is_empty() && stale(&e) => {
-                    c = Conn { stream: self.connect(target).await?, reader: WireReader::new(), reused: false };
+                    c = self.fresh(target).await?;
                 }
                 Err(e) => return Err(e),
             }
         }
     }
 
+    /// One request and response on this connection.
+    async fn on_conn(&self, mut c: Conn, bytes: &[u8], method: &str) -> Result<(Conn, Vec<u8>)> {
+        c.stream.write_all(bytes).await?;
+        c.stream.flush().await?;
+        let response = c.reader.read_response(&mut c.stream, method).await?;
+        Ok((c, response))
+    }
+
+    /// Whether requests to `target` must use HTTP/1.1: its platform auth is NTLM.
+    pub fn needs_http1(&self, target: &Target) -> bool {
+        self.net().platform(&target.host, target.port).is_some_and(|c| c.scheme == PlatformScheme::Ntlm)
+    }
+
+    /// The platform credentials to use for this request: the target has some, and
+    /// the request doesn't bring its own Authorization header.
+    fn platform_cred(&self, target: &Target, bytes: &[u8]) -> Option<Arc<PlatformCred>> {
+        let cred = self.net().platform(&target.host, target.port)?;
+        let (head, _) = crate::http::request::split_head_body(bytes);
+        let own = RawRequest::from_bytes(head.to_vec())
+            .head()
+            .is_ok_and(|h| h.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")));
+        (!own).then_some(cred)
+    }
+
+    /// The Authorization value from what an earlier exchange with this origin
+    /// learned (Basic, or Digest with the next nonce count).
+    fn learned_header(&self, cred: &PlatformCred, target: &Target, method: &str, uri: &str) -> Result<Option<String>> {
+        let key = (self.net().generation, target.origin());
+        let mut learned = self.pool.learned.lock().unwrap();
+        match learned.get_mut(&key) {
+            Some(Learned::Basic) => cred.basic().map(Some),
+            Some(Learned::Digest(ch, nc)) => {
+                *nc += 1;
+                cred.digest(ch, method, uri, *nc, &crate::connection::platform::cnonce()).map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn learn(&self, target: &Target, what: Option<Learned>) {
+        let key = (self.net().generation, target.origin());
+        let mut learned = self.pool.learned.lock().unwrap();
+        match what {
+            Some(w) => learned.insert(key, w),
+            None => learned.remove(&key),
+        };
+    }
+
+    /// The Authorization value answering a Basic or Digest challenge in `response`.
+    fn answer(
+        &self,
+        cred: &PlatformCred,
+        response: &[u8],
+        method: &str,
+        uri: &str,
+    ) -> Result<Option<(String, Learned)>> {
+        use crate::connection::platform::{challenges, cnonce, DigestChallenge};
+        let offered = challenges(response);
+        Ok(match cred.scheme {
+            PlatformScheme::Basic if offered.iter().any(|c| c.scheme == "basic") => {
+                Some((cred.basic()?, Learned::Basic))
+            }
+            PlatformScheme::Digest => match DigestChallenge::pick(&offered) {
+                Some(ch) => Some((cred.digest(&ch, method, uri, 1, &cnonce())?, Learned::Digest(ch, 1))),
+                None => None,
+            },
+            _ => None,
+        })
+    }
+
+    async fn exchange_platform(
+        &self,
+        cred: &PlatformCred,
+        bytes: &[u8],
+        target: &Target,
+        method: &str,
+    ) -> Result<(Conn, Vec<u8>)> {
+        let uri = request_uri(bytes);
+        let mut sent = bytes.to_vec();
+        if let Some(value) = self.learned_header(cred, target, method, &uri)? {
+            sent = with_header(bytes, "Authorization", &value);
+        }
+        let (conn, response) = self.exchange_once(&sent, target, method).await?;
+        if status(&response) != Some(401) {
+            return Ok((conn, response));
+        }
+        self.learn(target, None);
+        // The next leg goes on this connection if it stays open, else on a new one.
+        let next = |conn: Conn, prev: &[u8], prev_resp: &[u8], req: Vec<u8>| {
+            let reuse = !close_after(prev, prev_resp, method);
+            async move {
+                if reuse {
+                    self.on_conn(conn, &req, method).await
+                } else {
+                    drop(conn);
+                    let c = self.fresh(target).await?;
+                    self.on_conn(c, &req, method).await
+                }
+            }
+        };
+        if cred.scheme == PlatformScheme::Ntlm {
+            use crate::connection::platform::{challenges, ntlm_challenge};
+            if !challenges(&response).iter().any(|c| c.scheme == "ntlm") {
+                return Ok((conn, response));
+            }
+            // NTLM authenticates the connection: keep it open between the legs.
+            let negotiate = RawRequest::from_bytes(with_header(bytes, "Authorization", &cred.ntlm_negotiate()))
+                .set_header("Connection", "keep-alive")
+                .into_bytes();
+            let (conn, challenge) = next(conn, &sent, &response, negotiate.clone()).await?;
+            let Some(msg) = ntlm_challenge(&challenges(&challenge)) else { return Ok((conn, challenge)) };
+            if status(&challenge) != Some(401) || close_after(&negotiate, &challenge, method) {
+                return Ok((conn, challenge));
+            }
+            let auth = with_header(bytes, "Authorization", &cred.ntlm_authenticate(&msg)?);
+            return self.on_conn(conn, &auth, method).await;
+        }
+        let Some((value, learned)) = self.answer(cred, &response, method, &uri)? else { return Ok((conn, response)) };
+        let (conn, answered) = next(conn, &sent, &response, with_header(bytes, "Authorization", &value)).await?;
+        if status(&answered) != Some(401) {
+            self.learn(target, Some(learned));
+        }
+        Ok((conn, answered))
+    }
+
+    /// [`Client::round_trip_h2`] with platform authentication (Basic and Digest:
+    /// NTLM needs HTTP/1.1).
+    async fn round_trip_h2_auth(&self, filled: &[u8], target: &Target, method: &str) -> Result<Vec<u8>> {
+        let cred = self.platform_cred(target, filled).filter(|c| c.scheme != PlatformScheme::Ntlm);
+        let Some(cred) = cred else { return self.round_trip_h2(&H2Request::from_raw(filled, target)?, target).await };
+        let uri = request_uri(filled);
+        let first = match self.learned_header(&cred, target, method, &uri)? {
+            Some(value) => with_header(filled, "Authorization", &value),
+            None => filled.to_vec(),
+        };
+        let response = self.round_trip_h2(&H2Request::from_raw(&first, target)?, target).await?;
+        if status(&response) != Some(401) {
+            return Ok(response);
+        }
+        self.learn(target, None);
+        let Some((value, learned)) = self.answer(&cred, &response, method, &uri)? else { return Ok(response) };
+        let again = with_header(filled, "Authorization", &value);
+        let response = self.round_trip_h2(&H2Request::from_raw(&again, target)?, target).await?;
+        if status(&response) != Some(401) {
+            self.learn(target, Some(learned));
+        }
+        Ok(response)
+    }
+
     /// Sends on the pooled HTTP/2 connection to `target`, opening one if there
     /// is none. If the pooled connection has gone away (checked before anything
     /// is sent), a new one is opened.
     async fn round_trip_h2(&self, req: &H2Request, target: &Target) -> Result<Vec<u8>> {
-        let key = pool_key(target);
+        let key = self.pool_key(target, self.net().generation);
         let mut fresh = false;
         let sender = match self.h2_pooled(&key).await {
             Some(s) => s,
@@ -277,12 +492,14 @@ impl Client {
 
     /// Opens an HTTP/2 connection, runs its driver task, and pools the sender.
     async fn h2_handshake(&self, target: &Target) -> Result<h2::client::SendRequest<bytes::Bytes>> {
-        let stream = self.connect_h2(target).await?;
+        let net = self.net();
+        let stream = self.connect_h2_with(target, &net).await?;
         let (sender, conn) = h2::client::handshake(stream).await.map_err(crate::http::h2::h2_error)?;
         tokio::spawn(async move {
             let _ = conn.await;
         });
-        self.pool.h2.lock().unwrap().insert(pool_key(target), sender.clone());
+        // Pooled under the generation it was opened with: a newer one won't find it.
+        self.pool.h2.lock().unwrap().insert(self.pool_key(target, net.generation), sender.clone());
         Ok(sender)
     }
 
@@ -290,12 +507,18 @@ impl Client {
     /// for https (an error if the server picks anything else), plain TCP for
     /// http (prior knowledge). Goes through the scope guard like [`Client::connect`].
     pub async fn connect_h2(&self, target: &Target) -> Result<Stream> {
-        let tcp = self.connect_tcp(target).await?;
+        self.connect_h2_with(target, &self.net()).await
+    }
+
+    /// [`Client::connect_h2`] with one snapshot of the connection options throughout.
+    async fn connect_h2_with(&self, target: &Target, net: &Compiled) -> Result<Stream> {
         if !target.is_tls() {
-            return Ok(Box::new(tcp));
+            return Ok(Box::new(self.connect_tcp(target, net).await?));
         }
+        let connector = self.connector(true, target, net)?;
+        let tcp = self.connect_tcp(target, net).await?;
         let refused = || Error::Protocol(format!("{}:{} did not negotiate HTTP/2 (ALPN h2)", target.host, target.port));
-        let tls = self.tls_handshake(&self.tls_h2, tcp, target).await.map_err(|e| match e {
+        let tls = self.tls_handshake(&connector, tcp, target).await.map_err(|e| match e {
             Error::Tls(m) if m.contains("NoApplicationProtocol") => refused(),
             e => e,
         })?;
@@ -309,11 +532,38 @@ impl Client {
     /// must pass the scope guard; the connection goes to an address the guard
     /// checked.
     pub async fn connect(&self, target: &Target) -> Result<Stream> {
-        let tcp = self.connect_tcp(target).await?;
+        self.connect_with(target, &self.net()).await
+    }
+
+    /// [`Client::connect`] with one snapshot of the connection options throughout
+    /// (address, route, and certificate all from the same generation).
+    async fn connect_with(&self, target: &Target, net: &Compiled) -> Result<Stream> {
         if !target.is_tls() {
-            return Ok(Box::new(tcp));
+            return Ok(Box::new(self.connect_tcp(target, net).await?));
         }
-        Ok(Box::new(self.tls_handshake(&self.tls, tcp, target).await?))
+        // A client certificate that can't be loaded fails before any connection.
+        let connector = self.connector(false, target, net)?;
+        let tcp = self.connect_tcp(target, net).await?;
+        Ok(Box::new(self.tls_handshake(&connector, tcp, target).await?))
+    }
+
+    /// The TLS configuration for `target`: with the client certificate its host
+    /// pattern asks for, if any.
+    fn connector(&self, h2: bool, target: &Target, net: &Compiled) -> Result<TlsConnector> {
+        let Some((index, identity)) = net.client_cert(&target.host, target.port) else {
+            return Ok(if h2 { self.tls_h2.clone() } else { self.tls.clone() });
+        };
+        if let Some(e) = &identity.error {
+            return Err(Error::Tls(format!("client certificate for {}: {e}", target.host)));
+        }
+        let key = (net.generation, index, h2);
+        if let Some(c) = self.pool.cert_tls.lock().unwrap().get(&key) {
+            return Ok(c.clone());
+        }
+        let alpn: &[u8] = if h2 { b"h2" } else { b"http/1.1" };
+        let connector = TlsConnector::from(Arc::new(tls_config(self.opts.verify_tls, alpn, Some(&identity))?));
+        self.pool.cert_tls.lock().unwrap().insert(key, connector.clone());
+        Ok(connector)
     }
 
     async fn tls_handshake(
@@ -329,19 +579,57 @@ impl Client {
     }
 
     /// The only place sockets to targets are opened: resolves through the scope
-    /// guard and connects only to the addresses it checked.
-    async fn connect_tcp(&self, target: &Target) -> Result<TcpStream> {
+    /// guard and connects only to the addresses it checked, directly or through
+    /// the upstream proxy the connection options pick (asked for the checked
+    /// address, never the name).
+    async fn connect_tcp(&self, target: &Target, net: &Compiled) -> Result<TcpStream> {
         let guard = self.opts.guard.as_ref().ok_or_else(|| {
             Error::OutOfScope("no engagement scope: run `brainproxy engagement start --target HOST ...` first".into())
         })?;
-        let addrs = guard.resolve(&target.host, target.port).await?;
-        let tcp = TcpStream::connect(&addrs[..])
-            .await
-            .map_err(|e| Error::Connect(format!("{}:{}: {e}", target.host, target.port)))?;
+        let addrs = guard.resolve_with(&target.host, target.port, net).await?;
+        let tcp = match net.route(&target.host, target.port) {
+            Route::Direct => TcpStream::connect(&addrs[..])
+                .await
+                .map_err(|e| Error::Connect(format!("{}:{}: {e}", target.host, target.port)))?,
+            Route::Proxy(proxy) => {
+                let proxy_addrs = guard.resolve_proxy(&proxy.host, proxy.port).await?;
+                let mut last = None;
+                let mut opened = None;
+                for addr in &addrs {
+                    match proxy.open(&proxy_addrs, *addr).await {
+                        Ok(t) => {
+                            opened = Some(t);
+                            break;
+                        }
+                        Err(e) => last = Some(e),
+                    }
+                }
+                match (opened, last) {
+                    (Some(t), _) => t,
+                    (None, Some(e)) => return Err(e),
+                    (None, None) => return Err(Error::Connect(format!("{}: no address", target.host))),
+                }
+            }
+        };
         tcp.set_nodelay(true).ok();
         self.pool.opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(tcp)
     }
+}
+
+/// The final response's status.
+fn status(response: &[u8]) -> Option<u16> {
+    parse_response_head(final_response(response)).ok().map(|h| h.status)
+}
+
+/// The request target from the request line (the Digest `uri`).
+fn request_uri(bytes: &[u8]) -> String {
+    let (head, _) = crate::http::request::split_head_body(bytes);
+    RawRequest::from_bytes(head.to_vec()).head().map(|h| h.target).unwrap_or_else(|_| "/".into())
+}
+
+fn with_header(bytes: &[u8], name: &str, value: &str) -> Vec<u8> {
+    RawRequest::from_bytes(bytes.to_vec()).set_header(name, value).into_bytes()
 }
 
 /// Whether an error on a reused connection means the server had closed it.

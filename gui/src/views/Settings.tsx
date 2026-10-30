@@ -1,5 +1,5 @@
 // Project and tool settings: auth profiles, match & replace, intercept options, proxy setup,
-// the CA, rule data, project info, and open-source licenses. Each sub-tab loads its data when first shown.
+// connection options, the CA, rule data, project info, and open-source licenses. Each sub-tab loads its data when first shown.
 
 import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { run, type CliInput } from "../api";
@@ -10,15 +10,32 @@ import { interceptEnableArgs, type InterceptSettings } from "./Proxy";
 import { usePoll } from "../ui/usePoll";
 import { RecordLogin } from "./RecordLogin";
 import { AppUpdateSettings } from "./AppUpdate";
+import {
+  EMPTY_CERT,
+  EMPTY_UPSTREAM,
+  certAddArgs,
+  describePlatform,
+  hostsAddArgs,
+  passthroughAddArgs,
+  platformArgs,
+  platformForm,
+  upstreamAddArgs,
+  type CertForm,
+  type ConnectionSettings,
+  type PlatformAuth,
+  type PlatformForm,
+  type UpstreamForm,
+} from "./connection";
 import NOTICE from "../../../NOTICE?raw";
 
-type Sub = "auth" | "rules" | "intercept" | "proxy" | "ca" | "data" | "project" | "licenses";
+type Sub = "auth" | "rules" | "intercept" | "proxy" | "connections" | "ca" | "data" | "project" | "licenses";
 
 const SUBS: { id: Sub; label: string }[] = [
   { id: "auth", label: "Auth profiles" },
   { id: "rules", label: "Match & replace" },
   { id: "intercept", label: "Intercept options" },
   { id: "proxy", label: "Proxy" },
+  { id: "connections", label: "Connections" },
   { id: "ca", label: "TLS / CA" },
   { id: "data", label: "Rules & data" },
   { id: "project", label: "Project" },
@@ -41,6 +58,7 @@ export function SettingsView() {
       {sub === "rules" && <Rules />}
       {sub === "intercept" && <Intercept />}
       {sub === "proxy" && <ProxySetup />}
+      {sub === "connections" && <Connections />}
       {sub === "ca" && <Ca />}
       {sub === "data" && <RuleData />}
       {sub === "project" && <Project />}
@@ -128,6 +146,7 @@ interface Profile {
   headers: [string, string][];
   relogin_interval_secs: number;
   max_relogins: number;
+  platform?: PlatformAuth;
 }
 
 interface ProfileItem {
@@ -158,6 +177,7 @@ interface Form {
   headers: string;
   reloginInterval: string;
   maxRelogins: string;
+  platform: PlatformForm;
 }
 
 const EMPTY_FORM: Form = {
@@ -181,6 +201,7 @@ const EMPTY_FORM: Form = {
   headers: "",
   reloginInterval: "5",
   maxRelogins: "20",
+  platform: platformForm(),
 };
 
 const headerLines = (h: [string, string][]) => h.map(([k, v]) => `${k}: ${v}`).join("\n");
@@ -208,6 +229,7 @@ function formOf(p: Profile): Form {
     headers: headerLines(p.headers),
     reloginInterval: String(p.relogin_interval_secs),
     maxRelogins: String(p.max_relogins),
+    platform: platformForm(p.platform),
   };
 }
 
@@ -239,6 +261,7 @@ function addArgs(f: Form): string[] {
   lines("--header", f.headers);
   opt("--relogin-interval", f.reloginInterval);
   opt("--max-relogins", f.maxRelogins);
+  args.push(...platformArgs(f.platform));
   args.push("--", f.name.trim());
   return args;
 }
@@ -310,7 +333,7 @@ function Auth() {
   };
 
   const set = (patch: Partial<Form>) => form && setForm({ ...form, ...patch });
-  const text = (key: keyof Form, placeholder = "") => (
+  const text = (key: { [K in keyof Form]: Form[K] extends string ? K : never }[keyof Form], placeholder = "") => (
     <input className="input" value={form![key]} placeholder={placeholder} onChange={(e) => set({ [key]: e.target.value })} />
   );
 
@@ -442,6 +465,45 @@ function Auth() {
               </Field>
             )}
           </div>
+          <h3>Platform authentication</h3>
+          <p className="muted small">
+            HTTP Basic, Digest, or NTLM with the username and password above. brainproxy answers these hosts' 401
+            challenges on every command and through the proxy, without --auth; the header is added on the wire only, so
+            history never holds it. For NTLM give the domain here or as DOMAIN\user.
+          </p>
+          <div className="form">
+            <div>
+              <span className="label">Scheme</span>
+              <div className="seg">
+                {(["", "basic", "digest", "ntlm"] as const).map((m) => (
+                  <button
+                    key={m || "none"}
+                    className={form.platform.scheme === m ? "on" : ""}
+                    onClick={(e) => (e.preventDefault(), set({ platform: { ...form.platform, scheme: m } }))}
+                  >
+                    {m ? m.toUpperCase() : "None"}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {form.platform.scheme && (
+              <>
+                <Field label="Hosts (one pattern per line: app.test, *.corp.test, *)" wide>
+                  <textarea
+                    className="input area mono"
+                    value={form.platform.hosts}
+                    placeholder="*.corp.test"
+                    onChange={(e) => set({ platform: { ...form.platform, hosts: e.target.value } })}
+                  />
+                </Field>
+                {form.platform.scheme === "ntlm" && (
+                  <Field label="Domain">
+                    <input className="input" value={form.platform.domain} onChange={(e) => set({ platform: { ...form.platform, domain: e.target.value } })} />
+                  </Field>
+                )}
+              </>
+            )}
+          </div>
           <h3>Session checks</h3>
           <div className="form">
             <Field label="Logged-in regex">{text("loggedIn", "Logout")}</Field>
@@ -533,6 +595,7 @@ function Auth() {
                 ["Logged out", shown.profile.logged_out],
                 ["Check URL", shown.profile.check_url],
                 ["Headers", headerLines(shown.profile.headers)],
+                ["Platform auth", shown.profile.platform && describePlatform(shown.profile.platform)],
                 ["Re-login", `at most ${shown.profile.max_relogins} per run, ${shown.profile.relogin_interval_secs} s apart`],
               ] as [string, string | undefined][]
             )
@@ -552,6 +615,209 @@ function Auth() {
         <div className="blank">Select a profile, or add one.</div>
       )}
     </Split>
+  );
+}
+
+// ---------------- Connections ----------------
+
+/** Upstream proxies, host overrides, client certificates, and TLS pass-through (`connection *`). */
+function Connections() {
+  const exec = useRunner();
+  const [s, setS] = useState<ConnectionSettings | null>(null);
+  const [up, setUp] = useState<UpstreamForm>({ ...EMPTY_UPSTREAM });
+  const [host, setHost] = useState({ host: "", ip: "" });
+  const [cert, setCert] = useState<CertForm>({ ...EMPTY_CERT });
+  const [pass, setPass] = useState("");
+  const [probe, setProbe] = useState("");
+  const [route, setRoute] = useState<any>(null);
+
+  // Every connection command answers with the full settings.
+  const apply = async (args: string[]) => {
+    const d = await exec<ConnectionSettings>(args);
+    if (d) setS(d);
+    return d;
+  };
+  useEffect(() => {
+    apply(["connection", "show"]);
+  }, []);
+  if (!s) return <div className="blank">Loading…</div>;
+
+  const remove = (what: string, h: string) => (
+    <button className="btn small" onClick={() => apply(["connection", what, "remove", `--host=${h}`])}>
+      Remove
+    </button>
+  );
+
+  return (
+    <div className="detail">
+      <div className="detail-head">
+        <h2>Connections</h2>
+      </div>
+      <p className="muted small">
+        These apply to every request brainproxy sends (send, scans, crawl, fuzz, imports, logins, and the proxy's
+        upstream side). A running proxy picks up changes within a second. None of them widens the engagement scope:
+        every target is still resolved and checked, and passwords are read from environment variables, never stored.
+      </p>
+      {s.warnings.length > 0 && (
+        <ul className="set-err small">
+          {s.warnings.map((w) => (
+            <li key={w}>{w}</li>
+          ))}
+        </ul>
+      )}
+
+      <h3>Upstream proxies</h3>
+      <p className="muted small">
+        First matching host pattern wins; no match connects directly. The proxy is asked for the address brainproxy
+        checked, never the name. Proxies on this machine work as they are; others must be listed when the engagement
+        starts (<span className="mono">engagement start --proxy HOST:PORT</span>).
+      </p>
+      <table className="set-table">
+        <tbody>
+          {s.upstream.map((r) => (
+            <tr key={r.host}>
+              <td className="mono">{r.host}</td>
+              <td className="mono">{r.proxy ?? <span className="muted">direct</span>}</td>
+              <td className="mono">{r.username ? `${r.username}${r.password_env ? ` · $${r.password_env}` : ""}` : ""}</td>
+              <td>{remove("upstream", r.host)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="toolbar flat">
+        <input className="input mono" placeholder="host pattern" value={up.host} onChange={(e) => setUp({ ...up, host: e.target.value })} />
+        <label className="check">
+          <input type="checkbox" checked={up.direct} onChange={(e) => setUp({ ...up, direct: e.target.checked })} /> direct
+        </label>
+        {!up.direct && (
+          <>
+            <input className="input grow mono" placeholder="socks5://127.0.0.1:1080 or http://proxy:3128" value={up.proxy} onChange={(e) => setUp({ ...up, proxy: e.target.value })} />
+            <input className="input" placeholder="username" value={up.username} onChange={(e) => setUp({ ...up, username: e.target.value })} />
+            <input className="input mono" placeholder="password env var" value={up.passwordEnv} onChange={(e) => setUp({ ...up, passwordEnv: e.target.value })} />
+          </>
+        )}
+        <label className="check">
+          <input type="checkbox" checked={up.first} onChange={(e) => setUp({ ...up, first: e.target.checked })} /> first
+        </label>
+        <button
+          className="btn primary"
+          disabled={!up.host.trim() || (!up.direct && !up.proxy.trim())}
+          onClick={async () => (await apply(upstreamAddArgs(up))) && setUp({ ...EMPTY_UPSTREAM })}
+        >
+          Add
+        </button>
+      </div>
+
+      <h3>Host overrides</h3>
+      <p className="muted small">
+        Like /etc/hosts: connect to this address for the name. The name must be in scope, and a private, loopback, or
+        link-local address must also be listed in the scope by address. A public address needs no listing;
+        TLS SNI and the Host header stay the name.
+      </p>
+      <table className="set-table">
+        <tbody>
+          {s.hosts.map((h) => (
+            <tr key={h.host}>
+              <td className="mono">{h.host}</td>
+              <td className="mono">{h.ip}</td>
+              <td>
+                <button className="btn small" onClick={() => apply(["connection", "hosts", "remove", "--", h.host])}>
+                  Remove
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="toolbar flat">
+        <input className="input mono" placeholder="app.test" value={host.host} onChange={(e) => setHost({ ...host, host: e.target.value })} />
+        <input className="input mono" placeholder="10.0.0.5" value={host.ip} onChange={(e) => setHost({ ...host, ip: e.target.value })} />
+        <button
+          className="btn primary"
+          disabled={!host.host.trim() || !host.ip.trim()}
+          onClick={async () => (await apply(hostsAddArgs(host.host, host.ip))) && setHost({ host: "", ip: "" })}
+        >
+          Add
+        </button>
+      </div>
+
+      <h3>Client certificates (mutual TLS)</h3>
+      <p className="muted small">Offered to matching hosts over HTTP/1.1 and HTTP/2. The files are read when settings load.</p>
+      <table className="set-table">
+        <tbody>
+          {s.client_certs.map((c) => (
+            <tr key={c.host}>
+              <td className="mono">{c.host}</td>
+              <td className="mono">{c.pkcs12 ? `${c.pkcs12}${c.password_env ? ` · $${c.password_env}` : ""}` : `${c.cert} + ${c.key}`}</td>
+              <td>{remove("cert", c.host)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="toolbar flat">
+        <input className="input mono" placeholder="host pattern" value={cert.host} onChange={(e) => setCert({ ...cert, host: e.target.value })} />
+        <div className="seg">
+          {(["pem", "pkcs12"] as const).map((k) => (
+            <button key={k} className={cert.kind === k ? "on" : ""} onClick={() => setCert({ ...cert, kind: k })}>
+              {k === "pem" ? "PEM" : "PKCS#12"}
+            </button>
+          ))}
+        </div>
+        {cert.kind === "pem" ? (
+          <>
+            <input className="input grow mono" placeholder="/path/client.pem" value={cert.cert} onChange={(e) => setCert({ ...cert, cert: e.target.value })} />
+            <input className="input grow mono" placeholder="/path/client.key" value={cert.key} onChange={(e) => setCert({ ...cert, key: e.target.value })} />
+          </>
+        ) : (
+          <>
+            <input className="input grow mono" placeholder="/path/client.p12" value={cert.pkcs12} onChange={(e) => setCert({ ...cert, pkcs12: e.target.value })} />
+            <input className="input mono" placeholder="password env var" value={cert.passwordEnv} onChange={(e) => setCert({ ...cert, passwordEnv: e.target.value })} />
+          </>
+        )}
+        <button
+          className="btn primary"
+          disabled={!cert.host.trim() || (cert.kind === "pem" ? !cert.cert.trim() || !cert.key.trim() : !cert.pkcs12.trim())}
+          onClick={async () => (await apply(certAddArgs(cert))) && setCert({ ...EMPTY_CERT })}
+        >
+          Add
+        </button>
+      </div>
+
+      <h3>TLS pass-through</h3>
+      <p className="muted small">
+        The proxy tunnels these hosts' TLS without decrypting it (for certificate pinning, or traffic you shouldn't see).
+        Still scope-checked; each connection is recorded without its content.
+      </p>
+      <div className="toolbar flat">
+        {s.passthrough.map((p) => (
+          <span key={p} className="tag mono">
+            {p}{" "}
+            <button className="btn small" onClick={() => apply(["connection", "passthrough", "remove", "--", p])}>
+              ×
+            </button>
+          </span>
+        ))}
+      </div>
+      <div className="toolbar flat">
+        <input className="input grow mono" placeholder="bank.test *.pinned.test" value={pass} onChange={(e) => setPass(e.target.value)} />
+        <button className="btn primary" disabled={!pass.trim()} onClick={async () => (await apply(passthroughAddArgs(pass))) && setPass("")}>
+          Add
+        </button>
+      </div>
+
+      <h3>Check a target</h3>
+      <div className="toolbar flat">
+        <input className="input grow mono" placeholder="https://app.test/" value={probe} onChange={(e) => setProbe(e.target.value)} />
+        <button className="btn" disabled={!probe.trim()} onClick={async () => setRoute(await exec(["connection", "route", "--", probe.trim()]))}>
+          Show route
+        </button>
+      </div>
+      {route && <pre className="mono set-pre small">{JSON.stringify(route, null, 2)}</pre>}
+
+      <div className="row gap set-actions">
+        <ConfirmButton label="Clear all" question="Remove every connection option?" onConfirm={() => apply(["connection", "clear"])} />
+      </div>
+    </div>
   );
 }
 
