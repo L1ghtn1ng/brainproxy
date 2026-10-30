@@ -8,7 +8,7 @@ import { useApp } from "../store";
 import { HttpView } from "../ui/HttpView";
 import { Split } from "../ui/Split";
 import { usePoll } from "../ui/usePoll";
-import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./access";
+import { grid, KIND_LABEL, KINDS, liveArgs, proxyOptions, runArgs, runLabel, withLive, type AuthzRun, type CellKind, type Matrix, type RunForm } from "./accessMatrix";
 import { stateClass, type Job } from "./Scanner";
 
 const FORM: RunForm = { identities: [], anonymous: true, owner: "", select: "all", host: "", tag: "", where: "", keepCookies: "", rate: "" };

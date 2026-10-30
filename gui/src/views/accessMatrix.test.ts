@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { cellKind, grid, hostOf, liveArgs, proxyOptions, runArgs, runLabel, withLive, type Matrix, type RunForm } from "./access.ts";
+import { cellKind, grid, hostOf, liveArgs, proxyOptions, runArgs, runLabel, withLive, type Matrix, type RunForm } from "./accessMatrix.ts";
 
 const cell = (verdict: string, status: number | null, history_id: number, confidence: string | null = null) => ({ verdict, confidence, status, history_id });
 
