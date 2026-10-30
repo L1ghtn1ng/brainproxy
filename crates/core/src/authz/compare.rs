@@ -103,6 +103,14 @@ impl Noise {
         noise
     }
 
+    /// Whether the body holds anything to compare once noise is left out.
+    pub fn has_content(&self, b: &Body) -> bool {
+        match &b.json {
+            Some(_) => !self.leaves(b).is_empty(),
+            None => !self.word_counts(&b.text).is_empty(),
+        }
+    }
+
     fn leaves<'a>(&self, b: &'a Body) -> HashMap<&'a str, &'a str> {
         b.json
             .iter()

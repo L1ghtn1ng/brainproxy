@@ -520,6 +520,7 @@ Each response gets a verdict:
 | `bypass` | the owner's data came back: most of the owner's private values (JSON values the anonymous response and the request don't contain), the owner's username, or a nearly identical response when there is nothing private to look for |
 | `public` | the anonymous control got the same response, so the page isn't protected |
 | `different` | a successful but different response, such as the identity's own data |
+| `inconclusive` | a successful response with nothing to compare: an empty body, `{}`, or a HEAD or OPTIONS request. It says nothing about access, so check it by hand |
 
 A bypass is `high` confidence when the request names an object (a number, UUID, long hex
 id or email address) and the owner's values or username came back, `medium` when it names

@@ -50,6 +50,7 @@ fn handle(mut s: TcpStream, logouts: &AtomicUsize, counter: &AtomicUsize, flaky:
     let text = String::from_utf8_lossy(&buf).to_string();
     let line = text.lines().next().unwrap_or("").to_string();
     let path = line.split(' ').nth(1).unwrap_or("/").to_string();
+    let head_only = line.starts_with("HEAD ");
     let cookie = text
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
@@ -87,6 +88,8 @@ fn handle(mut s: TcpStream, logouts: &AtomicUsize, counter: &AtomicUsize, flaky:
         ("/api/orders/7", Some("alice")) => json("200 OK", order(7, "alice")),
         // Not alice's data, and without the requester's name in it either.
         ("/api/orders/7", Some(_)) => json("200 OK", order(8, "carol")),
+        // Succeeds for anyone logged in, with nothing in it to compare.
+        ("/api/orders/9", Some(_)) => "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
         ("/api/me", Some(u)) => json("200 OK", format!(r#"{{"user":"{u}","email":"{u}@shop.test","ts":{n}}}"#)),
         ("/logout", Some(_)) => {
             logouts.fetch_add(1, Ordering::SeqCst);
@@ -94,6 +97,7 @@ fn handle(mut s: TcpStream, logouts: &AtomicUsize, counter: &AtomicUsize, flaky:
         }
         _ => json("404 Not Found", "{}".into()),
     };
+    let resp = if head_only { resp.split_inclusive("\r\n\r\n").next().unwrap_or("").to_string() } else { resp };
     let _ = s.write_all(resp.as_bytes());
 }
 
@@ -214,4 +218,21 @@ fn a_rate_limited_second_baseline_does_not_hide_differences() {
     let m = ok(&p, &["authz", "matrix", &run_id]);
     assert_eq!(cell(&m, "/api/orders/7", "bob")["verdict"], "different", "{m}");
     assert_eq!(r["new_findings"], 0, "{r}");
+}
+
+#[test]
+fn empty_and_head_responses_are_not_bypasses() {
+    let srv = Server::start();
+    let p = tmp_project("empty");
+    ok(&p, &["send", "--url", &srv.url("/api/orders/9"), "--auth", "alice"]);
+    ok(&p, &["send", "-X", "HEAD", "--url", &srv.url("/api/orders/1"), "--auth", "alice"]);
+    let r = ok(&p, &["authz", "run", "--as", "bob"]);
+    assert_eq!(r["new_findings"], 0, "{r}");
+    assert!(r["verdicts"].get("bypass").is_none(), "{r}");
+    let run_id = r["run_id"].as_i64().unwrap().to_string();
+    let m = ok(&p, &["authz", "matrix", &run_id]);
+    assert_eq!(cell(&m, "/api/orders/9", "bob")["verdict"], "inconclusive", "{m}");
+    assert_eq!(cell(&m, "/api/orders/1", "bob")["verdict"], "inconclusive", "{m}");
+    // A refusal is still a refusal.
+    assert_eq!(cell(&m, "/api/orders/9", "anonymous")["verdict"], "enforced", "{m}");
 }

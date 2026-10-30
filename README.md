@@ -316,7 +316,7 @@ brainproxy auth rule list app
 # no session, compare with alice's responses. Only GET/HEAD/OPTIONS from history unless --include-methods.
 brainproxy auth add bob --login-url https://app.example.com/login ... --username bob --password-env BOB_PW
 brainproxy authz run --as bob --where "host = 'app.example.com'"   # owner worked out per request
-brainproxy authz matrix 7                         # request x identity: enforced, bypass, public, different
+brainproxy authz matrix 7                         # request x identity: enforced, bypass, public, different, ...
 brainproxy authz results 7 --verdict bypass       # with baseline/replay history ids for `diff`
 
 # Reports: findings grouped by alert type with description, solution, references, and the

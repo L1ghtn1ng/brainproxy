@@ -32,7 +32,7 @@ pub enum AuthzCmd {
     #[command(after_help = "Each request is re-sent as the identity that made it (twice: what changes between \
         the two is ignored), then without credentials, then as every --as identity. Verdicts: enforced \
         (refused), bypass (the owner's data came back), public (also without a session), different (e.g. the \
-        identity's own data). Bypasses of medium or high confidence are also findings (source authz). The \
+        identity's own data), inconclusive (nothing to compare: an empty body, or HEAD or OPTIONS). Bypasses of medium or high confidence are also findings (source authz). The \
         owner is found from the auth placeholders or session values in the request; --owner sets it. Only \
         GET, HEAD and OPTIONS requests that carry credentials are picked from history unless \
         --include-methods or --history-id says otherwise.")]
@@ -71,6 +71,7 @@ pub enum VerdictArg {
     Bypass,
     Public,
     Different,
+    Inconclusive,
     Error,
     Skipped,
 }
@@ -83,6 +84,7 @@ impl VerdictArg {
             VerdictArg::Bypass => "bypass",
             VerdictArg::Public => "public",
             VerdictArg::Different => "different",
+            VerdictArg::Inconclusive => "inconclusive",
             VerdictArg::Error => "error",
             VerdictArg::Skipped => "skipped",
         }

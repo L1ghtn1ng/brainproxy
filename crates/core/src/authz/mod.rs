@@ -1,4 +1,4 @@
-//! Access-control testing across identities (Autorize-style). Each recorded request is
+//! Access-control testing across identities. Each recorded request is
 //! sent again as the identity that made it (the baseline, twice, to learn what changes
 //! on its own), without any login (the anonymous control), and as every other identity.
 //! Each response is compared with the baseline and labelled:
@@ -7,7 +7,9 @@
 //! - `bypass`: the owner's data came back (their private values or username, or a
 //!   nearly identical response when there is nothing private to look for);
 //! - `public`: the anonymous control got the same response, so nothing is protected;
-//! - `different`: a successful but different response (e.g. the identity's own data).
+//! - `different`: a successful but different response (e.g. the identity's own data);
+//! - `inconclusive`: a successful response with nothing to compare (an empty body, `{}`,
+//!   or a HEAD or OPTIONS request), so it says nothing about access.
 //!
 //! Bypasses of medium or high confidence become findings. Everything is recorded in
 //! `authz_results`, one row per request and identity, with the history ids of the
@@ -75,7 +77,7 @@ pub const AUTHZ_RESULT_COLUMNS: &[(&str, &str, &str)] = &[
         "TEXT",
         "Identity the request was sent as: an auth profile, 'anonymous', or the owner (verdict baseline)",
     ),
-    ("verdict", "TEXT", "baseline, enforced, bypass, public, different, error, skipped"),
+    ("verdict", "TEXT", "baseline, enforced, bypass, public, different, inconclusive, error, skipped"),
     ("confidence", "TEXT", "For bypass: low, medium, high (medium and high are also findings)"),
     ("status", "INTEGER", "Response status"),
     (
@@ -153,6 +155,7 @@ pub enum Verdict {
     Bypass,
     Public,
     Different,
+    Inconclusive,
     Error,
     Skipped,
 }
@@ -165,6 +168,7 @@ impl Verdict {
             Verdict::Bypass => "bypass",
             Verdict::Public => "public",
             Verdict::Different => "different",
+            Verdict::Inconclusive => "inconclusive",
             Verdict::Error => "error",
             Verdict::Skipped => "skipped",
         }
@@ -339,6 +343,8 @@ struct Baseline<'a> {
     /// The request names an object (id, UUID, email).
     object: bool,
     privileged: bool,
+    /// The baseline has a body worth comparing: not empty, and not HEAD or OPTIONS.
+    comparable: bool,
 }
 
 /// Labels one identity's response. `user` is the identity's own username, if known.
@@ -372,6 +378,12 @@ fn judge(
         row.reason = "response says access is denied".into();
         return row;
     }
+    // Two empty bodies are "identical", which says nothing about who may see what.
+    if !base.comparable {
+        row.verdict = Verdict::Inconclusive;
+        row.reason = "a successful response with nothing to compare (no body, or HEAD or OPTIONS)".into();
+        return row;
+    }
     let sim = similarity(base.body, body, base.noise);
     let hits = private_hits(base.private, body);
     row.similarity = Some((sim * 1000.0).round() / 1000.0);
@@ -398,7 +410,9 @@ fn judge(
         return row;
     }
     let by_values = base.private.len() >= 2 && hits * 10 >= base.private.len() * 6;
-    let by_similarity = base.private.len() < 2 && sim >= 0.95;
+    // A private value that didn't come back means this is someone else's data, however
+    // alike the rest is.
+    let by_similarity = base.private.len() < 2 && hits == base.private.len() && sim >= 0.95;
     let own_data =
         user.is_some_and(|w| w.chars().count() >= 3 && mentions(&body.text, w) && !mentions(&base.body.text, w));
     if !(by_values || user_leak.is_some() || by_similarity) || (own_data && user_leak.is_none() && !by_values) {
@@ -592,6 +606,8 @@ impl Shared {
         let object =
             references_object(&msg.path, &format!("{} {}", msg.query.clone().unwrap_or_default(), msg.req_body_str()));
         let privileged = privileged_path(&msg.path);
+        let comparable =
+            !matches!(msg.method.to_ascii_uppercase().as_str(), "HEAD" | "OPTIONS") && noise.has_content(&body);
         // The anonymous control goes first: what it gets isn't private.
         let mut anon_text = None;
         let mut anon_public = false;
@@ -619,8 +635,15 @@ impl Shared {
                     private_values(&body, &noise, &public)
                 })
             };
-            let base =
-                Baseline { body: &body, noise: &noise, private, owner_user: owner_user.as_deref(), object, privileged };
+            let base = Baseline {
+                body: &body,
+                noise: &noise,
+                private,
+                owner_user: owner_user.as_deref(),
+                object,
+                privileged,
+                comparable,
+            };
             let mut row = judge(
                 &base,
                 &resp,
@@ -1039,8 +1062,57 @@ mod tests {
             owner_user: Some("alice"),
             object,
             privileged: false,
+            comparable: true,
         };
         judge(&base, &json_resp(resp), false, "GET /api/orders/17", anonymous, user)
+    }
+
+    #[test]
+    fn nothing_to_compare_is_not_a_bypass() {
+        let noise = Noise::default();
+        for empty in [Body::parse(b"HTTP/1.1 204 No Content\r\n\r\n"), json_resp("{}"), json_resp("[]")] {
+            assert!(!noise.has_content(&empty), "{empty:?}");
+            let comparable = noise.has_content(&empty);
+            let base = Baseline {
+                body: &empty,
+                noise: &noise,
+                private: &[],
+                owner_user: None,
+                object: true,
+                privileged: false,
+                comparable,
+            };
+            for anonymous in [false, true] {
+                let r = judge(&base, &empty, false, "", anonymous, None);
+                assert_eq!((r.verdict, r.confidence), (Verdict::Inconclusive, None), "{r:?}");
+            }
+            // A refusal still counts.
+            let refused = Body::parse(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+            assert_eq!(judge(&base, &refused, false, "", false, None).verdict, Verdict::Enforced);
+        }
+    }
+
+    #[test]
+    fn one_private_value_must_come_back() {
+        let shared: String = (0..40).map(|i| format!(r#""k{i}":"v{i}","#)).collect();
+        let body = json_resp(&format!(r#"{{{shared}"ref":"r-alice"}}"#));
+        let noise = Noise::default();
+        let private = [("ref".to_string(), "r-alice".to_string())];
+        let base = Baseline {
+            body: &body,
+            noise: &noise,
+            private: &private,
+            owner_user: None,
+            object: true,
+            privileged: false,
+            comparable: true,
+        };
+        let theirs = json_resp(&format!(r#"{{{shared}"ref":"r-bob"}}"#));
+        let r = judge(&base, &theirs, false, "", false, None);
+        assert!(r.similarity.unwrap() >= 0.95, "{r:?}");
+        assert_eq!(r.verdict, Verdict::Different, "{r:?}");
+        let r = judge(&base, &body, false, "", false, None);
+        assert_eq!(r.verdict, Verdict::Bypass, "{r:?}");
     }
 
     #[test]
@@ -1061,8 +1133,15 @@ mod tests {
         let denied = Body::parse(b"HTTP/1.1 200 OK\r\n\r\n{\"error\":\"Access denied\"}");
         let body = json_resp(alice);
         let noise = Noise::default();
-        let base =
-            Baseline { body: &body, noise: &noise, private: &[], owner_user: None, object: true, privileged: false };
+        let base = Baseline {
+            body: &body,
+            noise: &noise,
+            private: &[],
+            owner_user: None,
+            object: true,
+            privileged: false,
+            comparable: true,
+        };
         assert_eq!(judge(&base, &denied, false, "", false, None).verdict, Verdict::Enforced);
         let forbidden = Body::parse(b"HTTP/1.1 403 Forbidden\r\n\r\n");
         assert_eq!(judge(&base, &forbidden, false, "", false, None).verdict, Verdict::Enforced);
