@@ -877,7 +877,11 @@ impl Hooks for WsHooks {
 /// Works out the upstream target and rewrites absolute-form requests to origin-form.
 /// With `by_host` (invisible proxying), an origin-form request goes to its Host
 /// header's host and port over http.
-pub(crate) fn resolve_target(raw: Vec<u8>, default_target: Option<&Target>, by_host: bool) -> Result<(Target, Vec<u8>)> {
+pub(crate) fn resolve_target(
+    raw: Vec<u8>,
+    default_target: Option<&Target>,
+    by_host: bool,
+) -> Result<(Target, Vec<u8>)> {
     let req = RawRequest::from_bytes(raw);
     let head = req.head()?;
     if let Some(t) = default_target {
