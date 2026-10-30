@@ -189,6 +189,17 @@ fn capabilities_lists_all_commands() {
         assert!(names.contains(&want), "{want} missing from {names:?}");
     }
     assert_eq!(v["data"]["conventions"]["interactive_prompts"], false);
+    assert!(!names.contains(&"engage"), "hidden commands stay out of capabilities");
+}
+
+#[test]
+fn engage() {
+    let project = tmp_project("engage");
+    let (code, v) = run(&["engage"], &project, None);
+    assert_eq!((code, v["data"]["order"].as_str()), (0, Some("Make it so.")));
+    let help = bin().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout).into_owned();
+    assert!(help.contains("  engagement") && !help.lines().any(|l| l.trim_start().starts_with("engage ")), "{help}");
 }
 
 #[test]

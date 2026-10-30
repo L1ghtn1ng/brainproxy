@@ -1013,6 +1013,32 @@ select {
 .toast.error {
   border-left-color: var(--high);
 }
+.toast.clickable {
+  cursor: pointer;
+}
+
+.engage-dialog {
+  width: min(720px, 100%);
+}
+.engage-ship {
+  margin: 0 0 12px;
+  overflow-x: auto;
+  font-size: 12px;
+  line-height: 1.25;
+  color: var(--accent);
+}
+.engage-dialog p.engage-mission {
+  font-style: italic;
+}
+.engage-dialog p.engage-sign {
+  margin-top: 4px;
+  text-align: right;
+  color: var(--muted);
+}
+.engage-dialog p.engage-rip {
+  text-align: center;
+  color: var(--text);
+}
 
 /* ---------- project picker ---------- */
 

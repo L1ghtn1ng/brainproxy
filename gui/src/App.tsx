@@ -20,6 +20,7 @@ import { Menu, useMenu } from "./ui/Menu";
 import { ConfirmHost, confirm } from "./ui/Confirm";
 import { Welcome, remember, saveTempAs } from "./views/Welcome";
 import { usePoll } from "./ui/usePoll";
+import { EngageHost, useEngage } from "./ui/Engage";
 import { version } from "../package.json";
 
 const DISCARD_TITLE = "Discard this temporary engagement?";
@@ -245,6 +246,8 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
     };
   }, []);
 
+  useEngage(app.toast);
+
   const save = () => app.saveAs().catch((e) => app.toast(`Not saved: ${e.message}`, "error"));
   const tempTitle = app.temp
     ? `Temporary engagement, kept ${app.temp.ramBacked ? "in memory (RAM)" : "in the temp folder on disk"} and deleted when you discard it. Click to save it as a project file.`
@@ -414,9 +417,10 @@ function Shell({ onClose, toggleTheme }: { onClose: () => void; toggleTheme: () 
       </main>
       </div>
       <Menu menu={browserMenu.menu} close={browserMenu.close} />
+      <EngageHost />
       <div className="toasts">
         {app.toasts.map((t) => (
-          <div key={t.id} className={`toast ${t.kind}`}>
+          <div key={t.id} className={`toast ${t.kind}${t.onClick ? " clickable" : ""}`} onClick={t.onClick}>
             {t.text}
           </div>
         ))}

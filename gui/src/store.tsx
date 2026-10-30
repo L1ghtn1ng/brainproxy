@@ -34,6 +34,8 @@ interface Toast {
   id: number;
   text: string;
   kind: "info" | "error";
+  /** Runs when the toast is clicked. */
+  onClick?: () => void;
 }
 
 /** An open temporary project: deleted when the user discards it. Not RAM-backed where the OS has no RAM folder. */
@@ -60,7 +62,7 @@ interface State {
   sendToComparer: (text: string) => void;
   setComparer: (items: string[]) => void;
   toasts: Toast[];
-  toast: (text: string, kind?: Toast["kind"]) => void;
+  toast: (text: string, kind?: Toast["kind"], onClick?: () => void) => void;
   /** The guided scan on the Overview, opened on request (it also shows by itself until a project has a scan). */
   wizardOpen: boolean;
   openWizard: (open: boolean) => void;
@@ -94,9 +96,9 @@ export function AppProvider({
   const [wizardOpen, setWizardOpen] = useState(false);
   const nextKey = useRef(1);
 
-  const toast = useCallback((text: string, kind: Toast["kind"] = "info") => {
+  const toast = useCallback((text: string, kind: Toast["kind"] = "info", onClick?: () => void) => {
     const id = nextKey.current++;
-    setToasts((t) => [...t, { id, text, kind }]);
+    setToasts((t) => [...t, { id, text, kind, onClick }]);
     // Long messages (instructions) stay up long enough to read.
     const ms = Math.max(kind === "error" ? 7000 : 3500, text.length * 60);
     setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), ms);
