@@ -683,15 +683,15 @@ fn call(f: Func, args: Vec<Value>, re: &LazyRegex) -> Option<Value> {
             use sha2::Digest;
             str_v(hex::encode(sha2::Sha256::digest(s(0).as_bytes())))
         }
-        // Like Nuclei: hmac(hash, data, key) in hex; generate_jwt(json, alg, key[, max age]).
+        // Like Nuclei: hmac(hash, data, key) in hex; generate_jwt(json, alg, key[, unix time it expires]).
         Hmac => {
             let alg = crate::sign::HmacAlg::parse(&s(0)).ok()?;
             str_v(hex::encode(crate::sign::hmac_digest(alg, s(2).as_bytes(), s(1).as_bytes())))
         }
         GenerateJwt => {
             let alg = crate::sign::JwtAlg::parse(&s(1)).ok()?;
-            let age = args.get(3).map(|a| a.as_num().map(|n| n.max(0.0) as u64)).unwrap_or(Some(0))?;
-            str_v(crate::sign::generate_jwt(&s(0), alg, s(2).as_bytes(), (age > 0).then_some(age)).ok()?)
+            let expires = args.get(3).map(|a| a.as_num().map(|n| n.max(0.0) as u64)).unwrap_or(Some(0))?;
+            str_v(crate::sign::generate_jwt(&s(0), alg, s(2).as_bytes(), Some(expires)).ok()?)
         }
         Base64 => str_v(base64::engine::general_purpose::STANDARD.encode(s(0).as_bytes())),
         Base64Py => str_v(base64_py(s(0).as_bytes())),
@@ -964,7 +964,11 @@ mod tests {
         let v = jwt(r#"generate_jwt('{"sub":"1"}', 'HS256', 'k')"#);
         assert_eq!((v["header"]["alg"].as_str(), v["payload"]["sub"].as_str()), (Some("HS256"), Some("1")));
         assert!(v["payload"].get("exp").is_none());
-        assert!(jwt(r#"generate_jwt('{}', 'HS512', 'k', 60)"#)["payload"]["exp"].as_u64().unwrap() > 1_700_000_000);
+        assert!(
+            jwt(r#"generate_jwt('{}', 'HS512', 'k', unix_time(600))"#)["payload"]["exp"].as_u64().unwrap()
+                > 1_700_000_000
+        );
+        assert!(jwt(r#"generate_jwt('{}', 'HS512', 'k', 60)"#)["payload"].get("exp").is_none(), "60 is long past");
         assert_eq!(eval("generate_jwt('not json', 'HS256', 'k')"), None);
     }
 

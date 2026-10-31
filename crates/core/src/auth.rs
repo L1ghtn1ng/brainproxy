@@ -395,9 +395,8 @@ impl Vault {
         let mut inner = self.0.lock().unwrap();
         inner.signers.retain(|l| l.profile != profile);
         for signer in signers {
-            let key = crate::sign::load_key(signer);
             inner.sign_marks.extend(signer.marks(profile));
-            inner.signers.push(crate::sign::Loaded { profile: profile.to_string(), signer: signer.clone(), key });
+            inner.signers.push(crate::sign::Loaded::new(profile, signer.clone()));
         }
     }
 
@@ -452,6 +451,11 @@ impl Vault {
             }
             for signer in &inner.signers {
                 out = signer.sign(out, target, &stamp)?;
+            }
+            // A signer replaced since the placeholder was written leaves it unfilled.
+            let head = split_head_body(&out).0;
+            if let Some(mark) = inner.sign_marks.iter().find(|m| find(head, m.as_bytes()).is_some()) {
+                return Err(Error::InvalidInput(format!("no signer fills {mark} in this request")));
             }
         }
         Ok(Cow::Owned(out))
@@ -1109,6 +1113,30 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_signers_placeholder_never_goes_out() {
+        let signer = crate::sign::Signer {
+            name: "s".into(),
+            key: crate::sign::KeySource::Env("UNUSED".into()),
+            key_encoding: Default::default(),
+            origins: vec!["https://a.test".into()],
+            to: crate::sign::Place::Header("X-Sig".into()),
+            format: None,
+            headers: vec![],
+            kind: crate::sign::SignKind::Hmac {
+                alg: crate::sign::HmacAlg::Sha256,
+                canonical: "{{path}}".into(),
+                output: Default::default(),
+            },
+        };
+        let vault = Vault::default();
+        vault.put_signers("p", std::slice::from_ref(&signer));
+        vault.put_signers("p", &[]);
+        let raw = signer.place(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]);
+        let target = Target::from_url("https://a.test").unwrap();
+        assert!(vault.resolve(&raw, &target).unwrap_err().to_string().contains("no signer fills"));
+    }
 
     fn session(profile: AuthProfile) -> AuthSession {
         let dir = std::env::temp_dir().join(format!("bp-auth-unit-{}", std::process::id()));

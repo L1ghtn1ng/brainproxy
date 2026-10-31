@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::http::request::{find, split_head_body};
 use crate::http::{RawRequest, Target};
 
-/// Where a signing key is read from when a session loads; never stored.
+/// Where a signing key is read from when a signer first signs; never stored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum KeySource {
@@ -143,6 +143,15 @@ pub enum Place {
     Query(String),
 }
 
+impl std::fmt::Display for Place {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Place::Header(n) => write!(f, "header:{n}"),
+            Place::Query(n) => write!(f, "query:{n}"),
+        }
+    }
+}
+
 impl Place {
     /// Parses `header:NAME` or `query:NAME`.
     pub fn parse(s: &str) -> Result<Place> {
@@ -210,7 +219,14 @@ impl Signer {
         for o in &self.origins {
             Target::from_url(o).map_err(|e| what(format!("origin {o:?}: {e}")))?;
         }
-        if !valid_token(self.to.name()) {
+        let name_ok = match &self.to {
+            Place::Header(n) => valid_token(n),
+            // Sent as written, so nothing that means something in a query.
+            Place::Query(n) => {
+                !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+            }
+        };
+        if !name_ok {
             return Err(what(format!("bad destination name {:?}", self.to.name())));
         }
         if let Place::Header(n) = &self.to {
@@ -240,8 +256,9 @@ impl Signer {
             SignKind::Hmac { canonical, .. } => check_vars(canonical, &[]).map_err(what)?,
             SignKind::Jwt { claims, .. } => {
                 check_vars(claims, &[]).map_err(what)?;
-                claims_object(&render(claims, &|_| Some(b"0".to_vec()), Mode::Json))
-                    .map_err(|e| what(format!("--claims: {e}")))?;
+                // Only the times are numbers: anything else needs its quotes in the JSON.
+                let sample = |v: &str| Some(if v.starts_with("timestamp") { b"0".to_vec() } else { b"x".to_vec() });
+                claims_object(&render(claims, &sample, Mode::Json)).map_err(|e| what(format!("--claims: {e}")))?;
             }
         }
         Ok(())
@@ -367,14 +384,15 @@ impl Signer {
                     let text = self.filled(render(claims, &|v| parts.get(v), Mode::Json))?;
                     let mut payload = claims_object(&text)?;
                     let mut header = Map::new();
-                    if *resign {
-                        if let Ok(old) = crate::codec::decode_jwt(&String::from_utf8_lossy(token)) {
-                            let object = |v: &Value| v.as_object().cloned().unwrap_or_default();
-                            header = object(&old["header"]);
-                            let mut merged = object(&old["payload"]);
-                            merged.append(&mut payload);
-                            payload = merged;
-                        }
+                    if *resign && !token.is_empty() {
+                        let old = crate::codec::decode_jwt(&String::from_utf8_lossy(token)).map_err(|_| {
+                            Error::InvalidInput(format!("signer {:?}: no JWT to re-sign in {}", self.name, self.to))
+                        })?;
+                        let object = |v: &Value| v.as_object().cloned().unwrap_or_default();
+                        header = object(&old["header"]);
+                        let mut merged = object(&old["payload"]);
+                        merged.append(&mut payload);
+                        payload = merged;
                     }
                     if let Some(ttl) = ttl {
                         // `claims` wins, but a re-signed token's old times don't.
@@ -406,7 +424,7 @@ impl Signer {
     }
 }
 
-/// A key loaded for the session. The message of a key that can't be loaded names where
+/// Reads a signer's key. The message of a key that can't be loaded names where
 /// it should have come from, never what was there.
 pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
     let (raw, from) = match &s.key {
@@ -416,7 +434,7 @@ pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
         }
         KeySource::File(path) => {
             let from = format!("file {}", path.display());
-            (std::fs::read(path).map_err(|e| format!("{from}: {}", e.kind()))?, from)
+            (std::fs::read(path).map_err(|_| format!("{from} can't be read"))?, from)
         }
     };
     let trimmed = String::from_utf8_lossy(&raw);
@@ -430,15 +448,27 @@ pub(crate) fn load_key(s: &Signer) -> std::result::Result<Vec<u8>, String> {
     }
 }
 
-/// A signer with its key as the vault keeps it.
+/// A signer as the vault keeps it, with its key once it has signed: a key no request
+/// needs stays where it is.
 #[derive(Clone)]
 pub(crate) struct Loaded {
     pub profile: String,
     pub signer: Signer,
-    pub key: std::result::Result<Vec<u8>, String>,
+    key: std::sync::OnceLock<std::result::Result<Vec<u8>, String>>,
 }
 
 impl Loaded {
+    pub(crate) fn new(profile: &str, signer: Signer) -> Self {
+        Loaded { profile: profile.to_string(), signer, key: Default::default() }
+    }
+
+    fn check_origin(&self, target: &Target) -> Result<()> {
+        if self.signer.origins.iter().any(|o| same_origin(o, target)) {
+            return Ok(());
+        }
+        Err(Error::InvalidInput(format!("signer {:?} doesn't sign for {}", self.signer.name, target.origin())))
+    }
+
     fn used(&self, raw: &[u8]) -> bool {
         let (head, _) = split_head_body(raw);
         self.signer.marks(&self.profile).iter().any(|m| find(head, m.as_bytes()).is_some())
@@ -449,10 +479,7 @@ impl Loaded {
         if !self.used(&raw) {
             return Ok(raw);
         }
-        let name = &self.signer.name;
-        if !self.signer.origins.iter().any(|o| same_origin(o, target)) {
-            return Err(Error::InvalidInput(format!("signer {name:?} doesn't sign for {}", target.origin())));
-        }
+        self.check_origin(target)?;
         self.signer.set_headers(raw, &self.profile, target, stamp)
     }
 
@@ -461,8 +488,10 @@ impl Loaded {
         if !self.used(&raw) {
             return Ok(raw);
         }
+        self.check_origin(target)?;
         let name = &self.signer.name;
-        let key = self.key.as_ref().map_err(|e| Error::InvalidInput(format!("signer {name:?}: {e}")))?;
+        let key = self.key.get_or_init(|| load_key(&self.signer));
+        let key = key.as_ref().map_err(|e| Error::InvalidInput(format!("signer {name:?}: {e}")))?;
         let out = self.signer.sign(raw, &self.profile, key, target, stamp)?;
         if self.used(&out) {
             return Err(Error::InvalidInput(format!("signer {name:?} has a placeholder out of place in this request")));
@@ -706,7 +735,11 @@ pub fn jwt_token(alg: JwtAlg, key: &[u8], header: &[u8], payload: &[u8]) -> Resu
         JwtAlg::HS384 => hmac_digest(HmacAlg::Sha384, key, input.as_bytes()),
         JwtAlg::HS512 => hmac_digest(HmacAlg::Sha512, key, input.as_bytes()),
         JwtAlg::RS256 => {
-            let bad = || Error::InvalidInput("the RS256 key is not a PEM RSA private key".into());
+            let bad = || {
+                Error::InvalidInput(
+                    "the RS256 key must be an unencrypted PEM RSA private key of 2048 bits or more".into(),
+                )
+            };
             let pem = pem::parse(key).map_err(|_| bad())?;
             let pair = match pem.tag() {
                 "PRIVATE KEY" => signature::RsaKeyPair::from_pkcs8(pem.contents()),
@@ -723,13 +756,15 @@ pub fn jwt_token(alg: JwtAlg, key: &[u8], header: &[u8], payload: &[u8]) -> Resu
     Ok(format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig)))
 }
 
-/// `{"alg":ALG,"typ":"JWT"}` over the claims JSON, with `exp` set when `max_age` is
-/// given: the check DSL's `generate_jwt`.
-pub(crate) fn generate_jwt(claims: &str, alg: JwtAlg, key: &[u8], max_age: Option<u64>) -> Result<String> {
+/// `{"alg":ALG,"typ":"JWT"}` over the claims JSON: the check DSL's `generate_jwt`. Like
+/// Nuclei's, `expires` is a unix time: one still ahead sets `exp` and `iat`, unless the
+/// claims have an `exp`.
+pub(crate) fn generate_jwt(claims: &str, alg: JwtAlg, key: &[u8], expires: Option<u64>) -> Result<String> {
     let mut payload = claims_object(claims.as_bytes())?;
-    if let Some(age) = max_age {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        payload.insert("exp".into(), now.saturating_add(age).into());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    if let Some(at) = expires.filter(|at| *at > now + 1 && !payload.contains_key("exp")) {
+        payload.insert("exp".into(), at.into());
+        payload.insert("iat".into(), now.into());
     }
     let header = serde_json::json!({"alg": alg.name(), "typ": "JWT"}).to_string();
     let payload = serde_json::to_vec(&payload).map_err(|e| Error::InvalidInput(e.to_string()))?;
@@ -790,7 +825,7 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     }
 
     fn signed(s: &Signer, raw: &[u8], key: &[u8]) -> Result<String> {
-        let loaded = Loaded { profile: "p".into(), signer: s.clone(), key: Ok(key.to_vec()) };
+        let loaded = Loaded { profile: "p".into(), signer: s.clone(), key: Ok(key.to_vec()).into() };
         let target = Target::from_url("https://a.test").unwrap();
         Ok(String::from_utf8(applied(&loaded, s.place(raw, "p", &[]), &target)?).unwrap())
     }
@@ -989,7 +1024,8 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
     #[test]
     fn a_signer_can_cover_the_headers_of_a_signer_after_it_but_not_an_unmade_signature() {
         let target = Target::from_url("https://a.test").unwrap();
-        let load = |signer: &Signer| Loaded { profile: "p".into(), signer: signer.clone(), key: Ok(b"k".to_vec()) };
+        let load =
+            |signer: &Signer| Loaded { profile: "p".into(), signer: signer.clone(), key: Ok(b"k".to_vec()).into() };
         let mut covers = hmac_signer("{{header:X-Time}}", Place::Header("X-Sig".into()));
         covers.name = "covers".into();
         let mut sets = hmac_signer("{{path}}", Place::Header("X-Other".into()));
@@ -1029,11 +1065,67 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let s = hmac_signer("{{path}}", Place::Header("X-Sig".into()));
         let raw = s.place(b"GET / HTTP/1.1\r\nHost: b.test\r\n\r\n", "p", &[]);
         let other = Target::from_url("https://b.test").unwrap();
-        let loaded = Loaded { profile: "p".into(), signer: s.clone(), key: Ok(b"k".to_vec()) };
+        let loaded = Loaded { profile: "p".into(), signer: s.clone(), key: Ok(b"k".to_vec()).into() };
         assert!(applied(&loaded, raw.clone(), &other).is_err());
         let here = Target::from_url("https://a.test").unwrap();
-        let loaded = Loaded { profile: "p".into(), signer: s, key: Err("environment variable K is not set".into()) };
+        let loaded =
+            Loaded { profile: "p".into(), signer: s, key: Err("environment variable K is not set".to_string()).into() };
         assert!(applied(&loaded, raw, &here).unwrap_err().to_string().contains("K is not set"));
+    }
+
+    #[test]
+    fn signing_alone_checks_the_origin() {
+        let s = hmac_signer("{{path}}", Place::Header("X-Sig".into()));
+        let raw = s.place(b"GET / HTTP/1.1\r\nHost: b.test\r\n\r\n", "p", &[]);
+        let loaded = Loaded { profile: "p".into(), signer: s, key: Ok(b"k".to_vec()).into() };
+        let (other, stamp) = (Target::from_url("https://b.test").unwrap(), Stamp::new().unwrap());
+        assert!(loaded.sign(raw, &other, &stamp).unwrap_err().to_string().contains("doesn't sign for"));
+    }
+
+    #[test]
+    fn a_key_loads_when_first_needed_and_says_little() {
+        let mut s = hmac_signer("{{path}}", Place::Header("X-Sig".into()));
+        s.key = KeySource::File("/nonexistent/brainproxy-key".into());
+        let loaded = Loaded::new("p", s.clone());
+        let target = Target::from_url("https://a.test").unwrap();
+        applied(&loaded, b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n".to_vec(), &target).unwrap();
+        assert!(loaded.key.get().is_none(), "no placeholder, no read");
+        let raw = s.place(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]);
+        let e = applied(&loaded, raw, &target).unwrap_err().to_string();
+        assert!(e.contains("can't be read") && !e.contains("NotFound") && !e.contains("not found"), "{e}");
+    }
+
+    #[test]
+    fn a_query_signer_refuses_to_cover_a_query_signature_not_made_yet() {
+        let mut first = hmac_signer("{{query}}", Place::Query("a".into()));
+        first.name = "first".into();
+        let mut second = hmac_signer("{{path}}", Place::Query("b".into()));
+        second.name = "second".into();
+        let raw = second.place(&first.place(b"GET /?x=1 HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]), "p", &[]);
+        let loaded = Loaded { profile: "p".into(), signer: first, key: Ok(b"k".to_vec()).into() };
+        let e = applied(&loaded, raw, &Target::from_url("https://a.test").unwrap()).unwrap_err().to_string();
+        assert!(e.contains("not computed yet"), "{e}");
+    }
+
+    #[test]
+    fn resigning_needs_a_jwt_when_the_destination_has_a_value() {
+        let raw = b"GET / HTTP/1.1\r\nHost: a.test\r\nAuthorization: Bearer notajwt\r\n\r\n";
+        let e = signed(&jwt_signer("{}", None, true), raw, b"k").unwrap_err().to_string();
+        assert!(e.contains("no JWT to re-sign in header:Authorization"), "{e}");
+    }
+
+    #[test]
+    fn generate_jwt_takes_a_unix_time_like_nuclei() {
+        let now = Stamp::new().unwrap().now.as_secs();
+        let claims = |json: &str, at| {
+            let token = generate_jwt(json, JwtAlg::HS256, b"k", Some(at)).unwrap();
+            crate::codec::decode_jwt(&token).unwrap()["payload"].clone()
+        };
+        let v = claims("{}", now + 600);
+        assert_eq!(v["exp"], now + 600);
+        assert!(v["iat"].as_u64().unwrap() >= now, "{v}");
+        assert!(claims("{}", now.saturating_sub(5)).get("exp").is_none(), "a time gone by sets nothing");
+        assert_eq!(claims(r#"{"exp":7}"#, now + 600)["exp"], 7, "the claims' own exp stays");
     }
 
     #[test]
@@ -1057,5 +1149,11 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         }));
         assert!(!jwt_signer(r#"{"iat":{{timestamp}}}"#, None, false).validate().is_err());
         assert!(jwt_signer("[1]", None, false).validate().is_err());
+        assert!(jwt_signer(r#"{"p":{{path}}}"#, None, false).validate().is_err(), "needs its quotes");
+        assert!(jwt_signer(r#"{"p":"{{path}}"}"#, None, false).validate().is_ok());
+        for name in ["a&b", "a+b", "a%62", "a#b", "a'b", "a=b", ""] {
+            assert!(bad(&|s| s.to = Place::Query(name.into())), "{name}");
+        }
+        assert!(!bad(&|s| s.to = Place::Query("sig_1.v-2~".into())));
     }
 }

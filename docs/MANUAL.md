@@ -587,8 +587,10 @@ and targets that want a JWT you choose the claims of:
   anything else is refused when the signer is saved. `--canonical` reads `\n`, `\r`, `\t` and `\\`
   as escapes. `--set-header` values are set before signing and can't hold `{{body}}`.
 - The value is computed when the request goes on the wire: after insertion-point mutations, other
-  session values and the Content-Length update, for every send, scan, check, fuzz, crawl, proxy and
-  authz request a rule matches, and for history replays that carry the placeholder. Each send gets a
+  session values and the Content-Length update, for every send, active scan (YAML checks included),
+  fuzz, crawl, proxy and authz request a rule matches, and for history replays that carry the
+  placeholder. `authz` sends through the `send` tool, so a rule limited with `--tool` must include
+  `send` to sign its requests. Each send gets a
   new timestamp and nonce, shared by every signer of that send. A signer may cover a header another
   sets with `--set-header`; covering another's signature needs that signer added first, and is
   refused otherwise. A chunked body is hashed without its framing. A query signature leaves itself
@@ -596,11 +598,14 @@ and targets that want a JWT you choose the claims of:
   offered, since it would change what a body hash covers.
 - A destination being attacked (a fuzz marker in the signature header, say) keeps the payload, so a
   bad signature can be tested. `--resign` starts from the token in the request and lays `--claims`
-  over its claims; the token's own signature isn't checked.
-- Macro, login and check requests aren't signed.
+  over its claims; the token's own signature isn't checked, and a value that isn't a JWT fails the
+  send.
+- The requests a session rule makes for itself aren't signed: macro steps, logins and the session
+  check URL of its `check` action.
 - Signers store where a key is, never the key, so `auth show`, `query`, reports and MCP output can't
   show it; history and findings hold `«auth:PROFILE:sign:NAME»`. A value only goes to the signer's
-  origins. A missing key fails the send, naming the variable or file.
+  origins. A key is read when its signer first signs, so one no request needs is never touched. A
+  missing or unreadable key fails the send, naming the variable or file and nothing more.
 - Signers are data: templates name request parts and nothing is executed. A signer can read any
   file the process can as its key, but only the HMAC or signature made with it leaves the machine.
 

@@ -165,8 +165,11 @@ Nuclei's DSL is govaluate plus helper functions. brainproxy parses it at load ti
   `replace`, `replace_regex`, `concat`, `trim`, `trim_space`, `trim_left`, `trim_right`,
   `trim_prefix`, `trim_suffix`, `to_string`/`tostring`, `to_number`, `substr`, `repeat`,
   `md5`, `sha1`, `sha256`, `hmac` (`hmac('sha256', data, key)`, in hex), `generate_jwt`
-  (`generate_jwt('{"sub":"1"}', 'HS256', key[, max_age_seconds])`; HS256/384/512, RS256 with
-  a PEM key), `base64`, `base64_decode`, `base64_py` and `mmh3` (favicon
+  (`generate_jwt('{"sub":"1"}', 'HS256', key[, expires])`, a subset of Nuclei's: the algorithm
+  and key are required, and only HS256/384/512 and RS256 with a PEM key are supported, not NONE,
+  RS384/512, PS*, ES* or EdDSA. As in Nuclei, `expires` is an absolute unix time such as
+  `unix_time(600)`: if still ahead, it sets `exp` and `iat` unless the claims have an `exp`),
+  `base64`, `base64_decode`, `base64_py` and `mmh3` (favicon
   hashes), `hex_encode`, `hex_decode`, `url_encode`, `url_decode`, `compare_versions`
   (hashicorp/go-version constraints such as `'>= 8.0.0, < 8.10.2'`), `rand_base`,
   `rand_text_alpha`, `rand_text_alphanumeric`, `rand_text_numeric`, `rand_int`, `unix_time`.

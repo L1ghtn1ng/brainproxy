@@ -219,10 +219,10 @@ pub struct SignAddArgs {
     #[arg(long, conflicts_with = "jwt", required_unless_present = "jwt")]
     pub canonical: Option<String>,
     /// HMAC hash: sha1, sha256, sha384, or sha512.
-    #[arg(long, default_value = "sha256")]
+    #[arg(long, default_value = "sha256", conflicts_with = "jwt")]
     pub hash: String,
     /// HMAC output: hex, base64, or base64url.
-    #[arg(long, default_value = "hex")]
+    #[arg(long, default_value = "hex", conflicts_with = "jwt")]
     pub output: String,
     /// Make a JWT with this algorithm: HS256, HS384, HS512, or RS256.
     #[arg(long)]
@@ -990,7 +990,7 @@ fn sign_cmd(project: &Path, cmd: SignCmd, out: &Out) -> Result<(), Error> {
                 } else {
                     signers
                         .iter()
-                        .map(|s| format!("{} -> {:?} for {}", s.name, s.to, s.origins.join(", ")))
+                        .map(|s| format!("{} -> {} for {}", s.name, s.to, s.origins.join(", ")))
                         .collect::<Vec<_>>()
                         .join("\n")
                 }
