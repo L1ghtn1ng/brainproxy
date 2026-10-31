@@ -6,7 +6,7 @@ operator is an AI pentesting platform: **Braintruder** drives it through a Kali 
 non-interactive CLI command with structured JSON output, and a desktop app for macOS,
 Linux, and Windows runs on the same engine.
 
-![brainproxy desktop app: a finished guided scan on the Overview](docs/screenshots/overview.png)
+<a href="docs/screenshots/overview-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/overview-light.png"><img src="docs/screenshots/overview-dark.png" alt="brainproxy desktop app: the Overview of a project with findings, history and scan rules"></picture></a>
 
 Only use it against systems you are authorized to test.
 
@@ -52,9 +52,14 @@ command line alone for Windows is `brainproxy-<version>-windows-x86_64.exe`; the
 (`-setup.exe`). See
 [docs/GUI.md](docs/GUI.md).
 
-| Site map | Replay | Fuzzer |
-| --- | --- | --- |
-| [![Site map: recorded requests by host and path, with the request and response](docs/screenshots/sitemap.png)](docs/screenshots/sitemap.png) | [![Replay: editing and resending a request](docs/screenshots/replay.png)](docs/screenshots/replay.png) | [![Fuzzer: payload positions, built-in SQL injection list, match rules](docs/screenshots/fuzzer.png)](docs/screenshots/fuzzer.png) |
+<table>
+<tr><th>Proxy</th><th>Site map</th><th>Replay</th><th>Fuzzer</th></tr>
+<tr><td><a href="docs/screenshots/proxy-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/proxy-light.png"><img src="docs/screenshots/proxy-dark.png" alt="Proxy: recorded traffic with the request and response"></picture></a></td><td><a href="docs/screenshots/sitemap-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/sitemap-light.png"><img src="docs/screenshots/sitemap-dark.png" alt="Site map: recorded requests by host and path"></picture></a></td><td><a href="docs/screenshots/replay-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/replay-light.png"><img src="docs/screenshots/replay-dark.png" alt="Replay: resending a request that returns a SQL error"></picture></a></td><td><a href="docs/screenshots/fuzzer-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/fuzzer-light.png"><img src="docs/screenshots/fuzzer-dark.png" alt="Fuzzer: payload position and the built-in SQL injection list"></picture></a></td></tr>
+<tr><th>Access</th><th>WebSockets</th><th>Findings</th></tr>
+<tr><td><a href="docs/screenshots/access-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/access-light.png"><img src="docs/screenshots/access-dark.png" alt="Access: another user's basket readable, with both responses side by side"></picture></a></td><td><a href="docs/screenshots/websockets-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/websockets-light.png"><img src="docs/screenshots/websockets-dark.png" alt="Proxy › WebSockets: recorded connections and messages"></picture></a></td><td><a href="docs/screenshots/findings-dark.png"><picture><source media="(prefers-color-scheme: light)" srcset="docs/screenshots/findings-light.png"><img src="docs/screenshots/findings-dark.png" alt="Findings: a SQL injection with its evidence"></picture></a></td></tr>
+</table>
+
+Shown against a local OWASP Juice Shop; the images follow your GitHub light or dark theme.
 
 ## Install on Kali (CLI only)
 
