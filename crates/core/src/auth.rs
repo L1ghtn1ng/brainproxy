@@ -148,6 +148,7 @@ impl AuthProfile {
             && self.platform.is_none()
             && handling.macros.is_empty()
             && handling.rules.is_empty()
+            && handling.signers.is_empty()
         {
             return Err(Error::InvalidInput(format!(
                 "profile needs --login-url, --platform, at least one --header, or a macro \
@@ -284,7 +285,7 @@ pub fn placeholder(profile: &str, kind: &str) -> String {
     format!("«auth:{profile}:{kind}»")
 }
 
-const MARK: &str = "«auth:";
+pub(crate) const MARK: &str = "«auth:";
 
 #[derive(Clone)]
 struct VaultEntry {
@@ -305,6 +306,9 @@ struct VaultInner {
     entries: HashMap<String, VaultEntry>,
     /// Per-run placeholders in the order they were added, for pruning.
     runs: std::collections::VecDeque<String>,
+    /// Request signers, in the order they run, and the placeholders they fill.
+    signers: Vec<crate::sign::Loaded>,
+    sign_marks: std::collections::HashSet<String>,
 }
 
 /// Current values behind auth placeholders. The auth layer writes placeholders into
@@ -386,6 +390,16 @@ impl Vault {
         }
     }
 
+    /// Registers a profile's request signers, replacing those it had.
+    pub(crate) fn put_signers(&self, profile: &str, signers: &[crate::sign::Signer]) {
+        let mut inner = self.0.lock().unwrap();
+        inner.signers.retain(|l| l.profile != profile);
+        for signer in signers {
+            inner.sign_marks.extend(signer.marks(profile));
+            inner.signers.push(crate::sign::Loaded::new(profile, signer.clone()));
+        }
+    }
+
     /// Registers a password, encoded for each login body type, for the login origin (and
     /// the origins of macro steps that use it, which stay allowed).
     pub(crate) fn put_password(&self, p: &AuthProfile, password: &str) {
@@ -404,7 +418,8 @@ impl Vault {
     /// filled into its own header, and a password or macro value only into requests to
     /// the origins it belongs to, so a placeholder can't be moved somewhere that
     /// reflects it back. Fails on a placeholder left over (profile removed, never logged
-    /// in, password variable unset, or the placeholder moved out of its header).
+    /// in, password variable unset, or the placeholder moved out of its header). Signers
+    /// run last, over the request as it will be sent; their placeholders only count in the head.
     pub fn resolve<'a>(&self, raw: &'a [u8], target: &Target) -> Result<Cow<'a, [u8]>> {
         if find(raw, MARK.as_bytes()).is_none() {
             return Ok(Cow::Borrowed(raw));
@@ -420,13 +435,28 @@ impl Vault {
                 .position(|&b| b == b':')
                 .map(|i| String::from_utf8_lossy(&line[..i]).trim().to_ascii_lowercase());
             let allowed = |e: &VaultEntry| anywhere(e) || (e.header.is_some() && e.header == name);
-            out.extend(fill(&inner.entries, line, allowed)?);
+            out.extend(fill(&inner.entries, &inner.sign_marks, line, allowed)?);
         }
-        let new_body = fill(&inner.entries, body, anywhere)?;
+        let new_body = fill(&inner.entries, &Default::default(), body, anywhere)?;
         let body_changed = new_body != body;
         out.extend(new_body);
         if body_changed {
             out = RawRequest::from_bytes(out).update_content_length().into_bytes();
+        }
+        if find(&out, MARK.as_bytes()).is_some() {
+            // Every generated header first: a signer may cover another's.
+            let stamp = crate::sign::Stamp::new()?;
+            for signer in &inner.signers {
+                out = signer.set_headers(out, target, &stamp)?;
+            }
+            for signer in &inner.signers {
+                out = signer.sign(out, target, &stamp)?;
+            }
+            // A signer replaced since the placeholder was written leaves it unfilled.
+            let head = split_head_body(&out).0;
+            if let Some(mark) = inner.sign_marks.iter().find(|m| find(head, m.as_bytes()).is_some()) {
+                return Err(Error::InvalidInput(format!("no signer fills {mark} in this request")));
+            }
         }
         Ok(Cow::Owned(out))
     }
@@ -434,7 +464,13 @@ impl Vault {
 
 /// `text` with each placeholder replaced by its value, where `allowed` lets it go.
 /// A per-run macro placeholder no longer kept falls back to the variable's latest value.
-fn fill(entries: &HashMap<String, VaultEntry>, text: &[u8], allowed: impl Fn(&VaultEntry) -> bool) -> Result<Vec<u8>> {
+/// Placeholders in `later` stay for the signers.
+fn fill(
+    entries: &HashMap<String, VaultEntry>,
+    later: &std::collections::HashSet<String>,
+    text: &[u8],
+    allowed: impl Fn(&VaultEntry) -> bool,
+) -> Result<Vec<u8>> {
     const END: &[u8] = "»".as_bytes();
     let mut out = Vec::with_capacity(text.len());
     let mut rest = text;
@@ -443,6 +479,13 @@ fn fill(entries: &HashMap<String, VaultEntry>, text: &[u8], allowed: impl Fn(&Va
         rest = &rest[i..];
         let end = find(&rest[..rest.len().min(400)], END).map(|j| j + END.len());
         let ph = end.map(|j| String::from_utf8_lossy(&rest[..j]).into_owned());
+        if let (Some(ph), Some(j)) = (&ph, end) {
+            if later.contains(ph) {
+                out.extend_from_slice(&rest[..j]);
+                rest = &rest[j..];
+                continue;
+            }
+        }
         let entry = ph
             .as_deref()
             .and_then(|ph| entries.get(ph).or_else(|| entries.get(&crate::session::latest_placeholder(ph)?)));
@@ -478,6 +521,7 @@ impl Store {
             if let Some(pw) = p.password.as_ref().and_then(|s| s.resolve().ok()) {
                 vault.put_password(&p, &pw);
             }
+            vault.put_signers(&p.name, &self.auth_handling(&p.name)?.signers);
         }
         Ok(())
     }
@@ -1070,6 +1114,30 @@ fn now_iso() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_replaced_signers_placeholder_never_goes_out() {
+        let signer = crate::sign::Signer {
+            name: "s".into(),
+            key: crate::sign::KeySource::Env("UNUSED".into()),
+            key_encoding: Default::default(),
+            origins: vec!["https://a.test".into()],
+            to: crate::sign::Place::Header("X-Sig".into()),
+            format: None,
+            headers: vec![],
+            kind: crate::sign::SignKind::Hmac {
+                alg: crate::sign::HmacAlg::Sha256,
+                canonical: "{{path}}".into(),
+                output: Default::default(),
+            },
+        };
+        let vault = Vault::default();
+        vault.put_signers("p", std::slice::from_ref(&signer));
+        vault.put_signers("p", &[]);
+        let raw = signer.place(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n", "p", &[]);
+        let target = Target::from_url("https://a.test").unwrap();
+        assert!(vault.resolve(&raw, &target).unwrap_err().to_string().contains("no signer fills"));
+    }
+
     fn session(profile: AuthProfile) -> AuthSession {
         let dir = std::env::temp_dir().join(format!("bp-auth-unit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1213,7 +1281,7 @@ mod tests {
             actions: vec![crate::session::Action::Login],
             invalid: None,
         };
-        assert!(bare.validate_with(&crate::session::Handling { macros: vec![], rules: vec![rule] }).is_ok());
+        assert!(bare.validate_with(&crate::session::Handling { rules: vec![rule], ..Default::default() }).is_ok());
         let p = AuthProfile {
             name: "x".into(),
             login_url: Some("https://a.test/l".into()),
