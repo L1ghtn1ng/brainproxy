@@ -541,7 +541,7 @@ impl<'a> Parts<'a> {
         let method = words.next().unwrap_or_default();
         let uri = words.next().unwrap_or_default();
         // The origin of an absolute-form target isn't part of the path.
-        let uri = match uri.find("://") {
+        let uri = match uri.find("://").filter(|_| !uri.starts_with('/')) {
             Some(i) => uri[i + 3..].find('/').map_or("/", |j| &uri[i + 3 + j..]),
             None => uri,
         };
@@ -901,6 +901,17 @@ ghbbW733XrWSZ5ErOjH7JNdZWHCbqNbk58wwSISs9J6G9UkiiAehZq+snu4il0UA
         let want = hex::encode(hmac_digest(HmacAlg::Sha256, b"k", text.as_bytes()));
         assert!(out.contains(&format!("X-Sig: v1={want}\r\n")), "{out}");
         assert!(out.contains("Content-Length: 3\r\n") && out.ends_with("\r\n\r\nabc"), "{out}");
+    }
+
+    #[test]
+    fn a_url_in_the_query_is_not_the_origin() {
+        let s = hmac_signer(r"{{path}}\n{{query}}", Place::Header("X-Sig".into()));
+        let want = hex::encode(hmac_digest(HmacAlg::Sha256, b"k", b"/a\nnext=https://b.test/c"));
+        for target in ["/a?next=https://b.test/c", "https://a.test/a?next=https://b.test/c"] {
+            let raw = format!("GET {target} HTTP/1.1\r\nHost: a.test\r\n\r\n");
+            let out = signed(&s, raw.as_bytes(), b"k").unwrap();
+            assert!(out.contains(&format!("X-Sig: {want}\r\n")), "{out}");
+        }
     }
 
     #[test]
