@@ -237,9 +237,9 @@ impl Signer {
             }
         }
         match &self.kind {
-            SignKind::Hmac { canonical, .. } => check_vars(canonical, &[]).map_err(&what)?,
+            SignKind::Hmac { canonical, .. } => check_vars(canonical, &[]).map_err(what)?,
             SignKind::Jwt { claims, .. } => {
-                check_vars(claims, &[]).map_err(&what)?;
+                check_vars(claims, &[]).map_err(what)?;
                 claims_object(&render(claims, &|_| Some(b"0".to_vec()), Mode::Json))
                     .map_err(|e| what(format!("--claims: {e}")))?;
             }
